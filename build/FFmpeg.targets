@@ -1,0 +1,56 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    发布时自动将 ffmpeg 放到发布目录的 tools/ffmpeg/ 下，
+    使 FluxForm 可以像格式工厂一样作为一个独立目录运行。
+
+    优先使用项目根目录 tools-cache/ffmpeg-release-essentials.zip 本地缓存；
+    如果缓存不存在，则从 gyan.dev 下载。
+  -->
+  <PropertyGroup>
+    <FFmpegUrl>https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip</FFmpegUrl>
+    <FFmpegPublishRoot>$(PublishDir.TrimEnd('\'))</FFmpegPublishRoot>
+    <FFmpegPublishDir>$([System.IO.Path]::Combine($(FFmpegPublishRoot), 'tools', 'ffmpeg'))</FFmpegPublishDir>
+    <FFmpegArchiveName>ffmpeg-release-essentials.zip</FFmpegArchiveName>
+    <FFmpegArchivePath>$([System.IO.Path]::Combine($(FFmpegPublishDir), $(FFmpegArchiveName)))</FFmpegArchivePath>
+    <FFmpegCachePath>$([System.IO.Path]::Combine($(MSBuildThisFileDirectory), '..', 'tools-cache', $(FFmpegArchiveName)))</FFmpegCachePath>
+  </PropertyGroup>
+
+  <Target Name="DownloadFFmpegForPublish" AfterTargets="Publish">
+    <Message Text="[FluxForm] 准备内置 ffmpeg：$(FFmpegPublishDir)" Importance="high" />
+    <MakeDir Directories="$(FFmpegPublishDir)" />
+
+    <!-- 优先使用本地缓存，避免每次都联网下载 -->
+    <PropertyGroup>
+      <FFmpegSourcePath Condition="Exists('$(FFmpegCachePath)')">$(FFmpegCachePath)</FFmpegSourcePath>
+      <FFmpegSourcePath Condition="'$(FFmpegSourcePath)' == ''">$(FFmpegUrl)</FFmpegSourcePath>
+    </PropertyGroup>
+
+    <Message Text="[FluxForm] ffmpeg 来源：$(FFmpegSourcePath)" Importance="high" />
+
+    <Copy
+      Condition="Exists('$(FFmpegCachePath)')"
+      SourceFiles="$(FFmpegCachePath)"
+      DestinationFiles="$(FFmpegArchivePath)"
+      SkipUnchangedFiles="true" />
+
+    <DownloadFile
+      Condition="!Exists('$(FFmpegArchivePath)')"
+      SourceUrl="$(FFmpegUrl)"
+      DestinationFolder="$(FFmpegPublishDir)"
+      DestinationFileName="$(FFmpegArchiveName)"
+      SkipUnchangedFiles="true" />
+
+    <Unzip
+      SourceFiles="$(FFmpegArchivePath)"
+      DestinationFolder="$(FFmpegPublishDir)"
+      OverwriteReadOnlyFiles="true" />
+
+    <Delete Files="$(FFmpegArchivePath)" />
+
+    <!--
+      gyan.dev 的 zip 解压后包含一层版本号文件夹，
+      我们需要把 bin/ffmpeg.exe、ffprobe.exe 等文件移动到 tools/ffmpeg/ 根目录。
+    -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)ExtractFfmpeg.ps1&quot; -PublishDir &quot;$(FFmpegPublishRoot)&quot;" />
+  </Target>
+</Project>

@@ -34,3 +34,4 @@ Thumbs.db
 *.temp
 tools/ffmpeg/
 tools/libreoffice/
+tools-cache/

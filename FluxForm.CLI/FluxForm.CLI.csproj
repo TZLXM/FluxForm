@@ -11,4 +11,6 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <Import Project="..\build\FFmpeg.targets" />
+
 </Project>
