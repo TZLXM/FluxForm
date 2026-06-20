@@ -1,0 +1,133 @@
+<ui:FluentWindow x:Class="FluxForm.WPF.MainWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                 xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 xmlns:vm="clr-namespace:FluxForm.WPF.ViewModels"
+                 Title="FluxForm"
+                 Width="1200"
+                 Height="800"
+                 ExtendsContentIntoTitleBar="True"
+                 WindowBackdropType="Mica"
+                 WindowStartupLocation="CenterScreen"
+                 mc:Ignorable="d"
+                 AllowDrop="True"
+                 DragEnter="Window_DragEnter"
+                 Drop="Window_Drop">
+
+    <ui:FluentWindow.Resources>
+        <vm:MainViewModel x:Key="ViewModel" />
+    </ui:FluentWindow.Resources>
+
+    <Grid DataContext="{StaticResource ViewModel}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="180" />
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Title="FluxForm" Grid.Row="0" />
+
+        <!-- 工具栏 -->
+        <ToolBarTray Grid.Row="1" Margin="12,8,12,0">
+            <ToolBar>
+                <ui:Button Command="{Binding AddFilesCommand}" Icon="{ui:SymbolIcon FolderOpen24}">
+                    添加文件
+                </ui:Button>
+                <ui:Button Command="{Binding StartCommand}" Icon="{ui:SymbolIcon Play24}">
+                    开始转换
+                </ui:Button>
+                <ui:Button Command="{Binding ClearCommand}" Icon="{ui:SymbolIcon Delete24}">
+                    清空
+                </ui:Button>
+                <Separator />
+                <TextBlock VerticalAlignment="Center" Text="分类：" />
+                <ComboBox Width="120"
+                          ItemsSource="{Binding Categories}"
+                          SelectedItem="{Binding SelectedCategory}" />
+                <TextBlock VerticalAlignment="Center" Text="（在表格中编辑目标格式和输出路径）" />
+            </ToolBar>
+        </ToolBarTray>
+
+        <!-- 任务列表 -->
+        <Border Grid.Row="2"
+                Margin="12"
+                BorderBrush="{ui:ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8">
+            <DataGrid x:Name="TasksGrid"
+                      AutoGenerateColumns="False"
+                      CanUserAddRows="False"
+                      GridLinesVisibility="Horizontal"
+                      ItemsSource="{Binding Tasks}"
+                      RowHeight="40"
+                      SelectionMode="Single">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Width="*"
+                                        Binding="{Binding FileName}"
+                                        Header="文件名" />
+                    <DataGridTextColumn Width="80"
+                                        Binding="{Binding InputFormat}"
+                                        Header="原格式" />
+                    <DataGridTextColumn Width="80"
+                                        Binding="{Binding DisplayCategory}"
+                                        Header="类型" />
+                    <DataGridTextColumn Width="100"
+                                        Binding="{Binding OutputFormat}"
+                                        Header="目标格式" />
+                    <DataGridTextColumn Width="2*"
+                                        Binding="{Binding OutputPath}"
+                                        Header="输出路径" />
+                    <DataGridTemplateColumn Width="120" Header="进度">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <ProgressBar Maximum="100" Minimum="0" Value="{Binding Progress}" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Width="150"
+                                        Binding="{Binding Status}"
+                                        Header="状态" />
+                    <DataGridTextColumn Width="2*"
+                                        Binding="{Binding Message}"
+                                        Header="消息" />
+                    <DataGridTemplateColumn Width="100" Header="操作">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <ui:Button Command="{Binding DataContext.OpenOutputCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                           CommandParameter="{Binding OutputPath}"
+                                           Icon="{ui:SymbolIcon Folder24}"
+                                           ToolTip="打开输出目录" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+        </Border>
+
+        <!-- 日志 -->
+        <Grid Grid.Row="3" Margin="12,0,12,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0"
+                       Margin="0,0,0,6"
+                       FontWeight="SemiBold"
+                       Text="日志" />
+            <Border Grid.Row="1"
+                    Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
+                    CornerRadius="8">
+                <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                              VerticalScrollBarVisibility="Auto">
+                    <TextBlock Margin="10"
+                               FontFamily="Consolas"
+                               Text="{Binding LogText}"
+                               TextWrapping="Wrap" />
+                </ScrollViewer>
+            </Border>
+        </Grid>
+    </Grid>
+</ui:FluentWindow>
