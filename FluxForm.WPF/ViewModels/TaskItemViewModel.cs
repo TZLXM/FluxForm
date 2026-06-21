@@ -1,3 +1,4 @@
+using System.IO;
 using FluxForm.Core.Models;
 
 namespace FluxForm.WPF.ViewModels;
@@ -20,7 +21,18 @@ public class TaskItemViewModel : ObservableObject
     public string OutputFormat
     {
         get => _outputFormat;
-        set => SetProperty(ref _outputFormat, value);
+        set
+        {
+            if (SetProperty(ref _outputFormat, value))
+            {
+                if (!string.IsNullOrWhiteSpace(OutputPath))
+                {
+                    var dir = Path.GetDirectoryName(OutputPath)!;
+                    var fileName = Path.GetFileNameWithoutExtension(OutputPath) + "." + value;
+                    OutputPath = Path.Combine(dir, fileName);
+                }
+            }
+        }
     }
 
     public string OutputPath

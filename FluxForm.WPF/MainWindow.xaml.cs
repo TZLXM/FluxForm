@@ -9,23 +9,50 @@ public partial class MainWindow : FluentWindow
     public MainWindow()
     {
         InitializeComponent();
+        DataContext = FindResource("ViewModel");
     }
 
-    private void Window_DragEnter(object sender, DragEventArgs e)
-    {
-        if (e.Data.GetDataPresent(DataFormats.FileDrop))
-            e.Effects = DragDropEffects.Copy;
-        else
-            e.Effects = DragDropEffects.None;
-    }
-
-    private void Window_Drop(object sender, DragEventArgs e)
+    private void Window_PreviewDragEnter(object sender, DragEventArgs e)
     {
         if (e.Data.GetDataPresent(DataFormats.FileDrop))
         {
-            var files = (string[])e.Data.GetData(DataFormats.FileDrop)!;
-            if (DataContext is MainViewModel vm)
-                vm.AddFiles(files);
+            e.Effects = DragDropEffects.Copy;
+            DropOverlay.Visibility = Visibility.Visible;
         }
+        else
+        {
+            e.Effects = DragDropEffects.None;
+        }
+    }
+
+    private void Window_PreviewDragOver(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            e.Effects = DragDropEffects.Copy;
+            DropOverlay.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            e.Effects = DragDropEffects.None;
+        }
+    }
+
+    private void Window_PreviewDragLeave(object sender, DragEventArgs e)
+    {
+        DropOverlay.Visibility = Visibility.Collapsed;
+    }
+
+    private void Window_PreviewDrop(object sender, DragEventArgs e)
+    {
+        DropOverlay.Visibility = Visibility.Collapsed;
+
+        if (e.Data.GetDataPresent(DataFormats.FileDrop) && DataContext is MainViewModel vm)
+        {
+            var files = (string[])e.Data.GetData(DataFormats.FileDrop)!;
+            vm.AddFiles(files);
+        }
+
+        e.Handled = true;
     }
 }

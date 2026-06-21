@@ -8,126 +8,316 @@
                  Title="FluxForm"
                  Width="1200"
                  Height="800"
+                 MinWidth="1000"
+                 MinHeight="700"
                  ExtendsContentIntoTitleBar="True"
                  WindowBackdropType="Mica"
                  WindowStartupLocation="CenterScreen"
                  mc:Ignorable="d"
                  AllowDrop="True"
-                 DragEnter="Window_DragEnter"
-                 Drop="Window_Drop">
+                 PreviewDragEnter="Window_PreviewDragEnter"
+                 PreviewDragLeave="Window_PreviewDragLeave"
+                 PreviewDragOver="Window_PreviewDragOver"
+                 PreviewDrop="Window_PreviewDrop">
 
     <ui:FluentWindow.Resources>
         <vm:MainViewModel x:Key="ViewModel" />
+        <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter" />
     </ui:FluentWindow.Resources>
 
-    <Grid DataContext="{StaticResource ViewModel}">
+    <Grid x:Name="RootGrid">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
-            <RowDefinition Height="180" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <ui:TitleBar Title="FluxForm" Grid.Row="0" />
 
-        <!-- 工具栏 -->
-        <ToolBarTray Grid.Row="1" Margin="12,8,12,0">
-            <ToolBar>
-                <ui:Button Command="{Binding AddFilesCommand}" Icon="{ui:SymbolIcon FolderOpen24}">
-                    添加文件
-                </ui:Button>
-                <ui:Button Command="{Binding StartCommand}" Icon="{ui:SymbolIcon Play24}">
-                    开始转换
-                </ui:Button>
-                <ui:Button Command="{Binding ClearCommand}" Icon="{ui:SymbolIcon Delete24}">
-                    清空
-                </ui:Button>
-                <Separator />
-                <TextBlock VerticalAlignment="Center" Text="分类：" />
-                <ComboBox Width="120"
-                          ItemsSource="{Binding Categories}"
-                          SelectedItem="{Binding SelectedCategory}" />
-                <TextBlock VerticalAlignment="Center" Text="（在表格中编辑目标格式和输出路径）" />
-            </ToolBar>
-        </ToolBarTray>
-
-        <!-- 任务列表 -->
-        <Border Grid.Row="2"
-                Margin="12"
+        <!-- 顶部命令栏 -->
+        <Border Grid.Row="1"
+                Margin="12,12,12,0"
+                Padding="12,8"
+                Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
                 BorderBrush="{ui:ThemeResource CardStrokeColorDefaultBrush}"
                 BorderThickness="1"
                 CornerRadius="8">
-            <DataGrid x:Name="TasksGrid"
-                      AutoGenerateColumns="False"
-                      CanUserAddRows="False"
-                      GridLinesVisibility="Horizontal"
-                      ItemsSource="{Binding Tasks}"
-                      RowHeight="40"
-                      SelectionMode="Single">
-                <DataGrid.Columns>
-                    <DataGridTextColumn Width="*"
-                                        Binding="{Binding FileName}"
-                                        Header="文件名" />
-                    <DataGridTextColumn Width="80"
-                                        Binding="{Binding InputFormat}"
-                                        Header="原格式" />
-                    <DataGridTextColumn Width="80"
-                                        Binding="{Binding DisplayCategory}"
-                                        Header="类型" />
-                    <DataGridTextColumn Width="100"
-                                        Binding="{Binding OutputFormat}"
-                                        Header="目标格式" />
-                    <DataGridTextColumn Width="2*"
-                                        Binding="{Binding OutputPath}"
-                                        Header="输出路径" />
-                    <DataGridTemplateColumn Width="120" Header="进度">
-                        <DataGridTemplateColumn.CellTemplate>
-                            <DataTemplate>
-                                <ProgressBar Maximum="100" Minimum="0" Value="{Binding Progress}" />
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                    </DataGridTemplateColumn>
-                    <DataGridTextColumn Width="150"
-                                        Binding="{Binding Status}"
-                                        Header="状态" />
-                    <DataGridTextColumn Width="2*"
-                                        Binding="{Binding Message}"
-                                        Header="消息" />
-                    <DataGridTemplateColumn Width="100" Header="操作">
-                        <DataGridTemplateColumn.CellTemplate>
-                            <DataTemplate>
-                                <ui:Button Command="{Binding DataContext.OpenOutputCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                           CommandParameter="{Binding OutputPath}"
-                                           Icon="{ui:SymbolIcon Folder24}"
-                                           ToolTip="打开输出目录" />
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                    </DataGridTemplateColumn>
-                </DataGrid.Columns>
-            </DataGrid>
+            <Grid>
+                <StackPanel HorizontalAlignment="Left" Orientation="Horizontal">
+                    <ui:Button Margin="0,0,8,0"
+                               Command="{Binding AddFilesCommand}"
+                               Icon="{ui:SymbolIcon FolderOpen24}">
+                        添加文件
+                    </ui:Button>
+                    <ui:Button Margin="0,0,8,0"
+                               Command="{Binding StartCommand}"
+                               Icon="{ui:SymbolIcon Play24}">
+                        开始转换
+                    </ui:Button>
+                    <ui:Button Margin="0,0,8,0"
+                               Command="{Binding CancelCommand}"
+                               Icon="{ui:SymbolIcon Dismiss24}">
+                        停止
+                    </ui:Button>
+                    <ui:Button Margin="0,0,16,0"
+                               Command="{Binding ClearCommand}"
+                               Icon="{ui:SymbolIcon Delete24}">
+                        清空
+                    </ui:Button>
+
+                    <Border Width="1"
+                            Margin="0,4,16,4"
+                            Background="{ui:ThemeResource CardStrokeColorDefaultBrush}" />
+
+                    <ui:Button Margin="0,0,8,0"
+                               Command="{Binding SetOutputDirectoryCommand}"
+                               Icon="{ui:SymbolIcon Folder24}">
+                        输出目录
+                    </ui:Button>
+                </StackPanel>
+
+                <StackPanel HorizontalAlignment="Right"
+                            VerticalAlignment="Center"
+                            Orientation="Horizontal">
+                    <TextBlock Margin="0,0,8,0"
+                               VerticalAlignment="Center"
+                               Text="总进度" />
+                    <ProgressBar Width="160"
+                                 Height="8"
+                                 Maximum="100"
+                                 Value="{Binding TotalProgress, Mode=OneWay}" />
+                </StackPanel>
+            </Grid>
         </Border>
 
-        <!-- 日志 -->
-        <Grid Grid.Row="3" Margin="12,0,12,12">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0"
-                       Margin="0,0,0,6"
-                       FontWeight="SemiBold"
-                       Text="日志" />
-            <Border Grid.Row="1"
+        <!-- 主内容区 -->
+        <Grid Grid.Row="2" Margin="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- 左侧功能导航 -->
+            <Border Grid.Column="0"
+                    Margin="0,0,12,0"
                     Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
+                    BorderBrush="{ui:ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
                     CornerRadius="8">
-                <ScrollViewer HorizontalScrollBarVisibility="Disabled"
-                              VerticalScrollBarVisibility="Auto">
-                    <TextBlock Margin="10"
-                               FontFamily="Consolas"
-                               Text="{Binding LogText}"
-                               TextWrapping="Wrap" />
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="12">
+                        <TextBlock Margin="0,0,0,8"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Text="分类" />
+                        <ListBox Background="Transparent"
+                                 BorderThickness="0"
+                                 ItemsSource="{Binding Categories}"
+                                 SelectedItem="{Binding SelectedCategory}">
+                            <ListBox.ItemContainerStyle>
+                                <Style TargetType="ListBoxItem">
+                                    <Setter Property="Padding" Value="10,8" />
+                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                </Style>
+                            </ListBox.ItemContainerStyle>
+                        </ListBox>
+
+                        <TextBlock Margin="0,16,0,8"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Text="输出格式" />
+                        <TextBlock Margin="0,0,0,8"
+                                   Opacity="0.7"
+                                   Text="请先选择一个分类"
+                                   Visibility="{Binding NoFormatPresets, Converter={StaticResource BoolToVisibilityConverter}}" />
+                        <ItemsControl ItemsSource="{Binding FormatPresets}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <ui:Button Margin="0,2,0,2"
+                                               Padding="10,8"
+                                               HorizontalAlignment="Stretch"
+                                               HorizontalContentAlignment="Stretch"
+                                               Command="{Binding DataContext.ApplyFormatCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                               CommandParameter="{Binding Extension}"
+                                               ToolTip="{Binding DisplayName}">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <ui:SymbolIcon Grid.Column="0"
+                                                           Margin="0,0,10,0"
+                                                           Symbol="ArrowSwap24" />
+                                            <TextBlock Grid.Column="1"
+                                                       VerticalAlignment="Center"
+                                                       FontWeight="SemiBold"
+                                                       Text="{Binding DisplayName}" />
+                                            <ui:SymbolIcon Grid.Column="2" Symbol="ChevronRight24" />
+                                        </Grid>
+                                    </ui:Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
                 </ScrollViewer>
             </Border>
+
+            <!-- 右侧任务与日志 -->
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="140" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0"
+                           Margin="0,0,0,8"
+                           FontSize="16"
+                           FontWeight="SemiBold"
+                           Text="任务列表" />
+
+                <!-- 任务表格 -->
+                <Border Grid.Row="1"
+                        Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
+                        BorderBrush="{ui:ThemeResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8">
+                    <Grid>
+                        <DataGrid x:Name="TasksGrid"
+                                  AutoGenerateColumns="False"
+                                  CanUserAddRows="False"
+                                  GridLinesVisibility="Horizontal"
+                                  ItemsSource="{Binding TasksView}"
+                                  RowHeight="44"
+                                  SelectionMode="Single">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Width="*"
+                                                    Binding="{Binding FileName}"
+                                                    Header="文件名" />
+                                <DataGridTextColumn Width="70"
+                                                    Binding="{Binding InputFormat}"
+                                                    Header="原格式" />
+                                <DataGridTextColumn Width="90"
+                                                    Binding="{Binding OutputFormat}"
+                                                    Header="目标格式" />
+                                <DataGridTemplateColumn Width="120" Header="进度">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <ProgressBar Maximum="100" Minimum="0" Value="{Binding Progress, Mode=OneWay}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTextColumn Width="100"
+                                                    Binding="{Binding Status}"
+                                                    Header="状态" />
+                                <DataGridTextColumn Width="*"
+                                                    Binding="{Binding Message}"
+                                                    Header="消息" />
+                                <DataGridTemplateColumn Width="100" Header="操作">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <StackPanel HorizontalAlignment="Center" Orientation="Horizontal">
+                                                <ui:Button Margin="0,0,4,0"
+                                                           Padding="6,4"
+                                                           Command="{Binding DataContext.OpenOutputCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                           CommandParameter="{Binding OutputPath}"
+                                                           Icon="{ui:SymbolIcon Folder24}"
+                                                           ToolTip="打开输出目录" />
+                                                <ui:Button Padding="6,4"
+                                                           Command="{Binding DataContext.RemoveTaskCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                           CommandParameter="{Binding}"
+                                                           Icon="{ui:SymbolIcon Delete24}"
+                                                           ToolTip="移除任务" />
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                            </DataGrid.Columns>
+                        </DataGrid>
+
+                        <!-- 空状态 -->
+                        <Grid Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
+                              Visibility="{Binding IsEmpty, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <ui:SymbolIcon Margin="0,0,0,12"
+                                               FontSize="48"
+                                               Symbol="FolderOpen24" />
+                                <TextBlock Margin="0,0,0,8"
+                                           FontSize="16"
+                                           FontWeight="SemiBold"
+                                           Text="暂无任务" />
+                                <TextBlock Margin="0,0,0,16"
+                                           Opacity="0.7"
+                                           Text="拖拽文件到此处，或点击“添加文件”开始" />
+                                <ui:Button Command="{Binding AddFilesCommand}" Icon="{ui:SymbolIcon FolderOpen24}">
+                                    添加文件
+                                </ui:Button>
+                            </StackPanel>
+                        </Grid>
+                    </Grid>
+                </Border>
+
+                <!-- 日志 -->
+                <Grid Grid.Row="2" Margin="0,12,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0"
+                               Margin="0,0,0,6"
+                               FontWeight="SemiBold"
+                               Text="日志" />
+                    <Border Grid.Row="1"
+                            Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
+                            BorderBrush="{ui:ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                        <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                                      VerticalScrollBarVisibility="Auto">
+                            <TextBlock Margin="10"
+                                       FontFamily="Consolas"
+                                       Text="{Binding LogText}"
+                                       TextWrapping="Wrap" />
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </Grid>
         </Grid>
+
+        <!-- 拖拽提示遮罩 -->
+        <Border x:Name="DropOverlay"
+                Grid.Row="2"
+                Margin="12"
+                IsHitTestVisible="False"
+                Panel.ZIndex="100"
+                Background="#BF000000"
+                CornerRadius="8"
+                Visibility="Collapsed">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                <ui:SymbolIcon Margin="0,0,0,12"
+                               FontSize="48"
+                               Foreground="White"
+                               Symbol="ArrowDownload24" />
+                <TextBlock FontSize="20"
+                           Foreground="White"
+                           Text="释放文件以添加任务" />
+            </StackPanel>
+        </Border>
+
+        <!-- 状态栏 -->
+        <Border Grid.Row="3"
+                Background="{ui:ThemeResource ControlFillColorDefaultBrush}"
+                BorderBrush="{ui:ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="0,1,0,0">
+            <TextBlock Margin="12,8"
+                       Text="{Binding StatusText}" />
+        </Border>
     </Grid>
 </ui:FluentWindow>
