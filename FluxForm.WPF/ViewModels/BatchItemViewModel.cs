@@ -5,10 +5,11 @@ using FluxForm.Core.Models;
 
 namespace FluxForm.WPF.ViewModels;
 
-public class BatchItemViewModel : ObservableObject
+public class BatchItemViewModel : ObservableObject, IDisposable
 {
     private double _totalProgress;
     private bool _isExpanded;
+    private bool _isDisposed;
 
     public BatchItemViewModel()
     {
@@ -55,8 +56,30 @@ public class BatchItemViewModel : ObservableObject
         OnPropertyChanged(nameof(FailedCount));
     }
 
+    public void Dispose()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        Tasks.CollectionChanged -= OnTasksCollectionChanged;
+
+        foreach (var task in Tasks)
+        {
+            task.PropertyChanged -= OnTaskPropertyChanged;
+        }
+
+        _isDisposed = true;
+    }
+
     private void OnTasksCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
+        if (_isDisposed)
+        {
+            return;
+        }
+
         if (e.OldItems is not null)
         {
             foreach (TaskItemViewModel task in e.OldItems)
@@ -78,6 +101,11 @@ public class BatchItemViewModel : ObservableObject
 
     private void OnTaskPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (_isDisposed)
+        {
+            return;
+        }
+
         if (e.PropertyName is nameof(TaskItemViewModel.Status) or nameof(TaskItemViewModel.Progress))
         {
             Refresh();

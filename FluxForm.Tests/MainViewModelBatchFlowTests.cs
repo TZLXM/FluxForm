@@ -170,6 +170,50 @@ public class MainViewModelBatchFlowTests
         Assert.Equal(10, batch.TotalProgress, 6);
     }
 
+    [Fact]
+    public void BatchItem_does_not_update_aggregate_values_after_removed_task_changes()
+    {
+        var removedTask = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Pending, Progress = 0 };
+        var remainingTask = new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Succeeded, Progress = 100 };
+        var batch = new BatchItemViewModel();
+
+        batch.Tasks.Add(removedTask);
+        batch.Tasks.Add(remainingTask);
+        batch.Tasks.Remove(removedTask);
+
+        Assert.Equal(1, batch.TotalCount);
+        Assert.Equal(0, batch.PendingCount);
+        Assert.Equal(1, batch.SucceededCount);
+        Assert.Equal(100, batch.TotalProgress, 6);
+
+        removedTask.Status = ConversionStatus.Running;
+        removedTask.Progress = 50;
+
+        Assert.Equal(1, batch.TotalCount);
+        Assert.Equal(0, batch.PendingCount);
+        Assert.Equal(0, batch.RunningCount);
+        Assert.Equal(1, batch.SucceededCount);
+        Assert.Equal(100, batch.TotalProgress, 6);
+    }
+
+    [Fact]
+    public void BatchItem_does_not_update_aggregate_values_after_dispose()
+    {
+        var task = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Pending, Progress = 0 };
+        var batch = new BatchItemViewModel();
+
+        batch.Tasks.Add(task);
+        batch.Dispose();
+
+        task.Status = ConversionStatus.Succeeded;
+        task.Progress = 100;
+
+        Assert.Equal(1, batch.TotalCount);
+        Assert.Equal(1, batch.PendingCount);
+        Assert.Equal(0, batch.SucceededCount);
+        Assert.Equal(0, batch.TotalProgress, 6);
+    }
+
     private static void AssertPendingFile(
         PendingBatchFileViewModel file,
         string inputPath,
