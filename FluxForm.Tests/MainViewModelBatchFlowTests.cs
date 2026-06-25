@@ -7,6 +7,41 @@ namespace FluxForm.Tests;
 public class MainViewModelBatchFlowTests
 {
     [Fact]
+    public void MainViewModel_adds_pending_batch_to_queue_and_clears_pending_state()
+    {
+        var vm = new MainViewModel();
+
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4 · 1920×1080 · 30fps");
+        vm.PendingBatch.OutputFormat = "mkv";
+        vm.PendingBatch.OutputDirectory = "D:/out";
+        vm.PendingBatch.SetOption("videoCodec", "libx264");
+
+        vm.EnqueuePendingBatch();
+
+        Assert.Single(vm.Batches);
+        Assert.Empty(vm.PendingBatch.Files);
+        Assert.False(vm.CanAddNewTasks);
+        Assert.Equal(1, vm.TotalTaskCount);
+    }
+
+    [Fact]
+    public void MainViewModel_stop_marks_unfinished_tasks_as_failed()
+    {
+        var vm = new MainViewModel();
+        var batch = new BatchItemViewModel { BatchId = "B001", Category = ConversionCategory.Video };
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Running });
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Pending });
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "c.mp4", Status = ConversionStatus.Succeeded });
+        vm.Batches.Add(batch);
+
+        vm.MarkUnfinishedTasksAsFailed();
+
+        Assert.Equal(ConversionStatus.Failed, batch.Tasks[0].Status);
+        Assert.Equal(ConversionStatus.Failed, batch.Tasks[1].Status);
+        Assert.Equal(ConversionStatus.Succeeded, batch.Tasks[2].Status);
+    }
+
+    [Fact]
     public void TryAddFile_WhenCategoryMatches_AddsFileAndPreservesBatchConfiguration()
     {
         var batch = new PendingBatchViewModel();

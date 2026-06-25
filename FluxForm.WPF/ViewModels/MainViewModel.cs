@@ -19,9 +19,8 @@ public class MainViewModel : ObservableObject
     private readonly DependencyManager _dependencyManager;
 
     private string _selectedCategory = "全部";
-    private string _logText = string.Empty;
-    private string _outputDirectory = string.Empty;
     private string _statusText = "就绪";
+    private string _logText = string.Empty;
     private double _totalProgress;
     private bool _isBusy;
     private CancellationTokenSource? _cts;
@@ -34,10 +33,29 @@ public class MainViewModel : ObservableObject
         [ConversionCategory.Document] = "pdf"
     };
 
-    public ObservableCollection<TaskItemViewModel> Tasks { get; } = new();
+    public PendingBatchViewModel PendingBatch { get; } = new();
+    public ObservableCollection<BatchItemViewModel> Batches { get; } = new();
     public ObservableCollection<string> Categories { get; } = new() { "全部", "视频", "音频", "图片", "文档" };
     public ObservableCollection<FormatPreset> FormatPresets { get; } = new();
     public ICollectionView TasksView { get; }
+
+    public bool CanAddNewTasks => !IsBusy && Batches.Count == 0;
+    public int TotalTaskCount => Batches.Sum(b => b.Tasks.Count);
+    public bool HasTasks => TotalTaskCount > 0;
+    public bool IsEmpty => TotalTaskCount == 0;
+    public bool NoFormatPresets => FormatPresets.Count == 0;
+
+    public RelayCommand AddFilesCommand { get; }
+    public RelayCommand AddFolderCommand { get; }
+    public RelayCommand EnqueuePendingBatchCommand { get; }
+    public RelayCommand RetryFailedTasksCommand { get; }
+    public RelayCommand ClearCommand { get; }
+    public RelayCommand StartCommand { get; }
+    public RelayCommand CancelCommand { get; }
+    public RelayCommand SetOutputDirectoryCommand { get; }
+    public RelayCommand<TaskItemViewModel> RemoveTaskCommand { get; }
+    public RelayCommand<string> ApplyFormatCommand { get; }
+    public RelayCommand OpenOutputCommand { get; }
 
     public string SelectedCategory
     {
@@ -55,15 +73,15 @@ public class MainViewModel : ObservableObject
 
     public string OutputDirectory
     {
-        get => _outputDirectory;
+        get => PendingBatch.OutputDirectory;
         set
         {
-            if (SetProperty(ref _outputDirectory, value))
-            {
-                foreach (var task in Tasks)
-                    task.OutputPath = GenerateOutputPath(task.InputPath, task.OutputFormat);
-                UpdateStatus();
-            }
+            if (PendingBatch.OutputDirectory == value)
+                return;
+
+            PendingBatch.OutputDirectory = value;
+            OnPropertyChanged();
+            UpdateStatus();
         }
     }
 
@@ -86,24 +104,12 @@ public class MainViewModel : ObservableObject
         {
             if (SetProperty(ref _isBusy, value))
             {
+                OnPropertyChanged(nameof(CanAddNewTasks));
                 UpdateStatus();
                 CommandManager.InvalidateRequerySuggested();
             }
         }
     }
-
-    public bool HasTasks => Tasks.Count > 0;
-    public bool IsEmpty => Tasks.Count == 0;
-    public bool NoFormatPresets => FormatPresets.Count == 0;
-
-    public RelayCommand AddFilesCommand { get; }
-    public RelayCommand ClearCommand { get; }
-    public RelayCommand StartCommand { get; }
-    public RelayCommand CancelCommand { get; }
-    public RelayCommand SetOutputDirectoryCommand { get; }
-    public RelayCommand<TaskItemViewModel> RemoveTaskCommand { get; }
-    public RelayCommand<string> ApplyFormatCommand { get; }
-    public RelayCommand OpenOutputCommand { get; }
 
     public string LogText
     {
@@ -114,30 +120,116 @@ public class MainViewModel : ObservableObject
     public MainViewModel()
     {
         var toolsDir = Path.Combine(AppContext.BaseDirectory, "tools");
-        _dependencyManager = new DependencyManager(toolsDir, new Progress<string>(msg => AppendLog(msg)));
+        _dependencyManager = new DependencyManager(toolsDir, new Progress<string>(AppendLog));
         _conversionService = new ConversionService(_dependencyManager);
 
-        Tasks.CollectionChanged += OnTasksCollectionChanged;
+        Batches.CollectionChanged += OnBatchesCollectionChanged;
+        PendingBatch.PropertyChanged += OnPendingBatchPropertyChanged;
 
-        TasksView = CollectionViewSource.GetDefaultView(Tasks);
+        TasksView = CollectionViewSource.GetDefaultView(new ObservableCollection<TaskItemViewModel>());
 
         AddFilesCommand = new RelayCommand(_ => AddFiles());
-        ClearCommand = new RelayCommand(_ => ClearTasks(), _ => Tasks.Count > 0 && !IsBusy);
-        StartCommand = new RelayCommand(_ => StartConversion(), _ => Tasks.Count > 0 && !IsBusy);
+        AddFolderCommand = new RelayCommand(_ => AddFolder());
+        EnqueuePendingBatchCommand = new RelayCommand(_ => EnqueuePendingBatch(), _ => !IsBusy);
+        RetryFailedTasksCommand = new RelayCommand(_ => RetryFailedTasks(), _ => !IsBusy && Batches.SelectMany(b => b.Tasks).Any(t => t.Status == ConversionStatus.Failed));
+        ClearCommand = new RelayCommand(_ => ClearTasks(), _ => HasTasks && !IsBusy);
+        StartCommand = new RelayCommand(_ => StartConversion(), _ => HasTasks && !IsBusy);
         CancelCommand = new RelayCommand(_ => CancelConversion(), _ => IsBusy);
         SetOutputDirectoryCommand = new RelayCommand(_ => SetOutputDirectory());
-        RemoveTaskCommand = new RelayCommand<TaskItemViewModel>(t => RemoveTask(t), _ => !IsBusy);
-        ApplyFormatCommand = new RelayCommand<string>(fmt => ApplyFormat(fmt));
-        OpenOutputCommand = new RelayCommand(p => OpenOutput(p?.ToString()));
+        RemoveTaskCommand = new RelayCommand<TaskItemViewModel>(task => RemoveTask(task), _ => !IsBusy);
+        ApplyFormatCommand = new RelayCommand<string>(format => ApplyFormat(format));
+        OpenOutputCommand = new RelayCommand(path => OpenOutput(path?.ToString()));
+
         RefreshFormats();
         UpdateStatus();
+    }
+
+    public void AddFiles(IEnumerable<string> files)
+    {
+        foreach (var file in files)
+        {
+            if (!File.Exists(file))
+                continue;
+
+            var ext = Path.GetExtension(file).TrimStart('.').ToLowerInvariant();
+            var category = GuessCategory(ext);
+            var summary = Path.GetExtension(file).TrimStart('.').ToUpperInvariant();
+
+            if (PendingBatch.TryAddFile(file, category, new FileInfo(file).Length, summary) && string.IsNullOrWhiteSpace(PendingBatch.OutputFormat))
+            {
+                PendingBatch.OutputFormat = _defaultFormats.GetValueOrDefault(category, ext);
+            }
+        }
+
+        OnPropertyChanged(nameof(HasTasks));
+        OnPropertyChanged(nameof(IsEmpty));
+        UpdateStatus();
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    public void EnqueuePendingBatch()
+    {
+        if (PendingBatch.Category == null || PendingBatch.Files.Count == 0 || string.IsNullOrWhiteSpace(PendingBatch.OutputFormat))
+            return;
+
+        var batchId = $"B{Batches.Count + 1:000}";
+        var batch = new BatchItemViewModel
+        {
+            BatchId = batchId,
+            Category = PendingBatch.Category.Value,
+            ConfigSummary = BuildBatchSummary(PendingBatch)
+        };
+
+        foreach (var file in PendingBatch.Files)
+        {
+            batch.Tasks.Add(CreateTask(batchId, file));
+        }
+
+        batch.Refresh();
+        Batches.Add(batch);
+        PendingBatch.Reset();
+        OnPropertyChanged(nameof(OutputDirectory));
+        RefreshAllBatchStats();
+    }
+
+    public void MarkUnfinishedTasksAsFailed()
+    {
+        foreach (var batch in Batches)
+        {
+            foreach (var task in batch.Tasks.Where(t => t.Status is ConversionStatus.Pending or ConversionStatus.Running or ConversionStatus.Cancelled))
+            {
+                task.Status = ConversionStatus.Failed;
+                task.Message = "失败：任务已停止";
+                task.Progress = 0;
+            }
+
+            batch.Refresh();
+        }
+
+        RefreshAllBatchStats();
+    }
+
+    private void RetryFailedTasks()
+    {
+        foreach (var task in Batches.SelectMany(batch => batch.Tasks).Where(task => task.Status == ConversionStatus.Failed))
+        {
+            task.Status = ConversionStatus.Pending;
+            task.Message = "等待中";
+            task.Progress = 0;
+        }
+
+        RefreshAllBatchStats();
     }
 
     private void RefreshFormats()
     {
         FormatPresets.Clear();
         var category = StringToCategory(SelectedCategory);
-        if (category == null) return;
+        if (category == null)
+        {
+            OnPropertyChanged(nameof(NoFormatPresets));
+            return;
+        }
 
         foreach (var format in _conversionService.GetFormats(category.Value)
                      .Select(f => f.Extension)
@@ -157,55 +249,17 @@ public class MainViewModel : ObservableObject
 
     private void ApplyFormat(string? format)
     {
-        if (string.IsNullOrWhiteSpace(format)) return;
+        if (string.IsNullOrWhiteSpace(format))
+            return;
 
         var category = StringToCategory(SelectedCategory);
-        var targets = category == null
-            ? Tasks.ToList()
-            : Tasks.Where(t => t.Category == category.Value).ToList();
-
-        foreach (var task in targets)
-        {
-            if (task.Status == ConversionStatus.Running) continue;
-            task.OutputFormat = format;
-            task.OutputPath = GenerateOutputPath(task.InputPath, format);
-        }
-
         if (category != null)
             _defaultFormats[category.Value] = format;
 
+        if (PendingBatch.Category == category || (category == null && PendingBatch.Category != null))
+            PendingBatch.OutputFormat = format;
+
         AppendLog($"已将 {(category == null ? "全部" : CategoryToString(category.Value))} 目标格式设为 {format.ToUpperInvariant()}");
-    }
-
-    public void AddFiles(IEnumerable<string> files)
-    {
-        foreach (var file in files)
-        {
-            if (!File.Exists(file)) continue;
-
-            var ext = Path.GetExtension(file).TrimStart('.').ToLowerInvariant();
-            var category = GuessCategory(ext);
-            var outputFormat = _defaultFormats.GetValueOrDefault(category, ext);
-            var outputPath = GenerateOutputPath(file, outputFormat);
-
-            var task = new TaskItemViewModel
-            {
-                FileName = Path.GetFileName(file),
-                InputPath = file,
-                InputFormat = ext,
-                OutputFormat = outputFormat,
-                OutputPath = outputPath,
-                Category = category,
-                Status = ConversionStatus.Pending,
-                Message = "等待中"
-            };
-
-            task.PropertyChanged += OnTaskPropertyChanged;
-            Tasks.Add(task);
-        }
-
-        CommandManager.InvalidateRequerySuggested();
-        TasksView.Refresh();
         UpdateStatus();
     }
 
@@ -216,8 +270,24 @@ public class MainViewModel : ObservableObject
             Multiselect = true,
             Title = "选择要转换的文件"
         };
+
         if (dialog.ShowDialog() == true)
             AddFiles(dialog.FileNames);
+    }
+
+    private void AddFolder()
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "选择包含待转换文件的文件夹",
+            Multiselect = false
+        };
+
+        if (dialog.ShowDialog() != true)
+            return;
+
+        var files = Directory.EnumerateFiles(dialog.FolderName);
+        AddFiles(files);
     }
 
     private void SetOutputDirectory()
@@ -227,37 +297,73 @@ public class MainViewModel : ObservableObject
             Title = "选择输出目录",
             Multiselect = false
         };
+
         if (dialog.ShowDialog() == true)
             OutputDirectory = dialog.FolderName;
     }
 
     private string GenerateOutputPath(string inputPath, string outputFormat)
     {
-        var dir = !string.IsNullOrWhiteSpace(OutputDirectory)
-            ? OutputDirectory
+        var dir = !string.IsNullOrWhiteSpace(PendingBatch.OutputDirectory)
+            ? PendingBatch.OutputDirectory
             : Path.GetDirectoryName(inputPath)!;
         var fileName = Path.GetFileNameWithoutExtension(inputPath) + "_converted." + outputFormat;
         return Path.Combine(dir, fileName);
     }
 
+    private TaskItemViewModel CreateTask(string batchId, PendingBatchFileViewModel file)
+    {
+        var inputFormat = Path.GetExtension(file.InputPath).TrimStart('.').ToLowerInvariant();
+        var outputFormat = PendingBatch.OutputFormat;
+
+        return new TaskItemViewModel
+        {
+            BatchId = batchId,
+            FileName = file.FileName,
+            InputPath = file.InputPath,
+            InputFormat = inputFormat,
+            OutputFormat = outputFormat,
+            OutputPath = GenerateOutputPath(file.InputPath, outputFormat),
+            Category = PendingBatch.Category ?? GuessCategory(inputFormat),
+            Status = ConversionStatus.Pending,
+            Message = "等待中",
+            ParameterSummary = file.Summary
+        };
+    }
+
+    private static string BuildBatchSummary(PendingBatchViewModel pendingBatch)
+    {
+        var parts = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(pendingBatch.OutputFormat))
+            parts.Add(pendingBatch.OutputFormat.ToUpperInvariant());
+
+        foreach (var option in pendingBatch.Options)
+            parts.Add($"{option.Key}={option.Value}");
+
+        return parts.Count > 0 ? string.Join(" / ", parts) : "默认配置";
+    }
+
     private void RemoveTask(TaskItemViewModel? task)
     {
-        if (task == null) return;
-        task.PropertyChanged -= OnTaskPropertyChanged;
-        Tasks.Remove(task);
-        TasksView.Refresh();
-        UpdateStatus();
-        CommandManager.InvalidateRequerySuggested();
+        if (task == null)
+            return;
+
+        var batch = Batches.FirstOrDefault(item => item.Tasks.Contains(task));
+        if (batch == null)
+            return;
+
+        batch.Tasks.Remove(task);
+        if (batch.Tasks.Count == 0)
+            Batches.Remove(batch);
+
+        RefreshAllBatchStats();
     }
 
     private void ClearTasks()
     {
-        foreach (var task in Tasks)
-            task.PropertyChanged -= OnTaskPropertyChanged;
-        Tasks.Clear();
-        TasksView.Refresh();
-        UpdateStatus();
-        CommandManager.InvalidateRequerySuggested();
+        Batches.Clear();
+        RefreshAllBatchStats();
     }
 
     private async void StartConversion()
@@ -267,10 +373,12 @@ public class MainViewModel : ObservableObject
         CommandManager.InvalidateRequerySuggested();
         AppendLog("开始转换任务...");
 
-        var pending = PendingBatch.Create(Tasks).Items;
+        var pendingTasks = Batches.SelectMany(batch => batch.Tasks)
+            .Where(task => task.Status is ConversionStatus.Pending or ConversionStatus.Failed)
+            .ToList();
         var stopwatch = Stopwatch.StartNew();
 
-        foreach (var task in pending)
+        foreach (var task in pendingTasks)
         {
             if (_cts.IsCancellationRequested)
             {
@@ -279,7 +387,7 @@ public class MainViewModel : ObservableObject
             }
 
             var supportedFormats = _conversionService.GetFormats(task.Category)
-                .Select(f => f.Extension)
+                .Select(format => format.Extension)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             if (!supportedFormats.Contains(task.OutputFormat))
@@ -287,18 +395,19 @@ public class MainViewModel : ObservableObject
                 task.Status = ConversionStatus.Failed;
                 task.Message = $"不支持的输出格式：{task.OutputFormat}";
                 AppendLog($"{task.FileName}: {task.Message}");
+                RefreshAllBatchStats();
                 continue;
             }
 
             task.Status = ConversionStatus.Running;
             task.Message = "转换中...";
 
-            var progress = new Progress<ProgressInfo>(p =>
+            var progress = new Progress<ProgressInfo>(info =>
             {
-                task.Progress = p.Percent;
-                task.Message = p.Message;
-                task.Status = p.Status;
-                UpdateTotalProgress();
+                task.Progress = info.Percent;
+                task.Message = info.Message;
+                task.Status = info.Status;
+                RefreshAllBatchStats();
             });
 
             try
@@ -318,13 +427,15 @@ public class MainViewModel : ObservableObject
                 task.Message = $"异常：{ex.Message}";
                 AppendLog($"{task.FileName}: {ex.Message}");
             }
+
+            RefreshAllBatchStats();
         }
 
         stopwatch.Stop();
         _cts.Dispose();
         _cts = null;
         IsBusy = false;
-        UpdateTotalProgress();
+        RefreshAllBatchStats();
         CommandManager.InvalidateRequerySuggested();
         AppendLog($"所有任务处理完毕。总耗时：{stopwatch.Elapsed.TotalSeconds:F1}s");
         UpdateStatus();
@@ -334,11 +445,14 @@ public class MainViewModel : ObservableObject
     {
         _cts?.Cancel();
         AppendLog("用户请求取消转换...");
+        MarkUnfinishedTasksAsFailed();
     }
 
     private void OpenOutput(string? path)
     {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return;
+
         Process.Start("explorer.exe", $"/select,\"{path}\"");
     }
 
@@ -347,41 +461,13 @@ public class MainViewModel : ObservableObject
         LogText += $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}";
     }
 
-    private void UpdateTotalProgress()
+    private void RefreshAllBatchStats()
     {
-        TotalProgress = Tasks.Count > 0 ? Tasks.Average(t => t.Progress) : 0;
-    }
+        foreach (var batch in Batches)
+            batch.Refresh();
 
-    private void UpdateStatus()
-    {
-        var total = Tasks.Count;
-        var pending = Tasks.Count(t => t.Status == ConversionStatus.Pending);
-        var succeeded = Tasks.Count(t => t.Status == ConversionStatus.Succeeded);
-        var failed = Tasks.Count(t => t.Status == ConversionStatus.Failed);
-        var dir = string.IsNullOrWhiteSpace(OutputDirectory) ? "与源文件相同" : OutputDirectory;
-
-        if (IsBusy)
-            StatusText = $"转换中 · 待处理 {pending} · 完成 {succeeded} · 失败 {failed}";
-        else if (total == 0)
-            StatusText = "就绪 · 点击“添加文件”或拖拽文件到此处";
-        else
-            StatusText = $"共 {total} 个任务 · 待处理 {pending} · 完成 {succeeded} · 失败 {failed} · 输出目录：{dir}";
-    }
-
-    private void OnTasksCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        if (e.NewItems != null)
-        {
-            foreach (TaskItemViewModel task in e.NewItems)
-                task.PropertyChanged += OnTaskPropertyChanged;
-        }
-
-        if (e.OldItems != null)
-        {
-            foreach (TaskItemViewModel task in e.OldItems)
-                task.PropertyChanged -= OnTaskPropertyChanged;
-        }
-
+        OnPropertyChanged(nameof(CanAddNewTasks));
+        OnPropertyChanged(nameof(TotalTaskCount));
         OnPropertyChanged(nameof(HasTasks));
         OnPropertyChanged(nameof(IsEmpty));
         UpdateTotalProgress();
@@ -389,10 +475,76 @@ public class MainViewModel : ObservableObject
         CommandManager.InvalidateRequerySuggested();
     }
 
-    private void OnTaskPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    private void UpdateTotalProgress()
     {
-        if (e.PropertyName == nameof(TaskItemViewModel.Progress))
+        var tasks = Batches.SelectMany(batch => batch.Tasks).ToList();
+        TotalProgress = tasks.Count > 0 ? tasks.Average(task => task.Progress) : 0;
+    }
+
+    private void UpdateStatus()
+    {
+        var batchCount = Batches.Count;
+        var tasks = Batches.SelectMany(batch => batch.Tasks).ToList();
+        var total = tasks.Count;
+        var pending = tasks.Count(task => task.Status == ConversionStatus.Pending);
+        var running = tasks.Count(task => task.Status == ConversionStatus.Running);
+        var succeeded = tasks.Count(task => task.Status == ConversionStatus.Succeeded);
+        var failed = tasks.Count(task => task.Status == ConversionStatus.Failed);
+        var dir = string.IsNullOrWhiteSpace(PendingBatch.OutputDirectory) ? "与源文件相同" : PendingBatch.OutputDirectory;
+
+        if (IsBusy)
+        {
+            StatusText = $"执行中 · 批次 {batchCount} · 运行 {running} · 待处理 {pending} · 完成 {succeeded} · 失败 {failed}";
+        }
+        else if (total == 0)
+        {
+            StatusText = PendingBatch.Files.Count == 0
+                ? "就绪 · 点击“添加文件”或拖拽文件到此处"
+                : $"待入队 {PendingBatch.Files.Count} 个文件 · 输出目录：{dir}";
+        }
+        else
+        {
+            StatusText = $"共 {batchCount} 个批次 / {total} 个任务 · 待处理 {pending} · 完成 {succeeded} · 失败 {failed} · 输出目录：{dir}";
+        }
+    }
+
+    private void OnBatchesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.NewItems != null)
+        {
+            foreach (BatchItemViewModel batch in e.NewItems)
+                batch.PropertyChanged += OnBatchPropertyChanged;
+        }
+
+        if (e.OldItems != null)
+        {
+            foreach (BatchItemViewModel batch in e.OldItems)
+                batch.PropertyChanged -= OnBatchPropertyChanged;
+        }
+
+        RefreshAllBatchStats();
+    }
+
+    private void OnBatchPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(BatchItemViewModel.TotalProgress)
+            or nameof(BatchItemViewModel.PendingCount)
+            or nameof(BatchItemViewModel.RunningCount)
+            or nameof(BatchItemViewModel.SucceededCount)
+            or nameof(BatchItemViewModel.FailedCount))
+        {
             UpdateTotalProgress();
+            UpdateStatus();
+        }
+    }
+
+    private void OnPendingBatchPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(PendingBatchViewModel.OutputDirectory))
+            OnPropertyChanged(nameof(OutputDirectory));
+
+        UpdateStatus();
+        CommandManager.InvalidateRequerySuggested();
     }
 
     private static ConversionCategory GuessCategory(string extension)
