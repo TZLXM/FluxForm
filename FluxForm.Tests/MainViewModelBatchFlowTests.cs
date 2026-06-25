@@ -78,6 +78,29 @@ public class MainViewModelBatchFlowTests
         Assert.Equal(string.Empty, batch.ValidationMessage);
     }
 
+    [Fact]
+    public void BatchItem_updates_counts_and_progress_from_child_tasks()
+    {
+        var batch = new BatchItemViewModel
+        {
+            BatchId = "B001",
+            Category = ConversionCategory.Video,
+            ConfigSummary = "MP4 / H.264 / 1080p / 30fps"
+        };
+
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Pending, Progress = 0, ParameterSummary = "H.264 · 1080p" });
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Succeeded, Progress = 100, ParameterSummary = "H.264 · 1080p" });
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "c.mp4", Status = ConversionStatus.Failed, Progress = 0, ParameterSummary = "H.264 · 1080p" });
+
+        batch.Refresh();
+
+        Assert.Equal(3, batch.TotalCount);
+        Assert.Equal(1, batch.PendingCount);
+        Assert.Equal(1, batch.SucceededCount);
+        Assert.Equal(1, batch.FailedCount);
+        Assert.Equal(33.333333333333336, batch.TotalProgress, 6);
+    }
+
     private static void AssertPendingFile(
         PendingBatchFileViewModel file,
         string inputPath,
