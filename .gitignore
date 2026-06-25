@@ -35,3 +35,4 @@ Thumbs.db
 tools/ffmpeg/
 tools/libreoffice/
 tools-cache/
+.worktrees/
