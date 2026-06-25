@@ -101,6 +101,75 @@ public class MainViewModelBatchFlowTests
         Assert.Equal(33.333333333333336, batch.TotalProgress, 6);
     }
 
+    [Fact]
+    public void BatchItem_updates_statistics_when_child_status_changes()
+    {
+        var pendingTask = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Pending, Progress = 0 };
+        var runningTask = new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Running, Progress = 50 };
+        var batch = new BatchItemViewModel();
+
+        batch.Tasks.Add(pendingTask);
+        batch.Tasks.Add(runningTask);
+
+        Assert.Equal(2, batch.TotalCount);
+        Assert.Equal(1, batch.PendingCount);
+        Assert.Equal(1, batch.RunningCount);
+        Assert.Equal(0, batch.SucceededCount);
+
+        pendingTask.Status = ConversionStatus.Succeeded;
+
+        Assert.Equal(0, batch.PendingCount);
+        Assert.Equal(1, batch.RunningCount);
+        Assert.Equal(1, batch.SucceededCount);
+        Assert.Equal(25, batch.TotalProgress, 6);
+    }
+
+    [Fact]
+    public void BatchItem_updates_total_progress_when_child_progress_changes()
+    {
+        var firstTask = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Running, Progress = 20 };
+        var secondTask = new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Running, Progress = 40 };
+        var batch = new BatchItemViewModel();
+
+        batch.Tasks.Add(firstTask);
+        batch.Tasks.Add(secondTask);
+
+        Assert.Equal(30, batch.TotalProgress, 6);
+
+        secondTask.Progress = 100;
+
+        Assert.Equal(60, batch.TotalProgress, 6);
+    }
+
+    [Fact]
+    public void BatchItem_updates_statistics_when_tasks_are_added_or_removed()
+    {
+        var firstTask = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Pending, Progress = 0 };
+        var secondTask = new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Cancelled, Progress = 10 };
+        var batch = new BatchItemViewModel();
+
+        batch.Tasks.Add(firstTask);
+
+        Assert.Equal(1, batch.TotalCount);
+        Assert.Equal(1, batch.PendingCount);
+        Assert.Equal(0, batch.FailedCount);
+        Assert.Equal(0, batch.TotalProgress, 6);
+
+        batch.Tasks.Add(secondTask);
+
+        Assert.Equal(2, batch.TotalCount);
+        Assert.Equal(1, batch.PendingCount);
+        Assert.Equal(1, batch.FailedCount);
+        Assert.Equal(5, batch.TotalProgress, 6);
+
+        batch.Tasks.Remove(firstTask);
+
+        Assert.Equal(1, batch.TotalCount);
+        Assert.Equal(0, batch.PendingCount);
+        Assert.Equal(1, batch.FailedCount);
+        Assert.Equal(10, batch.TotalProgress, 6);
+    }
+
     private static void AssertPendingFile(
         PendingBatchFileViewModel file,
         string inputPath,

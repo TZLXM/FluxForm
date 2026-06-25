@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using FluxForm.Core.Models;
 
 namespace FluxForm.WPF.ViewModels;
@@ -7,6 +9,11 @@ public class BatchItemViewModel : ObservableObject
 {
     private double _totalProgress;
     private bool _isExpanded;
+
+    public BatchItemViewModel()
+    {
+        Tasks.CollectionChanged += OnTasksCollectionChanged;
+    }
 
     public string BatchId { get; set; } = string.Empty;
     public ConversionCategory Category { get; set; }
@@ -46,5 +53,34 @@ public class BatchItemViewModel : ObservableObject
         OnPropertyChanged(nameof(RunningCount));
         OnPropertyChanged(nameof(SucceededCount));
         OnPropertyChanged(nameof(FailedCount));
+    }
+
+    private void OnTasksCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+        {
+            foreach (TaskItemViewModel task in e.OldItems)
+            {
+                task.PropertyChanged -= OnTaskPropertyChanged;
+            }
+        }
+
+        if (e.NewItems is not null)
+        {
+            foreach (TaskItemViewModel task in e.NewItems)
+            {
+                task.PropertyChanged += OnTaskPropertyChanged;
+            }
+        }
+
+        Refresh();
+    }
+
+    private void OnTaskPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(TaskItemViewModel.Status) or nameof(TaskItemViewModel.Progress))
+        {
+            Refresh();
+        }
     }
 }
