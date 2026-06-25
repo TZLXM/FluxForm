@@ -267,7 +267,7 @@ public class MainViewModel : ObservableObject
         CommandManager.InvalidateRequerySuggested();
         AppendLog("开始转换任务...");
 
-        var pending = Tasks.Where(t => t.Status == ConversionStatus.Pending).ToList();
+        var pending = PendingBatch.Create(Tasks).Items;
         var stopwatch = Stopwatch.StartNew();
 
         foreach (var task in pending)

@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net9.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\FluxForm.Core\FluxForm.Core.csproj" />
+    <ProjectReference Include="..\FluxForm.WPF\FluxForm.WPF.csproj" />
   </ItemGroup>
 
 </Project>
