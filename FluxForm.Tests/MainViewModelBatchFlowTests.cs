@@ -1,5 +1,10 @@
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO;
 using FluxForm.Core.Models;
+using FluxForm.Core.Services;
 using FluxForm.WPF.ViewModels;
 
 namespace FluxForm.Tests;
@@ -15,13 +20,170 @@ public class MainViewModelBatchFlowTests
         vm.PendingBatch.OutputFormat = "mkv";
         vm.PendingBatch.OutputDirectory = "D:/out";
         vm.PendingBatch.SetOption("videoCodec", "libx264");
+        vm.PendingBatch.SetOption("preset", "medium");
 
         vm.EnqueuePendingBatch();
 
-        Assert.Single(vm.Batches);
+        var batch = Assert.Single(vm.Batches);
+        var task = Assert.Single(batch.Tasks);
+        Assert.Equal(ConversionCategory.Video, task.Category);
+        Assert.StartsWith("D:/out", task.OutputPath);
+        Assert.EndsWith("demo_converted.mkv", task.OutputPath);
+        Assert.Equal(2, task.Options.Count);
+        Assert.Equal("libx264", task.Options["videoCodec"]);
+        Assert.Equal("medium", task.Options["preset"]);
         Assert.Empty(vm.PendingBatch.Files);
         Assert.False(vm.CanAddNewTasks);
         Assert.Equal(1, vm.TotalTaskCount);
+    }
+
+
+    [Fact]
+    public void RetryFailedTask_resets_only_the_selected_failed_task()
+    {
+        var vm = new MainViewModel();
+        var batch = new BatchItemViewModel { BatchId = "B001", Category = ConversionCategory.Video };
+        var target = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Failed, Message = "失败", Progress = 42 };
+        var otherFailed = new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Failed, Message = "失败", Progress = 17 };
+        var succeeded = new TaskItemViewModel { FileName = "c.mp4", Status = ConversionStatus.Succeeded, Message = "完成", Progress = 100 };
+        batch.Tasks.Add(target);
+        batch.Tasks.Add(otherFailed);
+        batch.Tasks.Add(succeeded);
+        vm.Batches.Add(batch);
+
+        vm.RetryFailedTask(target);
+
+        Assert.Equal(ConversionStatus.Pending, target.Status);
+        Assert.Equal("等待中", target.Message);
+        Assert.Equal(0, target.Progress);
+        Assert.Equal(ConversionStatus.Failed, otherFailed.Status);
+        Assert.Equal(17, otherFailed.Progress);
+        Assert.Equal(ConversionStatus.Succeeded, succeeded.Status);
+    }
+
+    [Fact]
+    public void RetryFailedTask_ignores_non_failed_task()
+    {
+        var vm = new MainViewModel();
+        var task = new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Succeeded, Message = "完成", Progress = 100 };
+        var batch = new BatchItemViewModel { BatchId = "B001", Category = ConversionCategory.Video };
+        batch.Tasks.Add(task);
+        vm.Batches.Add(batch);
+
+        vm.RetryFailedTask(task);
+
+        Assert.Equal(ConversionStatus.Succeeded, task.Status);
+        Assert.Equal("完成", task.Message);
+        Assert.Equal(100, task.Progress);
+    }
+
+    [Fact]
+    public void AddFiles_while_busy_does_not_add_pending_files()
+    {
+        using var tempDir = new TempDir();
+        var filePath = tempDir.CreateFile("demo.mp4");
+        var vm = new MainViewModel();
+        SetIsBusy(vm, true);
+
+        vm.AddFiles(new[] { filePath });
+
+        Assert.Empty(vm.PendingBatch.Files);
+    }
+
+    [Fact]
+    public void EnqueuePendingBatch_while_busy_does_not_add_batch()
+    {
+        var vm = new MainViewModel();
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4 · 1920×1080 · 30fps");
+        vm.PendingBatch.OutputFormat = "mkv";
+        SetIsBusy(vm, true);
+
+        vm.EnqueuePendingBatch();
+
+        Assert.Empty(vm.Batches);
+        Assert.Single(vm.PendingBatch.Files);
+    }
+
+    [Fact]
+    public async Task StartConversion_processes_tasks_in_serial_order()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+        AddBatch(vm, ("first.mp4", ConversionStatus.Succeeded, null), ("second.mp4", ConversionStatus.Succeeded, null));
+
+        vm.StartCommand.Execute(null);
+        await service.WaitForCallCountAsync(1);
+
+        Assert.Equal(new[] { "first.mp4" }, service.StartedFileNames);
+        Assert.Equal(ConversionStatus.Running, vm.Batches[0].Tasks[0].Status);
+        Assert.Equal(ConversionStatus.Pending, vm.Batches[0].Tasks[1].Status);
+
+        service.CompleteNext(ConversionResult.Success(service.StartedTasks[0].Id, "D:/out/first.mp4", TimeSpan.FromSeconds(1)));
+        await service.WaitForCallCountAsync(2);
+
+        Assert.Equal(new[] { "first.mp4", "second.mp4" }, service.StartedFileNames);
+        Assert.Equal(ConversionStatus.Succeeded, vm.Batches[0].Tasks[0].Status);
+        Assert.Equal(ConversionStatus.Running, vm.Batches[0].Tasks[1].Status);
+
+        service.CompleteNext(ConversionResult.Success(service.StartedTasks[1].Id, "D:/out/second.mp4", TimeSpan.FromSeconds(1)));
+        await WaitUntilAsync(() => !vm.IsBusy);
+
+        Assert.All(vm.Batches[0].Tasks, task => Assert.Equal(ConversionStatus.Succeeded, task.Status));
+    }
+
+    [Fact]
+    public async Task CancelConversion_marks_unfinished_tasks_as_failed()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+        AddBatch(vm, ("first.mp4", ConversionStatus.Succeeded, null), ("second.mp4", ConversionStatus.Succeeded, null), ("third.mp4", ConversionStatus.Succeeded, null));
+
+        vm.StartCommand.Execute(null);
+        await service.WaitForCallCountAsync(1);
+
+        vm.CancelCommand.Execute(null);
+        service.CompleteNext(ConversionResult.Cancelled(service.StartedTasks[0].Id));
+        await WaitUntilAsync(() => !vm.IsBusy);
+
+        var tasks = vm.Batches[0].Tasks;
+        Assert.Equal(ConversionStatus.Failed, tasks[0].Status);
+        Assert.Equal("失败：任务已停止", tasks[0].Message);
+        Assert.Equal(ConversionStatus.Failed, tasks[1].Status);
+        Assert.Equal(ConversionStatus.Failed, tasks[2].Status);
+    }
+
+    [Fact]
+    public async Task RetryFailedTask_returns_task_to_pending_and_requeues_it()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+        AddBatch(vm, ("first.mp4", ConversionStatus.Succeeded, null), ("second.mp4", ConversionStatus.Failed, "转码失败"));
+
+        vm.StartCommand.Execute(null);
+        await service.WaitForCallCountAsync(1);
+        service.CompleteNext(ConversionResult.Success(service.StartedTasks[0].Id, "D:/out/first.mp4", TimeSpan.FromSeconds(1)));
+        await service.WaitForCallCountAsync(2);
+        service.CompleteNext(ConversionResult.Failure(service.StartedTasks[1].Id, "转码失败", TimeSpan.FromSeconds(1)));
+        await WaitUntilAsync(() => !vm.IsBusy);
+
+        var failedTask = vm.Batches[0].Tasks[1];
+        Assert.Equal(ConversionStatus.Failed, failedTask.Status);
+
+        vm.RetryFailedTask(failedTask);
+
+        Assert.Equal(ConversionStatus.Pending, failedTask.Status);
+        Assert.Equal("等待中", failedTask.Message);
+        Assert.Equal(0, failedTask.Progress);
+
+        vm.StartCommand.Execute(null);
+        await service.WaitForCallCountAsync(3);
+
+        Assert.Equal("second.mp4", service.StartedFileNames.Last());
+        service.CompleteNext(ConversionResult.Success(service.StartedTasks[2].Id, "D:/out/second.mp4", TimeSpan.FromSeconds(1)));
+        await WaitUntilAsync(() => !vm.IsBusy);
+        await WaitUntilAsync(() => failedTask.Status == ConversionStatus.Succeeded);
+
+        Assert.Equal(ConversionStatus.Succeeded, failedTask.Status);
     }
 
     [Fact]
@@ -247,6 +409,151 @@ public class MainViewModelBatchFlowTests
         Assert.Equal(1, batch.PendingCount);
         Assert.Equal(0, batch.SucceededCount);
         Assert.Equal(0, batch.TotalProgress, 6);
+    }
+
+
+    private static MainViewModel CreateViewModel(IConversionService service)
+    {
+        return new MainViewModel(service);
+    }
+
+    private static void AddBatch(MainViewModel vm, params (string fileName, ConversionStatus resultStatus, string? errorMessage)[] files)
+    {
+        var batch = new BatchItemViewModel
+        {
+            BatchId = "B001",
+            Category = ConversionCategory.Video,
+            ConfigSummary = "MP4"
+        };
+
+        foreach (var (fileName, _, _) in files)
+        {
+            batch.Tasks.Add(new TaskItemViewModel
+            {
+                BatchId = batch.BatchId,
+                FileName = fileName,
+                InputPath = $"D:/media/{fileName}",
+                InputFormat = "mp4",
+                OutputFormat = "mkv",
+                OutputPath = $"D:/out/{Path.GetFileNameWithoutExtension(fileName)}_converted.mkv",
+                Category = ConversionCategory.Video,
+                Status = ConversionStatus.Pending,
+                Message = "等待中"
+            });
+        }
+
+        vm.Batches.Add(batch);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 5000)
+    {
+        var start = Environment.TickCount64;
+        while (!condition())
+        {
+            if (Environment.TickCount64 - start > timeoutMs)
+                throw new TimeoutException("Condition was not met within the timeout.");
+
+            await Task.Delay(20);
+        }
+    }
+
+    private sealed class ControlledConversionService : IConversionService
+    {
+        private readonly Queue<TaskCompletionSource<ConversionResult>> _pending = new();
+        private readonly TaskCompletionSource<bool> _callObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<ConversionTask> StartedTasks { get; } = new();
+        public List<string> StartedFileNames { get; } = new();
+
+        public Task<ConversionResult> ConvertAsync(ConversionTask task, IProgress<ProgressInfo>? progress = null, CancellationToken cancellationToken = default)
+        {
+            progress?.Report(new ProgressInfo
+            {
+                TaskId = task.Id,
+                Status = ConversionStatus.Running,
+                Percent = 5,
+                Message = "转换中..."
+            });
+
+            StartedTasks.Add(task);
+            StartedFileNames.Add(Path.GetFileName(task.InputPath));
+
+            var tcs = new TaskCompletionSource<ConversionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (cancellationToken.CanBeCanceled)
+            {
+                cancellationToken.Register(() =>
+                {
+                    if (!tcs.Task.IsCompleted)
+                        tcs.TrySetResult(ConversionResult.Cancelled(task.Id));
+                });
+            }
+
+            _pending.Enqueue(tcs);
+            _callObserved.TrySetResult(true);
+            return tcs.Task;
+        }
+
+        public IReadOnlyList<FormatInfo> GetFormats(ConversionCategory? category = null)
+        {
+            var formats = new[]
+            {
+                new FormatInfo { Category = ConversionCategory.Video, Extension = "mkv", Name = "MKV" },
+                new FormatInfo { Category = ConversionCategory.Video, Extension = "mp4", Name = "MP4" }
+            };
+
+            return category == null ? formats : formats.Where(x => x.Category == category).ToArray();
+        }
+
+        public async Task WaitForCallCountAsync(int expectedCount, int timeoutMs = 5000)
+        {
+            var start = Environment.TickCount64;
+            while (StartedTasks.Count < expectedCount)
+            {
+                if (Environment.TickCount64 - start > timeoutMs)
+                    throw new TimeoutException($"Expected {expectedCount} calls but saw {StartedTasks.Count}.");
+
+                await Task.Delay(20);
+            }
+        }
+
+        public void CompleteNext(ConversionResult result)
+        {
+            if (_pending.Count == 0)
+                throw new InvalidOperationException("No pending conversion to complete.");
+
+            var next = _pending.Dequeue();
+            next.TrySetResult(result);
+        }
+    }
+
+    private static void SetIsBusy(MainViewModel vm, bool value)
+    {
+        var property = typeof(MainViewModel).GetProperty(nameof(MainViewModel.IsBusy));
+        Assert.NotNull(property);
+        property.SetValue(vm, value);
+    }
+
+    private sealed class TempDir : IDisposable
+    {
+        public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"FluxFormTests_{Guid.NewGuid():N}");
+
+        public TempDir()
+        {
+            Directory.CreateDirectory(Path);
+        }
+
+        public string CreateFile(string name)
+        {
+            var filePath = System.IO.Path.Combine(Path, name);
+            File.WriteAllText(filePath, "test");
+            return filePath;
+        }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Path))
+                Directory.Delete(Path, true);
+        }
     }
 
     private static void AssertPendingFile(

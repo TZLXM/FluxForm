@@ -44,6 +44,12 @@ public class MainViewModel : ObservableObject
     public bool HasTasks => TotalTaskCount > 0;
     public bool IsEmpty => TotalTaskCount == 0;
     public bool NoFormatPresets => FormatPresets.Count == 0;
+    public bool HasPendingFiles => PendingBatch.Files.Count > 0;
+    public bool HasPendingValidationMessage => !string.IsNullOrWhiteSpace(PendingBatch.ValidationMessage);
+    public bool CanEnqueuePendingBatch => !IsBusy && PendingBatch.Category != null && PendingBatch.Files.Count > 0 && !string.IsNullOrWhiteSpace(PendingBatch.OutputFormat);
+    public string PendingCategoryText => PendingBatch.Category is { } category ? CategoryToString(category) : "未选择";
+    public string PendingFileSummary => PendingBatch.Files.Count == 0 ? "请添加同类型文件开始配置" : $"已选择 {PendingBatch.Files.Count} 个文件";
+    public string PendingOptionSummary => PendingBatch.Options.Count == 0 ? "未设置额外参数" : string.Join(" / ", PendingBatch.Options.Select(x => $"{x.Key}={x.Value}"));
 
     public RelayCommand AddFilesCommand { get; }
     public RelayCommand AddFolderCommand { get; }
@@ -118,19 +124,24 @@ public class MainViewModel : ObservableObject
     }
 
     public MainViewModel()
+        : this(CreateDefaultConversionService(), null)
     {
-        var toolsDir = Path.Combine(AppContext.BaseDirectory, "tools");
-        _dependencyManager = new DependencyManager(toolsDir, new Progress<string>(AppendLog));
-        _conversionService = new ConversionService(_dependencyManager);
+    }
+
+    public MainViewModel(IConversionService conversionService, DependencyManager? dependencyManager = null)
+    {
+        _dependencyManager = dependencyManager ?? CreateDefaultDependencyManager();
+        _conversionService = conversionService;
 
         Batches.CollectionChanged += OnBatchesCollectionChanged;
         PendingBatch.PropertyChanged += OnPendingBatchPropertyChanged;
+        PendingBatch.Files.CollectionChanged += OnPendingBatchFilesChanged;
 
         TasksView = CollectionViewSource.GetDefaultView(new ObservableCollection<TaskItemViewModel>());
 
-        AddFilesCommand = new RelayCommand(_ => AddFiles());
-        AddFolderCommand = new RelayCommand(_ => AddFolder());
-        EnqueuePendingBatchCommand = new RelayCommand(_ => EnqueuePendingBatch(), _ => !IsBusy);
+        AddFilesCommand = new RelayCommand(_ => AddFiles(), _ => !IsBusy);
+        AddFolderCommand = new RelayCommand(_ => AddFolder(), _ => !IsBusy);
+        EnqueuePendingBatchCommand = new RelayCommand(_ => EnqueuePendingBatch(), _ => CanEnqueuePendingBatch);
         RetryFailedTasksCommand = new RelayCommand(_ => RetryFailedTasks(), _ => !IsBusy && Batches.SelectMany(b => b.Tasks).Any(t => t.Status == ConversionStatus.Failed));
         ClearCommand = new RelayCommand(_ => ClearTasks(), _ => HasTasks && !IsBusy);
         StartCommand = new RelayCommand(_ => StartConversion(), _ => HasTasks && !IsBusy);
@@ -146,6 +157,9 @@ public class MainViewModel : ObservableObject
 
     public void AddFiles(IEnumerable<string> files)
     {
+        if (IsBusy)
+            return;
+
         foreach (var file in files)
         {
             if (!File.Exists(file))
@@ -169,15 +183,16 @@ public class MainViewModel : ObservableObject
 
     public void EnqueuePendingBatch()
     {
-        if (PendingBatch.Category == null || PendingBatch.Files.Count == 0 || string.IsNullOrWhiteSpace(PendingBatch.OutputFormat))
+        if (!CanEnqueuePendingBatch)
             return;
 
         var batchId = $"B{Batches.Count + 1:000}";
         var batch = new BatchItemViewModel
         {
             BatchId = batchId,
-            Category = PendingBatch.Category.Value,
-            ConfigSummary = BuildBatchSummary(PendingBatch)
+            Category = PendingBatch.Category!.Value,
+            ConfigSummary = BuildBatchSummary(PendingBatch),
+            IsExpanded = true
         };
 
         foreach (var file in PendingBatch.Files)
@@ -209,16 +224,44 @@ public class MainViewModel : ObservableObject
         RefreshAllBatchStats();
     }
 
+    public void RetryFailedTask(TaskItemViewModel? task)
+    {
+        if (task == null || task.Status != ConversionStatus.Failed)
+            return;
+
+        task.Status = ConversionStatus.Pending;
+        task.Message = "等待中";
+        task.Progress = 0;
+        RefreshAllBatchStats();
+    }
+
+    public void SetPendingOption(string key, string value)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return;
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            if (PendingBatch.Options.Remove(key))
+            {
+                RaisePendingStateChanged();
+                UpdateStatus();
+                CommandManager.InvalidateRequerySuggested();
+            }
+
+            return;
+        }
+
+        PendingBatch.SetOption(key, value);
+        RaisePendingStateChanged();
+        UpdateStatus();
+        CommandManager.InvalidateRequerySuggested();
+    }
+
     private void RetryFailedTasks()
     {
         foreach (var task in Batches.SelectMany(batch => batch.Tasks).Where(task => task.Status == ConversionStatus.Failed))
-        {
-            task.Status = ConversionStatus.Pending;
-            task.Message = "等待中";
-            task.Progress = 0;
-        }
-
-        RefreshAllBatchStats();
+            RetryFailedTask(task);
     }
 
     private void RefreshFormats()
@@ -277,6 +320,9 @@ public class MainViewModel : ObservableObject
 
     private void AddFolder()
     {
+        if (IsBusy)
+            return;
+
         var dialog = new OpenFolderDialog
         {
             Title = "选择包含待转换文件的文件夹",
@@ -325,6 +371,7 @@ public class MainViewModel : ObservableObject
             OutputFormat = outputFormat,
             OutputPath = GenerateOutputPath(file.InputPath, outputFormat),
             Category = PendingBatch.Category ?? GuessCategory(inputFormat),
+            Options = new Dictionary<string, string>(PendingBatch.Options, StringComparer.OrdinalIgnoreCase),
             Status = ConversionStatus.Pending,
             Message = "等待中",
             ParameterSummary = file.Summary
@@ -420,6 +467,12 @@ public class MainViewModel : ObservableObject
                         ? "已取消"
                         : $"失败：{result.ErrorMessage}";
                 AppendLog($"{task.FileName}: {task.Message}");
+
+                if (_cts.IsCancellationRequested && task.Status != ConversionStatus.Succeeded)
+                {
+                    MarkUnfinishedTasksAsFailed();
+                    break;
+                }
             }
             catch (Exception ex)
             {
@@ -445,7 +498,17 @@ public class MainViewModel : ObservableObject
     {
         _cts?.Cancel();
         AppendLog("用户请求取消转换...");
-        MarkUnfinishedTasksAsFailed();
+    }
+
+    private static DependencyManager CreateDefaultDependencyManager()
+    {
+        var toolsDir = Path.Combine(AppContext.BaseDirectory, "tools");
+        return new DependencyManager(toolsDir);
+    }
+
+    private static IConversionService CreateDefaultConversionService()
+    {
+        return new ConversionService(CreateDefaultDependencyManager());
     }
 
     private void OpenOutput(string? path)
@@ -543,8 +606,33 @@ public class MainViewModel : ObservableObject
         if (e.PropertyName is nameof(PendingBatchViewModel.OutputDirectory))
             OnPropertyChanged(nameof(OutputDirectory));
 
+        if (e.PropertyName is nameof(PendingBatchViewModel.Category) or nameof(PendingBatchViewModel.OutputFormat) or nameof(PendingBatchViewModel.ValidationMessage))
+        {
+            OnPropertyChanged(nameof(CanEnqueuePendingBatch));
+            OnPropertyChanged(nameof(PendingCategoryText));
+            OnPropertyChanged(nameof(HasPendingValidationMessage));
+            RefreshFormats();
+        }
+
         UpdateStatus();
         CommandManager.InvalidateRequerySuggested();
+    }
+
+    private void OnPendingBatchFilesChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        RaisePendingStateChanged();
+        UpdateStatus();
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    private void RaisePendingStateChanged()
+    {
+        OnPropertyChanged(nameof(HasPendingFiles));
+        OnPropertyChanged(nameof(CanEnqueuePendingBatch));
+        OnPropertyChanged(nameof(PendingCategoryText));
+        OnPropertyChanged(nameof(PendingFileSummary));
+        OnPropertyChanged(nameof(PendingOptionSummary));
+        OnPropertyChanged(nameof(HasPendingValidationMessage));
     }
 
     private static ConversionCategory GuessCategory(string extension)

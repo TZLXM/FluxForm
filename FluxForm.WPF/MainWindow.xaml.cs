@@ -12,9 +12,11 @@ public partial class MainWindow : FluentWindow
         DataContext = FindResource("ViewModel");
     }
 
+    private MainViewModel? ViewModel => DataContext as MainViewModel;
+
     private void Window_PreviewDragEnter(object sender, DragEventArgs e)
     {
-        if (e.Data.GetDataPresent(DataFormats.FileDrop))
+        if (e.Data.GetDataPresent(DataFormats.FileDrop) && ViewModel?.IsBusy != true)
         {
             e.Effects = DragDropEffects.Copy;
             DropOverlay.Visibility = Visibility.Visible;
@@ -27,7 +29,7 @@ public partial class MainWindow : FluentWindow
 
     private void Window_PreviewDragOver(object sender, DragEventArgs e)
     {
-        if (e.Data.GetDataPresent(DataFormats.FileDrop))
+        if (e.Data.GetDataPresent(DataFormats.FileDrop) && ViewModel?.IsBusy != true)
         {
             e.Effects = DragDropEffects.Copy;
             DropOverlay.Visibility = Visibility.Visible;
@@ -47,12 +49,28 @@ public partial class MainWindow : FluentWindow
     {
         DropOverlay.Visibility = Visibility.Collapsed;
 
-        if (e.Data.GetDataPresent(DataFormats.FileDrop) && DataContext is MainViewModel vm)
+        if (e.Data.GetDataPresent(DataFormats.FileDrop) && ViewModel is { IsBusy: false } vm)
         {
             var files = (string[])e.Data.GetData(DataFormats.FileDrop)!;
             vm.AddFiles(files);
         }
 
         e.Handled = true;
+    }
+
+    private void FrameRateTextBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (sender is TextBox textBox && ViewModel != null)
+        {
+            ViewModel.SetPendingOption("frameRate", textBox.Text.Trim());
+        }
+    }
+
+    private void AspectRatioTextBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (sender is TextBox textBox && ViewModel != null)
+        {
+            ViewModel.SetPendingOption("aspectRatio", textBox.Text.Trim());
+        }
     }
 }
