@@ -180,8 +180,7 @@ public class MainViewModelBatchFlowTests
 
         Assert.Equal("second.mp4", service.StartedFileNames.Last());
         service.CompleteNext(ConversionResult.Success(service.StartedTasks[2].Id, "D:/out/second.mp4", TimeSpan.FromSeconds(1)));
-        await WaitUntilAsync(() => !vm.IsBusy);
-        await WaitUntilAsync(() => failedTask.Status == ConversionStatus.Succeeded);
+        await WaitUntilAsync(() => !vm.IsBusy && failedTask.Status == ConversionStatus.Succeeded);
 
         Assert.Equal(ConversionStatus.Succeeded, failedTask.Status);
     }
