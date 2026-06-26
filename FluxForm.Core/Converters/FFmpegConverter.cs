@@ -141,6 +141,18 @@ public class FFmpegConverter : IConverter
             args.Add(vcodec);
         }
 
+        if (task.Options.TryGetValue("frameRate", out var frameRate) && !string.IsNullOrWhiteSpace(frameRate))
+        {
+            args.Add("-r");
+            args.Add(frameRate);
+        }
+
+        if (task.Options.TryGetValue("aspectRatio", out var aspectRatio) && !string.IsNullOrWhiteSpace(aspectRatio))
+        {
+            args.Add("-aspect");
+            args.Add(aspectRatio);
+        }
+
         if (task.Options.TryGetValue("quality", out var q) && int.TryParse(q, out var crf))
         {
             args.Add("-crf");

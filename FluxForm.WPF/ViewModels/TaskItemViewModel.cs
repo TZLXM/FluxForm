@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.IO;
 using FluxForm.Core.Models;
 
@@ -14,9 +15,12 @@ public class TaskItemViewModel : ObservableObject
     public Guid Id { get; } = Guid.NewGuid();
 
     public string FileName { get; set; } = string.Empty;
+    public string BatchId { get; set; } = string.Empty;
     public string InputPath { get; set; } = string.Empty;
     public string InputFormat { get; set; } = string.Empty;
     public ConversionCategory Category { get; set; }
+    public string ParameterSummary { get; set; } = string.Empty;
+    public Dictionary<string, string> Options { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     public string OutputFormat
     {
@@ -69,7 +73,8 @@ public class TaskItemViewModel : ObservableObject
             OutputPath = OutputPath,
             InputFormat = InputFormat,
             OutputFormat = OutputFormat,
-            Category = Category
+            Category = Category,
+            Options = new Dictionary<string, string>(Options, StringComparer.OrdinalIgnoreCase)
         };
     }
 }
