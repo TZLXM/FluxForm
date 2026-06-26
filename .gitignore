@@ -36,3 +36,5 @@ tools/ffmpeg/
 tools/libreoffice/
 tools-cache/
 .worktrees/
+.claude/
+.superpowers/
