@@ -19,6 +19,9 @@ public class MainWindowWorkspaceLayoutTests
         Assert.Contains("停止", xaml);
         Assert.Contains("清空", xaml);
         Assert.Contains("加入队列", xaml);
+        Assert.Contains("当前批次输出目录", xaml);
+        Assert.Contains("重新加入失败任务", xaml);
+        Assert.DoesNotContain("任务5", xaml);
     }
 
     [Fact]
@@ -29,8 +32,26 @@ public class MainWindowWorkspaceLayoutTests
         Assert.Contains("PendingBatch.Files", xaml);
         Assert.Contains("PendingBatch.OutputFormat", xaml);
         Assert.Contains("PendingBatch.ValidationMessage", xaml);
+        Assert.Contains("IsPendingBatchEmpty", xaml);
+        Assert.Contains("PendingFrameRate", xaml);
+        Assert.Contains("PendingAspectRatio", xaml);
         Assert.Contains("EnqueuePendingBatchCommand", xaml);
+        Assert.Contains("ClearPendingBatchCommand", xaml);
         Assert.Contains("ItemsSource=\"{Binding Batches}\"", xaml);
+        Assert.Contains("StatusText", xaml);
+        Assert.Contains("RemoveTaskCommand", xaml);
+        Assert.Contains("OpenOutputCommand", xaml);
+    }
+
+    [Fact]
+    public void MainWindow_output_format_picker_is_selection_only_and_uses_common_shortcuts()
+    {
+        var xaml = File.ReadAllText(GetProjectFile("FluxForm.WPF", "MainWindow.xaml"));
+
+        Assert.Contains("IsEditable=\"False\"", xaml);
+        Assert.DoesNotContain("Text=\"{Binding PendingBatch.OutputFormat", xaml);
+        Assert.Contains("ItemsSource=\"{Binding CommonFormatPresets}\"", xaml);
+        Assert.Contains("Command=\"{Binding DataContext.ApplyFormatCommand, RelativeSource={RelativeSource AncestorType=Window}}\"", xaml);
     }
 
     [Fact]
@@ -40,8 +61,10 @@ public class MainWindowWorkspaceLayoutTests
 
         Assert.Contains("public PendingBatchViewModel PendingBatch", source);
         Assert.Contains("public ObservableCollection<BatchItemViewModel> Batches", source);
+        Assert.Contains("public ObservableCollection<FormatPreset> CommonFormatPresets", source);
         Assert.Contains("public RelayCommand AddFolderCommand", source);
         Assert.Contains("public RelayCommand EnqueuePendingBatchCommand", source);
+        Assert.Contains("public RelayCommand ClearPendingBatchCommand", source);
         Assert.Contains("public RelayCommand RetryFailedTasksCommand", source);
     }
 

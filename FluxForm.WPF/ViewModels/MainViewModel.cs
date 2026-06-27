@@ -15,6 +15,9 @@ namespace FluxForm.WPF.ViewModels;
 
 public class MainViewModel : ObservableObject
 {
+    private const string FrameRateOptionKey = "frameRate";
+    private const string AspectRatioOptionKey = "aspectRatio";
+
     private readonly IConversionService _conversionService;
     private readonly DependencyManager _dependencyManager;
 
@@ -33,10 +36,19 @@ public class MainViewModel : ObservableObject
         [ConversionCategory.Document] = "pdf"
     };
 
+    private static readonly IReadOnlyDictionary<ConversionCategory, string[]> CommonFormatOrder = new Dictionary<ConversionCategory, string[]>
+    {
+        [ConversionCategory.Video] = new[] { "mp4", "mkv", "webm", "mov" },
+        [ConversionCategory.Audio] = new[] { "wav", "mp3", "flac", "ogg" },
+        [ConversionCategory.Image] = new[] { "png", "jpg" },
+        [ConversionCategory.Document] = new[] { "pdf", "docx", "xlsx", "pptx", "txt" }
+    };
+
     public PendingBatchViewModel PendingBatch { get; } = new();
     public ObservableCollection<BatchItemViewModel> Batches { get; } = new();
     public ObservableCollection<string> Categories { get; } = new() { "全部", "视频", "音频", "图片", "文档" };
     public ObservableCollection<FormatPreset> FormatPresets { get; } = new();
+    public ObservableCollection<FormatPreset> CommonFormatPresets { get; } = new();
     public ICollectionView TasksView { get; }
 
     public bool CanAddNewTasks => !IsBusy && Batches.Count == 0;
@@ -45,15 +57,35 @@ public class MainViewModel : ObservableObject
     public bool IsEmpty => TotalTaskCount == 0;
     public bool NoFormatPresets => FormatPresets.Count == 0;
     public bool HasPendingFiles => PendingBatch.Files.Count > 0;
+    public bool IsPendingBatchEmpty => PendingBatch.Files.Count == 0;
+    public bool HasPendingConfiguration => PendingBatch.Files.Count > 0
+        || PendingBatch.Category != null
+        || !string.IsNullOrWhiteSpace(PendingBatch.OutputFormat)
+        || !string.IsNullOrWhiteSpace(PendingBatch.OutputDirectory)
+        || PendingBatch.Options.Count > 0
+        || !string.IsNullOrWhiteSpace(PendingBatch.ValidationMessage);
     public bool HasPendingValidationMessage => !string.IsNullOrWhiteSpace(PendingBatch.ValidationMessage);
     public bool CanEnqueuePendingBatch => !IsBusy && PendingBatch.Category != null && PendingBatch.Files.Count > 0 && !string.IsNullOrWhiteSpace(PendingBatch.OutputFormat);
     public string PendingCategoryText => PendingBatch.Category is { } category ? CategoryToString(category) : "未选择";
     public string PendingFileSummary => PendingBatch.Files.Count == 0 ? "请添加同类型文件开始配置" : $"已选择 {PendingBatch.Files.Count} 个文件";
     public string PendingOptionSummary => PendingBatch.Options.Count == 0 ? "未设置额外参数" : string.Join(" / ", PendingBatch.Options.Select(x => $"{x.Key}={x.Value}"));
 
+    public string PendingFrameRate
+    {
+        get => GetPendingOption(FrameRateOptionKey);
+        set => SetPendingOption(FrameRateOptionKey, value);
+    }
+
+    public string PendingAspectRatio
+    {
+        get => GetPendingOption(AspectRatioOptionKey);
+        set => SetPendingOption(AspectRatioOptionKey, value);
+    }
+
     public RelayCommand AddFilesCommand { get; }
     public RelayCommand AddFolderCommand { get; }
     public RelayCommand EnqueuePendingBatchCommand { get; }
+    public RelayCommand ClearPendingBatchCommand { get; }
     public RelayCommand RetryFailedTasksCommand { get; }
     public RelayCommand ClearCommand { get; }
     public RelayCommand StartCommand { get; }
@@ -142,6 +174,7 @@ public class MainViewModel : ObservableObject
         AddFilesCommand = new RelayCommand(_ => AddFiles(), _ => !IsBusy);
         AddFolderCommand = new RelayCommand(_ => AddFolder(), _ => !IsBusy);
         EnqueuePendingBatchCommand = new RelayCommand(_ => EnqueuePendingBatch(), _ => CanEnqueuePendingBatch);
+        ClearPendingBatchCommand = new RelayCommand(_ => ClearPendingBatch(), _ => HasPendingConfiguration && !IsBusy);
         RetryFailedTasksCommand = new RelayCommand(_ => RetryFailedTasks(), _ => !IsBusy && Batches.SelectMany(b => b.Tasks).Any(t => t.Status == ConversionStatus.Failed));
         ClearCommand = new RelayCommand(_ => ClearTasks(), _ => HasTasks && !IsBusy);
         StartCommand = new RelayCommand(_ => StartConversion(), _ => HasTasks && !IsBusy);
@@ -204,17 +237,34 @@ public class MainViewModel : ObservableObject
         Batches.Add(batch);
         PendingBatch.Reset();
         OnPropertyChanged(nameof(OutputDirectory));
+        OnPropertyChanged(nameof(PendingFrameRate));
+        OnPropertyChanged(nameof(PendingAspectRatio));
         RefreshAllBatchStats();
     }
 
-    public void MarkUnfinishedTasksAsFailed()
+    public void ClearPendingBatch()
+    {
+        if (IsBusy || !HasPendingConfiguration)
+            return;
+
+        PendingBatch.Reset();
+        OnPropertyChanged(nameof(OutputDirectory));
+        OnPropertyChanged(nameof(PendingFrameRate));
+        OnPropertyChanged(nameof(PendingAspectRatio));
+        RaisePendingStateChanged();
+        RefreshFormats();
+        UpdateStatus();
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    public void MarkUnfinishedTasksAsCancelled()
     {
         foreach (var batch in Batches)
         {
-            foreach (var task in batch.Tasks.Where(t => t.Status is ConversionStatus.Pending or ConversionStatus.Running or ConversionStatus.Cancelled))
+            foreach (var task in batch.Tasks.Where(t => t.Status is ConversionStatus.Pending or ConversionStatus.Running))
             {
-                task.Status = ConversionStatus.Failed;
-                task.Message = "失败：任务已停止";
+                task.Status = ConversionStatus.Cancelled;
+                task.Message = "已取消：任务已停止";
                 task.Progress = 0;
             }
 
@@ -222,6 +272,11 @@ public class MainViewModel : ObservableObject
         }
 
         RefreshAllBatchStats();
+    }
+
+    public void MarkUnfinishedTasksAsFailed()
+    {
+        MarkUnfinishedTasksAsCancelled();
     }
 
     public void RetryFailedTask(TaskItemViewModel? task)
@@ -240,11 +295,14 @@ public class MainViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(key))
             return;
 
+        value = value.Trim();
+
         if (string.IsNullOrWhiteSpace(value))
         {
             if (PendingBatch.Options.Remove(key))
             {
                 RaisePendingStateChanged();
+                RaisePendingOptionPropertyChanged(key);
                 UpdateStatus();
                 CommandManager.InvalidateRequerySuggested();
             }
@@ -254,6 +312,7 @@ public class MainViewModel : ObservableObject
 
         PendingBatch.SetOption(key, value);
         RaisePendingStateChanged();
+        RaisePendingOptionPropertyChanged(key);
         UpdateStatus();
         CommandManager.InvalidateRequerySuggested();
     }
@@ -262,29 +321,48 @@ public class MainViewModel : ObservableObject
     {
         foreach (var task in Batches.SelectMany(batch => batch.Tasks).Where(task => task.Status == ConversionStatus.Failed))
             RetryFailedTask(task);
+
+        AppendLog("失败任务已重新加入待处理，点击“开始”继续转换。");
     }
 
     private void RefreshFormats()
     {
         FormatPresets.Clear();
-        var category = StringToCategory(SelectedCategory);
+        CommonFormatPresets.Clear();
+        var category = PendingBatch.Category ?? StringToCategory(SelectedCategory);
         if (category == null)
         {
             OnPropertyChanged(nameof(NoFormatPresets));
             return;
         }
 
-        foreach (var format in _conversionService.GetFormats(category.Value)
+        var presets = _conversionService.GetFormats(category.Value)
                      .Select(f => f.Extension)
+                     .Where(format => !string.IsNullOrWhiteSpace(format))
+                     .Select(format => format.TrimStart('.').ToLowerInvariant())
                      .Distinct(StringComparer.OrdinalIgnoreCase)
-                     .OrderBy(x => x))
+                     .OrderBy(x => x)
+                     .Select(format => new FormatPreset
+                     {
+                         Extension = format,
+                         DisplayName = format.ToUpperInvariant(),
+                         Category = category.Value
+                     })
+                     .ToList();
+
+        foreach (var preset in presets)
         {
-            FormatPresets.Add(new FormatPreset
+            FormatPresets.Add(preset);
+        }
+
+        if (CommonFormatOrder.TryGetValue(category.Value, out var commonFormats))
+        {
+            foreach (var commonFormat in commonFormats)
             {
-                Extension = format,
-                DisplayName = format.ToUpperInvariant(),
-                Category = category.Value
-            });
+                var preset = presets.FirstOrDefault(x => x.Extension.Equals(commonFormat, StringComparison.OrdinalIgnoreCase));
+                if (preset != null)
+                    CommonFormatPresets.Add(preset);
+            }
         }
 
         OnPropertyChanged(nameof(NoFormatPresets));
@@ -295,14 +373,18 @@ public class MainViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(format))
             return;
 
-        var category = StringToCategory(SelectedCategory);
+        format = format.TrimStart('.').Trim().ToLowerInvariant();
+        var category = PendingBatch.Category ?? StringToCategory(SelectedCategory);
+        if (category == null || !FormatPresets.Any(x => x.Extension.Equals(format, StringComparison.OrdinalIgnoreCase)))
+            return;
+
         if (category != null)
             _defaultFormats[category.Value] = format;
 
-        if (PendingBatch.Category == category || (category == null && PendingBatch.Category != null))
+        if (PendingBatch.Category != null || category != null)
             PendingBatch.OutputFormat = format;
 
-        AppendLog($"已将 {(category == null ? "全部" : CategoryToString(category.Value))} 目标格式设为 {format.ToUpperInvariant()}");
+        AppendLog($"已将 {(category == null ? "当前批次" : CategoryToString(category.Value))} 目标格式设为 {format.ToUpperInvariant()}");
         UpdateStatus();
     }
 
@@ -385,6 +467,10 @@ public class MainViewModel : ObservableObject
         if (!string.IsNullOrWhiteSpace(pendingBatch.OutputFormat))
             parts.Add(pendingBatch.OutputFormat.ToUpperInvariant());
 
+        parts.Add(string.IsNullOrWhiteSpace(pendingBatch.OutputDirectory)
+            ? "输出到源文件目录"
+            : $"输出到 {pendingBatch.OutputDirectory}");
+
         foreach (var option in pendingBatch.Options)
             parts.Add($"{option.Key}={option.Value}");
 
@@ -425,11 +511,15 @@ public class MainViewModel : ObservableObject
             .ToList();
         var stopwatch = Stopwatch.StartNew();
 
+        var wasCancelled = false;
+
         foreach (var task in pendingTasks)
         {
             if (_cts.IsCancellationRequested)
             {
                 AppendLog("转换已取消，停止后续任务。");
+                wasCancelled = true;
+                MarkUnfinishedTasksAsCancelled();
                 break;
             }
 
@@ -451,6 +541,9 @@ public class MainViewModel : ObservableObject
 
             var progress = new Progress<ProgressInfo>(info =>
             {
+                if (task.Status is ConversionStatus.Succeeded or ConversionStatus.Failed or ConversionStatus.Cancelled)
+                    return;
+
                 task.Progress = info.Percent;
                 task.Message = info.Message;
                 task.Status = info.Status;
@@ -470,9 +563,19 @@ public class MainViewModel : ObservableObject
 
                 if (_cts.IsCancellationRequested && task.Status != ConversionStatus.Succeeded)
                 {
-                    MarkUnfinishedTasksAsFailed();
+                    wasCancelled = true;
+                    MarkUnfinishedTasksAsCancelled();
                     break;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                task.Status = ConversionStatus.Cancelled;
+                task.Message = "已取消";
+                task.Progress = 0;
+                wasCancelled = true;
+                MarkUnfinishedTasksAsCancelled();
+                break;
             }
             catch (Exception ex)
             {
@@ -490,7 +593,9 @@ public class MainViewModel : ObservableObject
         IsBusy = false;
         RefreshAllBatchStats();
         CommandManager.InvalidateRequerySuggested();
-        AppendLog($"所有任务处理完毕。总耗时：{stopwatch.Elapsed.TotalSeconds:F1}s");
+        AppendLog(wasCancelled
+            ? $"转换已停止。总耗时：{stopwatch.Elapsed.TotalSeconds:F1}s"
+            : $"所有任务处理完毕。总耗时：{stopwatch.Elapsed.TotalSeconds:F1}s");
         UpdateStatus();
     }
 
@@ -524,6 +629,19 @@ public class MainViewModel : ObservableObject
         LogText += $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}";
     }
 
+    private string GetPendingOption(string key)
+    {
+        return PendingBatch.Options.TryGetValue(key, out var value) ? value : string.Empty;
+    }
+
+    private void RaisePendingOptionPropertyChanged(string key)
+    {
+        if (key.Equals(FrameRateOptionKey, StringComparison.OrdinalIgnoreCase))
+            OnPropertyChanged(nameof(PendingFrameRate));
+        else if (key.Equals(AspectRatioOptionKey, StringComparison.OrdinalIgnoreCase))
+            OnPropertyChanged(nameof(PendingAspectRatio));
+    }
+
     private void RefreshAllBatchStats()
     {
         foreach (var batch in Batches)
@@ -553,11 +671,12 @@ public class MainViewModel : ObservableObject
         var running = tasks.Count(task => task.Status == ConversionStatus.Running);
         var succeeded = tasks.Count(task => task.Status == ConversionStatus.Succeeded);
         var failed = tasks.Count(task => task.Status == ConversionStatus.Failed);
+        var cancelled = tasks.Count(task => task.Status == ConversionStatus.Cancelled);
         var dir = string.IsNullOrWhiteSpace(PendingBatch.OutputDirectory) ? "与源文件相同" : PendingBatch.OutputDirectory;
 
         if (IsBusy)
         {
-            StatusText = $"执行中 · 批次 {batchCount} · 运行 {running} · 待处理 {pending} · 完成 {succeeded} · 失败 {failed}";
+            StatusText = $"执行中 · 批次 {batchCount} · 运行 {running} · 待处理 {pending} · 完成 {succeeded} · 失败 {failed} · 取消 {cancelled}";
         }
         else if (total == 0)
         {
@@ -567,7 +686,11 @@ public class MainViewModel : ObservableObject
         }
         else
         {
-            StatusText = $"共 {batchCount} 个批次 / {total} 个任务 · 待处理 {pending} · 完成 {succeeded} · 失败 {failed} · 输出目录：{dir}";
+            var text = $"共 {batchCount} 个批次 / {total} 个任务 · 待处理 {pending} · 完成 {succeeded} · 失败 {failed} · 取消 {cancelled}";
+            if (PendingBatch.Files.Count > 0)
+                text += $" · 当前批次输出目录：{dir}";
+
+            StatusText = text;
         }
     }
 
@@ -594,7 +717,8 @@ public class MainViewModel : ObservableObject
             or nameof(BatchItemViewModel.PendingCount)
             or nameof(BatchItemViewModel.RunningCount)
             or nameof(BatchItemViewModel.SucceededCount)
-            or nameof(BatchItemViewModel.FailedCount))
+            or nameof(BatchItemViewModel.FailedCount)
+            or nameof(BatchItemViewModel.CancelledCount))
         {
             UpdateTotalProgress();
             UpdateStatus();
@@ -604,13 +728,21 @@ public class MainViewModel : ObservableObject
     private void OnPendingBatchPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName is nameof(PendingBatchViewModel.OutputDirectory))
+        {
             OnPropertyChanged(nameof(OutputDirectory));
+            OnPropertyChanged(nameof(HasPendingConfiguration));
+        }
 
         if (e.PropertyName is nameof(PendingBatchViewModel.Category) or nameof(PendingBatchViewModel.OutputFormat) or nameof(PendingBatchViewModel.ValidationMessage))
         {
             OnPropertyChanged(nameof(CanEnqueuePendingBatch));
             OnPropertyChanged(nameof(PendingCategoryText));
             OnPropertyChanged(nameof(HasPendingValidationMessage));
+            OnPropertyChanged(nameof(HasPendingConfiguration));
+        }
+
+        if (e.PropertyName is nameof(PendingBatchViewModel.Category))
+        {
             RefreshFormats();
         }
 
@@ -628,6 +760,8 @@ public class MainViewModel : ObservableObject
     private void RaisePendingStateChanged()
     {
         OnPropertyChanged(nameof(HasPendingFiles));
+        OnPropertyChanged(nameof(IsPendingBatchEmpty));
+        OnPropertyChanged(nameof(HasPendingConfiguration));
         OnPropertyChanged(nameof(CanEnqueuePendingBatch));
         OnPropertyChanged(nameof(PendingCategoryText));
         OnPropertyChanged(nameof(PendingFileSummary));

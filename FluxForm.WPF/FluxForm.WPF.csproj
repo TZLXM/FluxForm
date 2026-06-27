@@ -15,6 +15,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <IncludeAllContentForSelfExtract Condition="'$(PublishSingleFile)' == 'true'">true</IncludeAllContentForSelfExtract>
   </PropertyGroup>
 
   <Import Project="..\build\FFmpeg.targets" />

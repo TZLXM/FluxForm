@@ -48,8 +48,22 @@ public class TaskItemViewModel : ObservableObject
     public ConversionStatus Status
     {
         get => _status;
-        set => SetProperty(ref _status, value);
+        set
+        {
+            if (SetProperty(ref _status, value))
+                OnPropertyChanged(nameof(StatusText));
+        }
     }
+
+    public string StatusText => Status switch
+    {
+        ConversionStatus.Pending => "等待中",
+        ConversionStatus.Running => "转换中",
+        ConversionStatus.Succeeded => "已完成",
+        ConversionStatus.Failed => "失败",
+        ConversionStatus.Cancelled => "已取消",
+        _ => Status.ToString()
+    };
 
     public double Progress
     {

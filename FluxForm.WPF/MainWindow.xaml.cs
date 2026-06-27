@@ -58,19 +58,4 @@ public partial class MainWindow : FluentWindow
         e.Handled = true;
     }
 
-    private void FrameRateTextBox_LostFocus(object sender, RoutedEventArgs e)
-    {
-        if (sender is TextBox textBox && ViewModel != null)
-        {
-            ViewModel.SetPendingOption("frameRate", textBox.Text.Trim());
-        }
-    }
-
-    private void AspectRatioTextBox_LostFocus(object sender, RoutedEventArgs e)
-    {
-        if (sender is TextBox textBox && ViewModel != null)
-        {
-            ViewModel.SetPendingOption("aspectRatio", textBox.Text.Trim());
-        }
-    }
 }

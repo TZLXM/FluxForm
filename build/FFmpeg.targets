@@ -1,10 +1,12 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <!--
-    发布时自动将 ffmpeg 放到发布目录的 tools/ffmpeg/ 下，
-    使 FluxForm 可以像格式工厂一样作为一个独立目录运行。
+    Publish can optionally bundle ffmpeg into tools/ffmpeg/.
 
-    优先使用项目根目录 tools-cache/ffmpeg-release-essentials.zip 本地缓存；
-    如果缓存不存在，则从 gyan.dev 下载。
+    Normal publish stays fast and does not download from the network. If
+    tools-cache/ffmpeg-release-essentials.zip exists, ffmpeg is bundled from
+    that cache. To allow a network download, pass:
+
+      -p:BundleFFmpeg=true -p:DownloadFFmpegDuringPublish=true
   -->
   <PropertyGroup>
     <FFmpegUrl>https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip</FFmpegUrl>
@@ -13,44 +15,24 @@
     <FFmpegArchiveName>ffmpeg-release-essentials.zip</FFmpegArchiveName>
     <FFmpegArchivePath>$([System.IO.Path]::Combine($(FFmpegPublishDir), $(FFmpegArchiveName)))</FFmpegArchivePath>
     <FFmpegCachePath>$([System.IO.Path]::Combine($(MSBuildThisFileDirectory), '..', 'tools-cache', $(FFmpegArchiveName)))</FFmpegCachePath>
+    <BundleFFmpeg Condition="'$(BundleFFmpeg)' == '' and Exists('$(FFmpegCachePath)')">true</BundleFFmpeg>
+    <BundleFFmpeg Condition="'$(BundleFFmpeg)' == ''">false</BundleFFmpeg>
+    <DownloadFFmpegDuringPublish Condition="'$(DownloadFFmpegDuringPublish)' == ''">false</DownloadFFmpegDuringPublish>
+    <FFmpegDownloadSwitch Condition="'$(DownloadFFmpegDuringPublish)' == 'true'">-AllowDownload</FFmpegDownloadSwitch>
   </PropertyGroup>
 
-  <Target Name="DownloadFFmpegForPublish" AfterTargets="Publish">
-    <Message Text="[FluxForm] 准备内置 ffmpeg：$(FFmpegPublishDir)" Importance="high" />
-    <MakeDir Directories="$(FFmpegPublishDir)" />
-
-    <!-- 优先使用本地缓存，避免每次都联网下载 -->
-    <PropertyGroup>
-      <FFmpegSourcePath Condition="Exists('$(FFmpegCachePath)')">$(FFmpegCachePath)</FFmpegSourcePath>
-      <FFmpegSourcePath Condition="'$(FFmpegSourcePath)' == ''">$(FFmpegUrl)</FFmpegSourcePath>
-    </PropertyGroup>
-
-    <Message Text="[FluxForm] ffmpeg 来源：$(FFmpegSourcePath)" Importance="high" />
-
-    <Copy
-      Condition="Exists('$(FFmpegCachePath)')"
-      SourceFiles="$(FFmpegCachePath)"
-      DestinationFiles="$(FFmpegArchivePath)"
-      SkipUnchangedFiles="true" />
-
-    <DownloadFile
-      Condition="!Exists('$(FFmpegArchivePath)')"
-      SourceUrl="$(FFmpegUrl)"
-      DestinationFolder="$(FFmpegPublishDir)"
-      DestinationFileName="$(FFmpegArchiveName)"
-      SkipUnchangedFiles="true" />
-
-    <Unzip
-      SourceFiles="$(FFmpegArchivePath)"
-      DestinationFolder="$(FFmpegPublishDir)"
-      OverwriteReadOnlyFiles="true" />
-
+  <Target Name="CleanStaleFFmpegArchiveForPublish"
+          AfterTargets="Publish"
+          BeforeTargets="BundleFFmpegForPublish"
+          Condition="Exists('$(FFmpegArchivePath)')">
+    <Message Text="[FluxForm] 删除发布目录中的残留 ffmpeg 压缩包：$(FFmpegArchivePath)" Importance="high" />
     <Delete Files="$(FFmpegArchivePath)" />
+  </Target>
 
-    <!--
-      gyan.dev 的 zip 解压后包含一层版本号文件夹，
-      我们需要把 bin/ffmpeg.exe、ffprobe.exe 等文件移动到 tools/ffmpeg/ 根目录。
-    -->
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)ExtractFfmpeg.ps1&quot; -PublishDir &quot;$(FFmpegPublishRoot)&quot;" />
+  <Target Name="BundleFFmpegForPublish"
+          AfterTargets="Publish"
+          Condition="'$(BundleFFmpeg)' == 'true'">
+    <Message Text="[FluxForm] 准备内置 ffmpeg：$(FFmpegPublishDir)" Importance="high" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)BundleFfmpegForPublish.ps1&quot; -PublishDir &quot;$(FFmpegPublishRoot)&quot; -CachePath &quot;$(FFmpegCachePath)&quot; -DownloadUrl &quot;$(FFmpegUrl)&quot; $(FFmpegDownloadSwitch)" />
   </Target>
 </Project>

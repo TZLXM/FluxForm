@@ -27,6 +27,7 @@ public class BatchItemViewModel : ObservableObject, IDisposable
     public int RunningCount { get; private set; }
     public int SucceededCount { get; private set; }
     public int FailedCount { get; private set; }
+    public int CancelledCount { get; private set; }
 
     public double TotalProgress
     {
@@ -46,7 +47,8 @@ public class BatchItemViewModel : ObservableObject, IDisposable
         PendingCount = Tasks.Count(t => t.Status == ConversionStatus.Pending);
         RunningCount = Tasks.Count(t => t.Status == ConversionStatus.Running);
         SucceededCount = Tasks.Count(t => t.Status == ConversionStatus.Succeeded);
-        FailedCount = Tasks.Count(t => t.Status == ConversionStatus.Failed || t.Status == ConversionStatus.Cancelled);
+        FailedCount = Tasks.Count(t => t.Status == ConversionStatus.Failed);
+        CancelledCount = Tasks.Count(t => t.Status == ConversionStatus.Cancelled);
         TotalProgress = Tasks.Count == 0 ? 0 : Tasks.Average(t => t.Progress);
 
         OnPropertyChanged(nameof(TotalCount));
@@ -54,6 +56,7 @@ public class BatchItemViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(RunningCount));
         OnPropertyChanged(nameof(SucceededCount));
         OnPropertyChanged(nameof(FailedCount));
+        OnPropertyChanged(nameof(CancelledCount));
     }
 
     public void Dispose()

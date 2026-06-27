@@ -21,6 +21,7 @@ public class MainViewModelBatchFlowTests
         vm.PendingBatch.OutputDirectory = "D:/out";
         vm.PendingBatch.SetOption("videoCodec", "libx264");
         vm.PendingBatch.SetOption("preset", "medium");
+        vm.SetPendingOption("frameRate", "30");
 
         vm.EnqueuePendingBatch();
 
@@ -29,12 +30,139 @@ public class MainViewModelBatchFlowTests
         Assert.Equal(ConversionCategory.Video, task.Category);
         Assert.StartsWith("D:/out", task.OutputPath);
         Assert.EndsWith("demo_converted.mkv", task.OutputPath);
-        Assert.Equal(2, task.Options.Count);
+        Assert.Equal(3, task.Options.Count);
         Assert.Equal("libx264", task.Options["videoCodec"]);
         Assert.Equal("medium", task.Options["preset"]);
+        Assert.Equal("30", task.Options["frameRate"]);
         Assert.Empty(vm.PendingBatch.Files);
+        Assert.True(vm.IsPendingBatchEmpty);
+        Assert.Equal(string.Empty, vm.PendingFrameRate);
+        Assert.Equal(string.Empty, vm.PendingAspectRatio);
         Assert.False(vm.CanAddNewTasks);
         Assert.Equal(1, vm.TotalTaskCount);
+    }
+
+    [Fact]
+    public void PendingBatch_state_is_independent_from_queued_batch_empty_state()
+    {
+        var vm = new MainViewModel();
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4");
+        vm.PendingBatch.OutputFormat = "mkv";
+
+        vm.EnqueuePendingBatch();
+
+        Assert.False(vm.IsEmpty);
+        Assert.True(vm.IsPendingBatchEmpty);
+        Assert.Equal("请添加同类型文件开始配置", vm.PendingFileSummary);
+    }
+
+    [Fact]
+    public void Pending_category_refreshes_format_presets_for_that_category()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+
+        Assert.Empty(vm.FormatPresets);
+
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4");
+
+        Assert.Collection(
+            vm.FormatPresets.OrderBy(x => x.Extension),
+            preset => Assert.Equal("mkv", preset.Extension),
+            preset => Assert.Equal("mp4", preset.Extension));
+    }
+
+    [Fact]
+    public void Selecting_output_format_does_not_rebuild_format_presets()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4");
+        var collectionChangedCount = 0;
+        vm.FormatPresets.CollectionChanged += (_, _) => collectionChangedCount++;
+
+        vm.PendingBatch.OutputFormat = "mkv";
+
+        Assert.Equal("mkv", vm.PendingBatch.OutputFormat);
+        Assert.True(vm.CanEnqueuePendingBatch);
+        Assert.Equal(0, collectionChangedCount);
+    }
+
+    [Fact]
+    public void ClearPendingBatchCommand_clears_pending_configuration_without_touching_queue()
+    {
+        var vm = new MainViewModel();
+        var batch = new BatchItemViewModel { BatchId = "B001", Category = ConversionCategory.Video };
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "queued.mp4", Status = ConversionStatus.Pending });
+        vm.Batches.Add(batch);
+
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4");
+        vm.PendingBatch.OutputFormat = "mkv";
+        vm.OutputDirectory = "D:/out";
+        vm.PendingFrameRate = "60";
+
+        Assert.True(vm.ClearPendingBatchCommand.CanExecute(null));
+
+        vm.ClearPendingBatchCommand.Execute(null);
+
+        Assert.Single(vm.Batches);
+        Assert.Empty(vm.PendingBatch.Files);
+        Assert.Null(vm.PendingBatch.Category);
+        Assert.Equal(string.Empty, vm.PendingBatch.OutputFormat);
+        Assert.Equal(string.Empty, vm.OutputDirectory);
+        Assert.Equal(string.Empty, vm.PendingFrameRate);
+        Assert.False(vm.CanEnqueuePendingBatch);
+        Assert.Empty(vm.FormatPresets);
+        Assert.Empty(vm.CommonFormatPresets);
+    }
+
+    [Fact]
+    public void Common_format_presets_are_limited_for_audio_and_image_batches()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+
+        vm.PendingBatch.TryAddFile("D:/media/song.wav", ConversionCategory.Audio, 1024, "WAV");
+
+        Assert.Equal(new[] { "wav", "mp3", "flac", "ogg" }, vm.CommonFormatPresets.Select(x => x.Extension));
+
+        vm.PendingBatch.Reset();
+        vm.PendingBatch.TryAddFile("D:/media/photo.webp", ConversionCategory.Image, 1024, "WEBP");
+
+        Assert.Equal(new[] { "png", "jpg" }, vm.CommonFormatPresets.Select(x => x.Extension));
+    }
+
+    [Fact]
+    public void ApplyFormatCommand_accepts_non_first_common_format()
+    {
+        var service = new ControlledConversionService();
+        var vm = CreateViewModel(service);
+        vm.PendingBatch.TryAddFile("D:/media/song.wav", ConversionCategory.Audio, 1024, "WAV");
+
+        vm.ApplyFormatCommand.Execute("flac");
+
+        Assert.Equal("flac", vm.PendingBatch.OutputFormat);
+        Assert.True(vm.CanEnqueuePendingBatch);
+    }
+
+    [Fact]
+    public void Pending_option_properties_update_options_and_clear_on_reset()
+    {
+        var vm = new MainViewModel();
+
+        vm.PendingFrameRate = "60";
+        vm.PendingAspectRatio = "16:9";
+
+        Assert.Equal("60", vm.PendingBatch.Options["frameRate"]);
+        Assert.Equal("16:9", vm.PendingBatch.Options["aspectRatio"]);
+
+        vm.PendingBatch.TryAddFile("D:/media/demo.mp4", ConversionCategory.Video, 1024, "MP4");
+        vm.PendingBatch.OutputFormat = "mp4";
+        vm.EnqueuePendingBatch();
+
+        Assert.Equal(string.Empty, vm.PendingFrameRate);
+        Assert.Equal(string.Empty, vm.PendingAspectRatio);
+        Assert.Empty(vm.PendingBatch.Options);
     }
 
 
@@ -132,7 +260,7 @@ public class MainViewModelBatchFlowTests
     }
 
     [Fact]
-    public async Task CancelConversion_marks_unfinished_tasks_as_failed()
+    public async Task CancelConversion_marks_unfinished_tasks_as_cancelled()
     {
         var service = new ControlledConversionService();
         var vm = CreateViewModel(service);
@@ -146,10 +274,10 @@ public class MainViewModelBatchFlowTests
         await WaitUntilAsync(() => !vm.IsBusy);
 
         var tasks = vm.Batches[0].Tasks;
-        Assert.Equal(ConversionStatus.Failed, tasks[0].Status);
-        Assert.Equal("失败：任务已停止", tasks[0].Message);
-        Assert.Equal(ConversionStatus.Failed, tasks[1].Status);
-        Assert.Equal(ConversionStatus.Failed, tasks[2].Status);
+        Assert.Equal(ConversionStatus.Cancelled, tasks[0].Status);
+        Assert.Equal("已取消", tasks[0].Message);
+        Assert.Equal(ConversionStatus.Cancelled, tasks[1].Status);
+        Assert.Equal(ConversionStatus.Cancelled, tasks[2].Status);
     }
 
     [Fact]
@@ -186,7 +314,7 @@ public class MainViewModelBatchFlowTests
     }
 
     [Fact]
-    public void MainViewModel_stop_marks_unfinished_tasks_as_failed()
+    public void MainViewModel_stop_marks_unfinished_tasks_as_cancelled()
     {
         var vm = new MainViewModel();
         var batch = new BatchItemViewModel { BatchId = "B001", Category = ConversionCategory.Video };
@@ -195,10 +323,10 @@ public class MainViewModelBatchFlowTests
         batch.Tasks.Add(new TaskItemViewModel { FileName = "c.mp4", Status = ConversionStatus.Succeeded });
         vm.Batches.Add(batch);
 
-        vm.MarkUnfinishedTasksAsFailed();
+        vm.MarkUnfinishedTasksAsCancelled();
 
-        Assert.Equal(ConversionStatus.Failed, batch.Tasks[0].Status);
-        Assert.Equal(ConversionStatus.Failed, batch.Tasks[1].Status);
+        Assert.Equal(ConversionStatus.Cancelled, batch.Tasks[0].Status);
+        Assert.Equal(ConversionStatus.Cancelled, batch.Tasks[1].Status);
         Assert.Equal(ConversionStatus.Succeeded, batch.Tasks[2].Status);
     }
 
@@ -294,6 +422,7 @@ public class MainViewModelBatchFlowTests
         Assert.Equal(1, batch.PendingCount);
         Assert.Equal(1, batch.SucceededCount);
         Assert.Equal(1, batch.FailedCount);
+        Assert.Equal(0, batch.CancelledCount);
         Assert.Equal(33.333333333333336, batch.TotalProgress, 6);
     }
 
@@ -355,15 +484,55 @@ public class MainViewModelBatchFlowTests
 
         Assert.Equal(2, batch.TotalCount);
         Assert.Equal(1, batch.PendingCount);
-        Assert.Equal(1, batch.FailedCount);
+        Assert.Equal(0, batch.FailedCount);
+        Assert.Equal(1, batch.CancelledCount);
         Assert.Equal(5, batch.TotalProgress, 6);
 
         batch.Tasks.Remove(firstTask);
 
         Assert.Equal(1, batch.TotalCount);
         Assert.Equal(0, batch.PendingCount);
-        Assert.Equal(1, batch.FailedCount);
+        Assert.Equal(0, batch.FailedCount);
+        Assert.Equal(1, batch.CancelledCount);
         Assert.Equal(10, batch.TotalProgress, 6);
+    }
+
+    [Fact]
+    public void TaskItem_exposes_localized_status_text()
+    {
+        var task = new TaskItemViewModel { Status = ConversionStatus.Pending };
+        Assert.Equal("等待中", task.StatusText);
+
+        task.Status = ConversionStatus.Running;
+        Assert.Equal("转换中", task.StatusText);
+
+        task.Status = ConversionStatus.Succeeded;
+        Assert.Equal("已完成", task.StatusText);
+
+        task.Status = ConversionStatus.Failed;
+        Assert.Equal("失败", task.StatusText);
+
+        task.Status = ConversionStatus.Cancelled;
+        Assert.Equal("已取消", task.StatusText);
+    }
+
+    [Fact]
+    public void StatusText_for_queued_tasks_separates_cancelled_count_and_omits_pending_output_directory()
+    {
+        var vm = new MainViewModel
+        {
+            OutputDirectory = "D:/pending-output"
+        };
+        var batch = new BatchItemViewModel { BatchId = "B001", Category = ConversionCategory.Video };
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "a.mp4", Status = ConversionStatus.Pending });
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "b.mp4", Status = ConversionStatus.Failed });
+        batch.Tasks.Add(new TaskItemViewModel { FileName = "c.mp4", Status = ConversionStatus.Cancelled });
+
+        vm.Batches.Add(batch);
+
+        Assert.Contains("取消 1", vm.StatusText);
+        Assert.Contains("失败 1", vm.StatusText);
+        Assert.DoesNotContain("D:/pending-output", vm.StatusText);
     }
 
     [Fact]
@@ -497,7 +666,17 @@ public class MainViewModelBatchFlowTests
             var formats = new[]
             {
                 new FormatInfo { Category = ConversionCategory.Video, Extension = "mkv", Name = "MKV" },
-                new FormatInfo { Category = ConversionCategory.Video, Extension = "mp4", Name = "MP4" }
+                new FormatInfo { Category = ConversionCategory.Video, Extension = "mp4", Name = "MP4" },
+                new FormatInfo { Category = ConversionCategory.Audio, Extension = "aac", Name = "AAC" },
+                new FormatInfo { Category = ConversionCategory.Audio, Extension = "flac", Name = "FLAC" },
+                new FormatInfo { Category = ConversionCategory.Audio, Extension = "mp3", Name = "MP3" },
+                new FormatInfo { Category = ConversionCategory.Audio, Extension = "ogg", Name = "OGG" },
+                new FormatInfo { Category = ConversionCategory.Audio, Extension = "opus", Name = "OPUS" },
+                new FormatInfo { Category = ConversionCategory.Audio, Extension = "wav", Name = "WAV" },
+                new FormatInfo { Category = ConversionCategory.Image, Extension = "gif", Name = "GIF" },
+                new FormatInfo { Category = ConversionCategory.Image, Extension = "jpg", Name = "JPG" },
+                new FormatInfo { Category = ConversionCategory.Image, Extension = "png", Name = "PNG" },
+                new FormatInfo { Category = ConversionCategory.Image, Extension = "webp", Name = "WEBP" }
             };
 
             return category == null ? formats : formats.Where(x => x.Category == category).ToArray();

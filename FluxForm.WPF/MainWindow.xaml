@@ -55,7 +55,7 @@
                     <ui:Button Margin="0,0,8,8" Command="{Binding StartCommand}" Icon="{ui:SymbolIcon Play24}">开始</ui:Button>
                     <ui:Button Margin="0,0,8,8" Command="{Binding CancelCommand}" Icon="{ui:SymbolIcon Dismiss24}">停止</ui:Button>
                     <ui:Button Margin="0,0,8,8" Command="{Binding ClearCommand}" Icon="{ui:SymbolIcon Delete24}">清空</ui:Button>
-                    <ui:Button Margin="0,0,8,8" Command="{Binding RetryFailedTasksCommand}" Icon="{ui:SymbolIcon ArrowClockwise24}">重试失败任务</ui:Button>
+                    <ui:Button Margin="0,0,8,8" Command="{Binding RetryFailedTasksCommand}" Icon="{ui:SymbolIcon ArrowClockwise24}">重新加入失败任务</ui:Button>
                 </WrapPanel>
 
                 <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
@@ -130,7 +130,7 @@
 
                                     <StackPanel HorizontalAlignment="Center"
                                                 VerticalAlignment="Center"
-                                                Visibility="{Binding IsEmpty, Converter={StaticResource BoolToVisibilityConverter}}">
+                                                Visibility="{Binding IsPendingBatchEmpty, Converter={StaticResource BoolToVisibilityConverter}}">
                                         <ui:SymbolIcon FontSize="42" Symbol="ArrowUpload24" />
                                         <TextBlock Margin="0,10,0,0" FontWeight="SemiBold" Text="拖拽或点击上方按钮添加文件" />
                                         <TextBlock Margin="0,4,0,0" Opacity="0.72" Text="同一批次仅支持单一类型文件。" />
@@ -149,11 +149,10 @@
                                 </Grid.ColumnDefinitions>
                                 <ComboBox Grid.Column="0"
                                           Height="36"
-                                          IsEditable="True"
+                                          IsEditable="False"
                                           ItemsSource="{Binding FormatPresets}"
                                           SelectedValue="{Binding PendingBatch.OutputFormat, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                          SelectedValuePath="Extension"
-                                          Text="{Binding PendingBatch.OutputFormat, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}">
+                                          SelectedValuePath="Extension">
                                     <ComboBox.ItemTemplate>
                                         <DataTemplate>
                                             <TextBlock Text="{Binding DisplayName}" />
@@ -165,7 +164,7 @@
                                            Opacity="0.72"
                                            Text="也可点击下方格式快捷入口" />
                             </Grid>
-                            <ItemsControl Margin="0,10,0,0" ItemsSource="{Binding FormatPresets}">
+                            <ItemsControl Margin="0,10,0,0" ItemsSource="{Binding CommonFormatPresets}">
                                 <ItemsControl.ItemsPanel>
                                     <ItemsPanelTemplate>
                                         <WrapPanel />
@@ -175,7 +174,7 @@
                                     <DataTemplate>
                                         <ui:Button Margin="0,0,8,8"
                                                    Padding="12,4"
-                                                   Command="{Binding DataContext.ApplyFormatCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                   Command="{Binding DataContext.ApplyFormatCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                    CommandParameter="{Binding Extension}">
                                             <TextBlock Text="{Binding DisplayName}" />
                                         </ui:Button>
@@ -186,18 +185,18 @@
 
                         <StackPanel Margin="0,18,0,0">
                             <TextBlock FontSize="14" FontWeight="SemiBold" Text="基础参数" />
-                            <TextBlock Margin="0,4,0,0" Opacity="0.72" Text="任务5只提供最小可编辑入口，不扩展完整参数面板。" />
+                            <TextBlock Margin="0,4,0,0" Opacity="0.72" Text="按需设置帧率和画面比例；留空则使用默认参数。" />
                             <UniformGrid Margin="0,10,0,0" Columns="2" Rows="2">
                                 <StackPanel Margin="0,0,8,8">
                                     <TextBlock Margin="0,0,0,4" Text="frameRate" />
-                                    <TextBox x:Name="FrameRateTextBox" Height="36" LostFocus="FrameRateTextBox_LostFocus" ToolTip="例如 24 / 30 / 60" />
+                                    <TextBox Height="36" Text="{Binding PendingFrameRate, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" ToolTip="例如 24 / 30 / 60" />
                                 </StackPanel>
                                 <StackPanel Margin="8,0,0,8">
                                     <TextBlock Margin="0,0,0,4" Text="aspectRatio" />
-                                    <TextBox x:Name="AspectRatioTextBox" Height="36" LostFocus="AspectRatioTextBox_LostFocus" ToolTip="例如 16:9 / 4:3" />
+                                    <TextBox Height="36" Text="{Binding PendingAspectRatio, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" ToolTip="例如 16:9 / 4:3" />
                                 </StackPanel>
                                 <StackPanel Margin="0,0,8,0">
-                                    <TextBlock Margin="0,0,0,4" Text="输出目录" />
+                                    <TextBlock Margin="0,0,0,4" Text="当前批次输出目录" />
                                     <TextBox Height="36" IsReadOnly="True" Text="{Binding OutputDirectory}" />
                                 </StackPanel>
                                 <StackPanel Margin="8,0,0,0">
@@ -218,6 +217,13 @@
                         </Border>
 
                         <ui:Button Margin="0,18,0,0"
+                                   Height="36"
+                                   Command="{Binding ClearPendingBatchCommand}"
+                                   Icon="{ui:SymbolIcon Delete24}">
+                            清除待配置
+                        </ui:Button>
+
+                        <ui:Button Margin="0,8,0,0"
                                    Height="40"
                                    Command="{Binding EnqueuePendingBatchCommand}"
                                    Icon="{ui:SymbolIcon Add24}">
@@ -270,6 +276,7 @@
                                                     <StackPanel Grid.Column="1" HorizontalAlignment="Right">
                                                         <TextBlock HorizontalAlignment="Right" Text="{Binding SucceededCount, StringFormat=完成 {0}}" />
                                                         <TextBlock HorizontalAlignment="Right" Text="{Binding FailedCount, StringFormat=失败 {0}}" />
+                                                        <TextBlock HorizontalAlignment="Right" Text="{Binding CancelledCount, StringFormat=取消 {0}}" />
                                                         <TextBlock HorizontalAlignment="Right" Text="{Binding PendingCount, StringFormat=待处理 {0}}" />
                                                     </StackPanel>
                                                 </Grid>
@@ -299,9 +306,24 @@
                                                                         <TextBlock FontWeight="SemiBold" Text="{Binding FileName}" TextTrimming="CharacterEllipsis" />
                                                                         <TextBlock Margin="0,6,0,0" Opacity="0.72" Text="{Binding OutputFormat, StringFormat=目标：{0}}" />
                                                                         <TextBlock Margin="0,4,0,0" Opacity="0.72" Text="{Binding ParameterSummary}" TextWrapping="Wrap" />
-                                                                        <TextBlock Margin="0,8,0,0" FontWeight="SemiBold" Text="{Binding Status}" />
+                                                                        <TextBlock Margin="0,8,0,0" FontWeight="SemiBold" Text="{Binding StatusText}" />
                                                                         <ProgressBar Margin="0,8,0,0" Height="6" Maximum="100" Value="{Binding Progress, Mode=OneWay}" />
                                                                         <TextBlock Margin="0,8,0,0" FontSize="12" Opacity="0.72" Text="{Binding Message}" TextWrapping="Wrap" />
+                                                                        <StackPanel Margin="0,10,0,0" Orientation="Horizontal">
+                                                                            <ui:Button Margin="0,0,8,0"
+                                                                                       Padding="8,2"
+                                                                                       Command="{Binding DataContext.OpenOutputCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                       CommandParameter="{Binding OutputPath}"
+                                                                                       Icon="{ui:SymbolIcon FolderOpen24}">
+                                                                                打开位置
+                                                                            </ui:Button>
+                                                                            <ui:Button Padding="8,2"
+                                                                                       Command="{Binding DataContext.RemoveTaskCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                       CommandParameter="{Binding}"
+                                                                                       Icon="{ui:SymbolIcon Delete24}">
+                                                                                移除
+                                                                            </ui:Button>
+                                                                        </StackPanel>
                                                                     </StackPanel>
                                                                 </Border>
                                                             </DataTemplate>
