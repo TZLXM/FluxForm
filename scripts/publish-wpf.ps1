@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$publishDir = (Resolve-Path '.\\publish\\wpf').Path
+$publishDir = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) 'publish\wpf'))
 $running = Get-Process FluxForm.WPF -ErrorAction SilentlyContinue | Where-Object {
     $_.Path -and $_.Path.StartsWith($publishDir, [System.StringComparison]::OrdinalIgnoreCase)
 }

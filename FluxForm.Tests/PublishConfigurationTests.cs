@@ -49,6 +49,15 @@ public class PublishConfigurationTests
         Assert.Contains("<IncludeAllContentForSelfExtract Condition=\"'$(PublishSingleFile)' == 'true'\">true</IncludeAllContentForSelfExtract>", project);
     }
 
+    [Fact]
+    public void Wpf_publish_script_does_not_require_existing_publish_directory()
+    {
+        var script = File.ReadAllText(GetProjectFile("scripts", "publish-wpf.ps1"));
+
+        Assert.DoesNotContain("Resolve-Path '.\\\\publish\\\\wpf'", script);
+        Assert.Contains("[System.IO.Path]::GetFullPath((Join-Path (Get-Location) 'publish\\wpf'))", script);
+    }
+
     private static string GetProjectFile(params string[] parts)
     {
         var baseDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!;
