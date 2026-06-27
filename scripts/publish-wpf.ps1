@@ -24,6 +24,8 @@ $publishArgs = @(
     '-r', $Runtime,
     '--self-contained', 'true',
     '-p:PublishSingleFile=true',
+    '-p:RestorePackagesWithLockFile=false',
+    '-p:NuGetLockFilePath=.\FluxForm.WPF\obj\publish.packages.lock.json',
     '-o', '.\publish\wpf'
 )
 

@@ -1,0 +1,93 @@
+name: FluxForm bug report
+description: Report a reproducible problem in the WPF app, CLI, conversion engine, or publish output.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a FluxForm issue. Please include enough detail for a maintainer to reproduce it.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - WPF
+        - CLI
+        - Core conversion
+        - publish
+        - dependency management
+        - documentation
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: "Example: Windows 11 23H2 x64"
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: FluxForm version or commit
+      placeholder: "Example: v0.1.0 or commit SHA"
+    validations:
+      required: true
+
+  - type: input
+    id: input-format
+    attributes:
+      label: Input format
+      placeholder: "Example: mp4, wav, png, pdf"
+
+  - type: input
+    id: output-format
+    attributes:
+      label: Output format
+      placeholder: "Example: mkv, mp3, jpg, docx"
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add file ...
+        2. Select output format ...
+        3. Start conversion ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste WPF log text, CLI output, exception text, or publish output here.
+      render: text
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: External dependency details
+      description: Mention FFmpeg and LibreOffice status when relevant.
+      placeholder: |
+        FFmpeg:
+        LibreOffice:

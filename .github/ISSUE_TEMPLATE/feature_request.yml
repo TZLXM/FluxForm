@@ -1,0 +1,54 @@
+name: FluxForm feature request
+description: Suggest a focused improvement to conversion support, CLI, WPF, dependencies, or publishing.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - WPF
+        - CLI
+        - Core conversion
+        - publish
+        - dependency management
+        - documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user pain or limitation should this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: User workflow
+      description: Describe the intended flow from the user's point of view.
+      placeholder: |
+        1. User adds ...
+        2. User selects ...
+        3. FluxForm outputs ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

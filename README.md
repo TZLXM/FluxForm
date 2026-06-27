@@ -54,6 +54,8 @@ FluxForm.CLI.exe batch --input-dir ./videos --output-dir ./output --to mp4
 ./scripts/publish-wpf.ps1
 ```
 
+仓库通过 `global.json` 固定 .NET 9 SDK 选择策略，并通过 `Directory.Build.props` 启用 NuGet lock file。新增或升级 NuGet 包后，请运行 `dotnet restore .\FluxForm.sln --use-lock-file` 并提交更新后的 `packages.lock.json`。发布脚本使用独立的临时 lock path，避免 RID 发布修改项目根目录的锁文件。
+
 如需生成包含 FFmpeg 的发布目录，优先把 `ffmpeg-release-essentials.zip` 放到 `tools-cache/` 后运行：
 
 ```powershell
@@ -72,6 +74,23 @@ FluxForm.CLI.exe batch --input-dir ./videos --output-dir ./output --to mp4
 ```powershell
 ./scripts/release-check.ps1
 ```
+
+如果需要额外确认 WPF 可启动出主窗口，可以运行：
+
+```powershell
+./scripts/smoke-wpf.ps1
+
+# 或在发布检查后验证发布产物窗口
+./scripts/release-check.ps1 -RunWpfSmoke
+```
+
+## GitHub 协作
+
+- PR 请使用仓库内模板，说明改动范围、测试命令、是否涉及 WPF、publish、FFmpeg 或 LibreOffice。
+- Bug / Feature 请使用 Issue templates，尽量提供 Windows 版本、输入/输出格式、日志和验收标准。
+- CI 在 PR 和 `main` push 时执行 `release-check`，覆盖 Release build/test 和 CLI/WPF publish。
+- Release workflow 可通过 `workflow_dispatch` 手动触发，也会在 `v*` tag push 时生成 CLI/WPF artifacts。
+- Dependabot 每周检查 GitHub Actions 和各项目 NuGet 依赖。
 
 ## 项目结构
 

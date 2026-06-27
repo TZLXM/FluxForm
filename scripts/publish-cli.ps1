@@ -15,6 +15,8 @@ $publishArgs = @(
     '-r', $Runtime,
     '--self-contained', 'true',
     '-p:PublishSingleFile=true',
+    '-p:RestorePackagesWithLockFile=false',
+    '-p:NuGetLockFilePath=.\FluxForm.CLI\obj\publish.packages.lock.json',
     '-o', '.\publish\cli'
 )
 

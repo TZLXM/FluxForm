@@ -635,14 +635,6 @@ public class MainViewModelBatchFlowTests
 
         public Task<ConversionResult> ConvertAsync(ConversionTask task, IProgress<ProgressInfo>? progress = null, CancellationToken cancellationToken = default)
         {
-            progress?.Report(new ProgressInfo
-            {
-                TaskId = task.Id,
-                Status = ConversionStatus.Running,
-                Percent = 5,
-                Message = "转换中..."
-            });
-
             StartedTasks.Add(task);
             StartedFileNames.Add(Path.GetFileName(task.InputPath));
 

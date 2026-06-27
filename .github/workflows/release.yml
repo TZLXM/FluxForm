@@ -1,0 +1,51 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: Windows runtime identifier
+        required: true
+        default: win-x64
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      RUNTIME: ${{ inputs.runtime || 'win-x64' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Release check
+        run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluxForm.CLI-${{ env.RUNTIME }}
+          path: publish/cli
+          if-no-files-found: error
+
+      - name: Upload WPF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluxForm.WPF-${{ env.RUNTIME }}
+          path: publish/wpf
+          if-no-files-found: error
