@@ -37,14 +37,14 @@ jobs:
         run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FluxForm.CLI-${{ env.RUNTIME }}
           path: publish/cli
           if-no-files-found: error
 
       - name: Upload WPF artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FluxForm.WPF-${{ env.RUNTIME }}
           path: publish/wpf
