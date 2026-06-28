@@ -7,6 +7,10 @@ on:
         description: Windows runtime identifier
         required: true
         default: win-x64
+      release_tag:
+        description: Existing tag to publish as a GitHub Release
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -57,13 +61,15 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: pwsh
         run: |
-          gh release create ${{ github.ref_name }} `
+          gh release create $env:RELEASE_TAG `
             FluxForm.CLI-${{ env.RUNTIME }}.zip `
             FluxForm.WPF-${{ env.RUNTIME }}.zip `
-            --title ${{ github.ref_name }} `
+            --title $env:RELEASE_TAG `
+            --verify-tag `
             --generate-notes

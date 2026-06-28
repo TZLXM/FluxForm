@@ -126,14 +126,17 @@ public class DevelopmentWorkflowTests
         var releaseWorkflow = File.ReadAllText(GetProjectFile(".github", "workflows", "release.yml"));
 
         Assert.Contains("workflow_dispatch:", releaseWorkflow);
+        Assert.Contains("release_tag:", releaseWorkflow);
         Assert.Contains("tags:", releaseWorkflow);
         Assert.Contains("contents: write", releaseWorkflow);
         Assert.Contains(@".\scripts\release-check.ps1", releaseWorkflow);
         Assert.Contains("Compress-Archive -Path publish/cli/*", releaseWorkflow);
         Assert.Contains("Compress-Archive -Path publish/wpf/*", releaseWorkflow);
-        Assert.Contains("if: startsWith(github.ref, 'refs/tags/')", releaseWorkflow);
+        Assert.Contains("if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''", releaseWorkflow);
         Assert.Contains("GH_TOKEN: ${{ github.token }}", releaseWorkflow);
-        Assert.Contains("gh release create ${{ github.ref_name }}", releaseWorkflow);
+        Assert.Contains("RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}", releaseWorkflow);
+        Assert.Contains("gh release create $env:RELEASE_TAG", releaseWorkflow);
+        Assert.Contains("--verify-tag", releaseWorkflow);
         Assert.Contains("--generate-notes", releaseWorkflow);
         Assert.Contains("actions/upload-artifact@v4", releaseWorkflow);
         Assert.Contains("publish/cli", releaseWorkflow);
