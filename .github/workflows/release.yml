@@ -12,7 +12,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -36,6 +36,12 @@ jobs:
       - name: Release check
         run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME
 
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish/cli/* -DestinationPath FluxForm.CLI-${{ env.RUNTIME }}.zip -Force
+          Compress-Archive -Path publish/wpf/* -DestinationPath FluxForm.WPF-${{ env.RUNTIME }}.zip -Force
+
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
@@ -49,3 +55,15 @@ jobs:
           name: FluxForm.WPF-${{ env.RUNTIME }}
           path: publish/wpf
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create ${{ github.ref_name }} `
+            FluxForm.CLI-${{ env.RUNTIME }}.zip `
+            FluxForm.WPF-${{ env.RUNTIME }}.zip `
+            --title ${{ github.ref_name }} `
+            --generate-notes

@@ -127,7 +127,14 @@ public class DevelopmentWorkflowTests
 
         Assert.Contains("workflow_dispatch:", releaseWorkflow);
         Assert.Contains("tags:", releaseWorkflow);
+        Assert.Contains("contents: write", releaseWorkflow);
         Assert.Contains(@".\scripts\release-check.ps1", releaseWorkflow);
+        Assert.Contains("Compress-Archive -Path publish/cli/*", releaseWorkflow);
+        Assert.Contains("Compress-Archive -Path publish/wpf/*", releaseWorkflow);
+        Assert.Contains("if: startsWith(github.ref, 'refs/tags/')", releaseWorkflow);
+        Assert.Contains("GH_TOKEN: ${{ github.token }}", releaseWorkflow);
+        Assert.Contains("gh release create ${{ github.ref_name }}", releaseWorkflow);
+        Assert.Contains("--generate-notes", releaseWorkflow);
         Assert.Contains("actions/upload-artifact@v4", releaseWorkflow);
         Assert.Contains("publish/cli", releaseWorkflow);
         Assert.Contains("publish/wpf", releaseWorkflow);
