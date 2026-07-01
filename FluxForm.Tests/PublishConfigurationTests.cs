@@ -76,6 +76,20 @@ public class PublishConfigurationTests
         Assert.Contains("Name: \"{userdesktop}\\FluxForm\"; Filename: \"{app}\\FluxForm.WPF.exe\"; Tasks: desktopicon", installer);
     }
 
+    [Fact]
+    public void Installer_publish_script_builds_wpf_with_ffmpeg_and_finds_inno_compiler()
+    {
+        var script = File.ReadAllText(GetProjectFile("scripts", "publish-installer.ps1"));
+
+        Assert.Contains("[string]$InnoSetupCompilerPath", script);
+        Assert.Contains(".\\scripts\\publish-wpf.ps1", script);
+        Assert.Contains("-BundleFFmpeg", script);
+        Assert.Contains("ISCC.exe", script);
+        Assert.Contains("FluxForm.iss", script);
+        Assert.Contains("Inno Setup compiler was not found", script);
+        Assert.Contains("Test-Path -LiteralPath $_", script);
+    }
+
     private static string GetProjectFile(params string[] parts)
     {
         var baseDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!;
