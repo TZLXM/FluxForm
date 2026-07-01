@@ -90,6 +90,16 @@ public class PublishConfigurationTests
         Assert.Contains("Test-Path -LiteralPath $_", script);
     }
 
+    [Fact]
+    public void Release_check_builds_installer_only_when_requested()
+    {
+        var script = File.ReadAllText(GetProjectFile("scripts", "release-check.ps1"));
+
+        Assert.Contains("[switch]$BuildInstaller", script);
+        Assert.Contains("if ($BuildInstaller)", script);
+        Assert.Contains(".\\scripts\\publish-installer.ps1 -Configuration Release -Runtime $Runtime", script);
+    }
+
     private static string GetProjectFile(params string[] parts)
     {
         var baseDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!;

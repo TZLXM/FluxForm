@@ -70,6 +70,8 @@ public class DevelopmentWorkflowTests
         Assert.Contains("-p:RestorePackagesWithLockFile=false", publishWpf);
         Assert.Contains("-p:NuGetLockFilePath=.\\FluxForm.CLI\\obj\\publish.packages.lock.json", publishCli);
         Assert.Contains("-p:NuGetLockFilePath=.\\FluxForm.WPF\\obj\\publish.packages.lock.json", publishWpf);
+        Assert.Contains("[switch]$BuildInstaller", releaseCheck);
+        Assert.Contains("publish-installer.ps1", releaseCheck);
         Assert.Contains("MainWindowHandle", smoke);
         Assert.Contains("Start-Process", smoke);
         Assert.Contains("Stop-Process", smoke);
