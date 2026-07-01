@@ -58,6 +58,24 @@ public class PublishConfigurationTests
         Assert.Contains("[System.IO.Path]::GetFullPath((Join-Path (Get-Location) 'publish\\wpf'))", script);
     }
 
+    [Fact]
+    public void Installer_definition_targets_per_user_wpf_install_with_languages()
+    {
+        var installer = File.ReadAllText(GetProjectFile("installer", "FluxForm.iss"));
+
+        Assert.Contains("#define MyAppVersion \"0.1.1\"", installer);
+        Assert.Contains("OutputBaseFilename=FluxFormSetup-0.1.1", installer);
+        Assert.Contains("DefaultDirName={localappdata}\\Programs\\FluxForm", installer);
+        Assert.Contains("PrivilegesRequired=lowest", installer);
+        Assert.Contains("DisableDirPage=no", installer);
+        Assert.Contains("Name: \"english\"; MessagesFile: \"compiler:Default.isl\"", installer);
+        Assert.Contains("Name: \"chinesesimp\"; MessagesFile: \"compiler:Languages\\ChineseSimplified.isl\"", installer);
+        Assert.Contains("Source: \"..\\publish\\wpf\\FluxForm.WPF.exe\"; DestDir: \"{app}\"", installer);
+        Assert.Contains("Source: \"..\\publish\\wpf\\tools\\ffmpeg\\*\"; DestDir: \"{app}\\tools\\ffmpeg\"", installer);
+        Assert.Contains("Name: \"{group}\\FluxForm\"; Filename: \"{app}\\FluxForm.WPF.exe\"", installer);
+        Assert.Contains("Name: \"{userdesktop}\\FluxForm\"; Filename: \"{app}\\FluxForm.WPF.exe\"; Tasks: desktopicon", installer);
+    }
+
     private static string GetProjectFile(params string[] parts)
     {
         var baseDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!;
