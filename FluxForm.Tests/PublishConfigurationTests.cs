@@ -83,8 +83,10 @@ public class PublishConfigurationTests
         var script = File.ReadAllText(GetProjectFile("scripts", "publish-installer.ps1"));
 
         Assert.Contains("[string]$InnoSetupCompilerPath", script);
+        Assert.Contains("[switch]$DownloadFFmpeg", script);
         Assert.Contains(".\\scripts\\publish-wpf.ps1", script);
         Assert.Contains("-BundleFFmpeg", script);
+        Assert.Contains("-DownloadFFmpeg", script);
         Assert.Contains("ISCC.exe", script);
         Assert.Contains("FluxForm.iss", script);
         Assert.Contains("Inno Setup compiler was not found", script);
@@ -114,8 +116,9 @@ public class PublishConfigurationTests
         var script = File.ReadAllText(GetProjectFile("scripts", "release-check.ps1"));
 
         Assert.Contains("[switch]$BuildInstaller", script);
+        Assert.Contains("[switch]$DownloadFFmpeg", script);
         Assert.Contains("if ($BuildInstaller)", script);
-        Assert.Contains(".\\scripts\\publish-installer.ps1 -Configuration Release -Runtime $Runtime", script);
+        Assert.Contains("-DownloadFFmpeg:$DownloadFFmpeg", script);
     }
 
     private static string GetProjectFile(params string[] parts)

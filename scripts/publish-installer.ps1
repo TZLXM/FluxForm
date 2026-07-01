@@ -3,6 +3,7 @@ param(
     [string]$Configuration = 'Release',
     [string]$Runtime = 'win-x64',
     [string]$InnoSetupCompilerPath,
+    [switch]$DownloadFFmpeg,
     [switch]$PauseOnError
 )
 
@@ -16,7 +17,7 @@ $logPath = Join-Path $installerDir 'publish-installer.log'
 try {
     Start-Transcript -LiteralPath $logPath -Force | Out-Null
 
-    & .\scripts\publish-wpf.ps1 -Configuration $Configuration -Runtime $Runtime -BundleFFmpeg
+    & .\scripts\publish-wpf.ps1 -Configuration $Configuration -Runtime $Runtime -BundleFFmpeg -DownloadFFmpeg:$DownloadFFmpeg
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     $candidates = @()

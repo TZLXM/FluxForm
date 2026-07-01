@@ -41,7 +41,7 @@ jobs:
         run: winget install --id JRSoftware.InnoSetup -e -s winget --accept-source-agreements --accept-package-agreements
 
       - name: Release check
-        run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME -BuildInstaller
+        run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME -BuildInstaller -DownloadFFmpeg
 
       - name: Package release assets
         shell: pwsh

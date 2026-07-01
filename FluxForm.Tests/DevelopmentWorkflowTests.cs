@@ -149,7 +149,7 @@ public class DevelopmentWorkflowTests
         Assert.Contains("contents: write", releaseWorkflow);
         Assert.Contains("Install Inno Setup", releaseWorkflow);
         Assert.Contains("JRSoftware.InnoSetup", releaseWorkflow);
-        Assert.Contains(@".\scripts\release-check.ps1 -Runtime $env:RUNTIME -BuildInstaller", releaseWorkflow);
+        Assert.Contains(@".\scripts\release-check.ps1 -Runtime $env:RUNTIME -BuildInstaller -DownloadFFmpeg", releaseWorkflow);
         Assert.Contains("Compress-Archive -Path publish/cli/*", releaseWorkflow);
         Assert.Contains("Compress-Archive -Path publish/wpf/*", releaseWorkflow);
         Assert.Contains("FluxFormSetup-0.1.1.exe", releaseWorkflow);

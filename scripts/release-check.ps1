@@ -1,7 +1,8 @@
 param(
     [string]$Runtime = 'win-x64',
     [switch]$RunWpfSmoke,
-    [switch]$BuildInstaller
+    [switch]$BuildInstaller,
+    [switch]$DownloadFFmpeg
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,7 +21,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($BuildInstaller) {
-    & .\scripts\publish-installer.ps1 -Configuration Release -Runtime $Runtime
+    & .\scripts\publish-installer.ps1 -Configuration Release -Runtime $Runtime -DownloadFFmpeg:$DownloadFFmpeg
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
