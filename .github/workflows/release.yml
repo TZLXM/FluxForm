@@ -37,8 +37,11 @@ jobs:
         with:
           dotnet-version: 9.0.x
 
+      - name: Install Inno Setup
+        run: winget install --id JRSoftware.InnoSetup -e -s winget --accept-source-agreements --accept-package-agreements
+
       - name: Release check
-        run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME
+        run: .\scripts\release-check.ps1 -Runtime $env:RUNTIME -BuildInstaller
 
       - name: Package release assets
         shell: pwsh
@@ -60,6 +63,13 @@ jobs:
           path: publish/wpf
           if-no-files-found: error
 
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluxFormSetup-0.1.1
+          path: publish/installer/FluxFormSetup-0.1.1.exe
+          if-no-files-found: error
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         env:
@@ -70,6 +80,7 @@ jobs:
           gh release create $env:RELEASE_TAG `
             FluxForm.CLI-${{ env.RUNTIME }}.zip `
             FluxForm.WPF-${{ env.RUNTIME }}.zip `
+            publish/installer/FluxFormSetup-0.1.1.exe `
             --title $env:RELEASE_TAG `
             --verify-tag `
             --generate-notes

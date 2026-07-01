@@ -139,7 +139,7 @@ public class DevelopmentWorkflowTests
     }
 
     [Fact]
-    public void GitHub_release_workflow_builds_release_and_uploads_cli_and_wpf_artifacts()
+    public void GitHub_release_workflow_builds_release_and_uploads_cli_wpf_and_installer_artifacts()
     {
         var releaseWorkflow = File.ReadAllText(GetProjectFile(".github", "workflows", "release.yml"));
 
@@ -147,9 +147,12 @@ public class DevelopmentWorkflowTests
         Assert.Contains("release_tag:", releaseWorkflow);
         Assert.Contains("tags:", releaseWorkflow);
         Assert.Contains("contents: write", releaseWorkflow);
-        Assert.Contains(@".\scripts\release-check.ps1", releaseWorkflow);
+        Assert.Contains("Install Inno Setup", releaseWorkflow);
+        Assert.Contains("JRSoftware.InnoSetup", releaseWorkflow);
+        Assert.Contains(@".\scripts\release-check.ps1 -Runtime $env:RUNTIME -BuildInstaller", releaseWorkflow);
         Assert.Contains("Compress-Archive -Path publish/cli/*", releaseWorkflow);
         Assert.Contains("Compress-Archive -Path publish/wpf/*", releaseWorkflow);
+        Assert.Contains("FluxFormSetup-0.1.1.exe", releaseWorkflow);
         Assert.Contains("if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''", releaseWorkflow);
         Assert.Contains("GH_TOKEN: ${{ github.token }}", releaseWorkflow);
         Assert.Contains("RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}", releaseWorkflow);
@@ -159,6 +162,7 @@ public class DevelopmentWorkflowTests
         Assert.Contains("actions/upload-artifact@v4", releaseWorkflow);
         Assert.Contains("publish/cli", releaseWorkflow);
         Assert.Contains("publish/wpf", releaseWorkflow);
+        Assert.Contains("publish/installer/FluxFormSetup-0.1.1.exe", releaseWorkflow);
     }
 
     private static string GetProjectFile(params string[] parts)
