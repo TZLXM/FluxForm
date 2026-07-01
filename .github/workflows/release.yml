@@ -77,10 +77,15 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: pwsh
         run: |
+          $releaseNotesPath = ".github/release-notes/$env:RELEASE_TAG.md"
+          if (-not (Test-Path -LiteralPath $releaseNotesPath)) {
+            throw "Release notes file is required: $releaseNotesPath"
+          }
+
           gh release create $env:RELEASE_TAG `
             FluxForm.CLI-${{ env.RUNTIME }}.zip `
             FluxForm.WPF-${{ env.RUNTIME }}.zip `
             publish/installer/FluxFormSetup-0.1.1.exe `
             --title $env:RELEASE_TAG `
             --verify-tag `
-            --generate-notes
+            --notes-file $releaseNotesPath

@@ -207,7 +207,7 @@ public interface IConverter
 - PR 必须使用 `.github/pull_request_template.md`，说明 Summary、Scope、Test Plan 和风险。
 - Bug / Feature 使用 `.github/ISSUE_TEMPLATE/` 下的表单，优先收集复现步骤、输入/输出格式、日志和验收标准。
 - CI workflow 使用最小 `contents: read` 权限，并通过 concurrency 取消同一 ref 上的旧运行。
-- Release workflow 通过 `workflow_dispatch` 或 `v*` tag 触发，运行 `release-check` 后上传 CLI/WPF artifacts。
+- Release workflow 通过 `workflow_dispatch` 或 `v*` tag 触发，运行 `release-check` 后上传 CLI/WPF/安装包 artifacts。每个版本必须在 `.github/release-notes/vX.Y.Z.md` 写明面向用户的更新和修复内容，否则发布会失败。
 - Dependabot 每周检查 GitHub Actions 和各项目 NuGet 依赖；依赖 PR 需要同步更新 `packages.lock.json` 并跑 `./scripts/test.ps1`。
 
 ## 版本控制与提交规范
