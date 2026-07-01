@@ -50,21 +50,21 @@ jobs:
           Compress-Archive -Path publish/wpf/* -DestinationPath FluxForm.WPF-${{ env.RUNTIME }}.zip -Force
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FluxForm.CLI-${{ env.RUNTIME }}
           path: publish/cli
           if-no-files-found: error
 
       - name: Upload WPF artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FluxForm.WPF-${{ env.RUNTIME }}
           path: publish/wpf
           if-no-files-found: error
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FluxFormSetup-0.1.1
           path: publish/installer/FluxFormSetup-0.1.1.exe
