@@ -42,6 +42,16 @@ public class PublishConfigurationTests
     }
 
     [Fact]
+    public void FFmpeg_bundle_script_extracts_outside_target_directory_before_replacing_files()
+    {
+        var script = File.ReadAllText(GetProjectFile("build", "BundleFfmpegForPublish.ps1"));
+
+        Assert.Contains("[System.IO.Path]::GetTempPath()", script);
+        Assert.DoesNotContain("[System.IO.Path]::Combine($ffmpegDir, \"_extract_\"", script);
+        Assert.Contains("Get-ChildItem -LiteralPath $binDir -File", script);
+    }
+
+    [Fact]
     public void Wpf_single_file_publish_extracts_content_before_startup()
     {
         var project = File.ReadAllText(GetProjectFile("FluxForm.WPF", "FluxForm.WPF.csproj"));

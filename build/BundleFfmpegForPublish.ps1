@@ -70,7 +70,7 @@ else {
     throw "FFmpeg cache not found: $CachePath. Run publish without -BundleFFmpeg for a fast app-only build, place ffmpeg-release-essentials.zip in tools-cache, or add -DownloadFFmpeg to allow network download."
 }
 
-$extractDir = [System.IO.Path]::Combine($ffmpegDir, "_extract_" + [System.Guid]::NewGuid().ToString("N"))
+$extractDir = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "FluxForm_ffmpeg_extract_" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
 
 try {
@@ -85,7 +85,7 @@ try {
     New-Item -ItemType Directory -Force -Path $ffmpegDir | Out-Null
 
     $binDir = $exe.DirectoryName
-    Get-ChildItem -Path $binDir -File | Copy-Item -Destination $ffmpegDir -Force
+    Get-ChildItem -LiteralPath $binDir -File | Copy-Item -Destination $ffmpegDir -Force
 
     Write-Host "[FluxForm] ffmpeg files copied to $ffmpegDir"
 }
