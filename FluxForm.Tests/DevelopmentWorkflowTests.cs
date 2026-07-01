@@ -91,6 +91,22 @@ public class DevelopmentWorkflowTests
     }
 
     [Fact]
+    public void Documentation_describes_installer_distribution()
+    {
+        var readme = File.ReadAllText(GetProjectFile("README.md"));
+        var agents = File.ReadAllText(GetProjectFile("AGENTS.md"));
+
+        Assert.Contains("FluxFormSetup-0.1.1.exe", readme);
+        Assert.Contains("scripts/publish-installer.ps1", readme);
+        Assert.Contains("SmartScreen", readme);
+        Assert.Contains("LibreOffice", readme);
+
+        Assert.Contains("scripts/publish-installer.ps1", agents);
+        Assert.Contains("FluxFormSetup-0.1.1.exe", agents);
+        Assert.Contains("Inno Setup", agents);
+    }
+
+    [Fact]
     public void GitHub_issue_templates_collect_reproduction_environment_and_acceptance_details()
     {
         var bugReport = File.ReadAllText(GetProjectFile(".github", "ISSUE_TEMPLATE", "bug_report.yml"));
