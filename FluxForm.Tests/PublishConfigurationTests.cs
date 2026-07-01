@@ -91,6 +91,23 @@ public class PublishConfigurationTests
     }
 
     [Fact]
+    public void Installer_publish_script_logs_failures_and_has_double_click_wrapper()
+    {
+        var script = File.ReadAllText(GetProjectFile("scripts", "publish-installer.ps1"));
+        var wrapper = File.ReadAllText(GetProjectFile("scripts", "publish-installer.cmd"));
+
+        Assert.Contains("[switch]$PauseOnError", script);
+        Assert.Contains("publish\\installer", script);
+        Assert.Contains("publish-installer.log", script);
+        Assert.Contains("Start-Transcript -LiteralPath $logPath", script);
+        Assert.Contains("Press Enter to close", script);
+
+        Assert.Contains("powershell.exe", wrapper);
+        Assert.Contains("-PauseOnError", wrapper);
+        Assert.Contains("publish-installer.ps1", wrapper);
+    }
+
+    [Fact]
     public void Release_check_builds_installer_only_when_requested()
     {
         var script = File.ReadAllText(GetProjectFile("scripts", "release-check.ps1"));
