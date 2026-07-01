@@ -69,7 +69,8 @@ public class PublishConfigurationTests
         Assert.Contains("PrivilegesRequired=lowest", installer);
         Assert.Contains("DisableDirPage=no", installer);
         Assert.Contains("Name: \"english\"; MessagesFile: \"compiler:Default.isl\"", installer);
-        Assert.Contains("Name: \"chinesesimp\"; MessagesFile: \"compiler:Languages\\ChineseSimplified.isl\"", installer);
+        Assert.Contains("Name: \"chinesesimp\"; MessagesFile: \".\\Languages\\ChineseSimplified.isl\"", installer);
+        Assert.True(File.Exists(GetProjectFile("installer", "Languages", "ChineseSimplified.isl")));
         Assert.Contains("Source: \"..\\publish\\wpf\\FluxForm.WPF.exe\"; DestDir: \"{app}\"", installer);
         Assert.Contains("Source: \"..\\publish\\wpf\\tools\\ffmpeg\\*\"; DestDir: \"{app}\\tools\\ffmpeg\"", installer);
         Assert.Contains("Name: \"{group}\\FluxForm\"; Filename: \"{app}\\FluxForm.WPF.exe\"", installer);
