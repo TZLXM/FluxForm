@@ -22,10 +22,10 @@ public class DevelopmentWorkflowTests
     {
         var directoryProps = File.ReadAllText(GetProjectFile("Directory.Build.props"));
 
-        Assert.Contains("<VersionPrefix>0.1.0</VersionPrefix>", directoryProps);
-        Assert.Contains("<AssemblyVersion>0.1.0.0</AssemblyVersion>", directoryProps);
-        Assert.Contains("<FileVersion>0.1.0.0</FileVersion>", directoryProps);
-        Assert.Contains("<InformationalVersion>0.1.0</InformationalVersion>", directoryProps);
+        Assert.Contains("<VersionPrefix>0.1.1</VersionPrefix>", directoryProps);
+        Assert.Contains("<AssemblyVersion>0.1.1.0</AssemblyVersion>", directoryProps);
+        Assert.Contains("<FileVersion>0.1.1.0</FileVersion>", directoryProps);
+        Assert.Contains("<InformationalVersion>0.1.1</InformationalVersion>", directoryProps);
         Assert.Contains("<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>", directoryProps);
     }
 
