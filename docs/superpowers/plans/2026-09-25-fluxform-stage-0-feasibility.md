@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-25-fluxform-rust-water-platform-design.md`
 
-**Global Constraints:** Preserve the current C# implementation as the runnable baseline. Do not implement Water Lab, production conversion, public deployment, desktop packaging, or MCP in this plan. Do not accept raw FFmpeg arguments, client-supplied server paths, bearer tokens in URLs, or output writes outside a task-owned directory. All generated contracts and evidence must be deterministic after volatile fields are removed.
+**Global Constraints:** Preserve the current C# implementation as the runnable baseline. Do not implement Water Lab, production conversion, public deployment, production desktop packaging, or MCP in this plan. Probe-only installers/DMGs/AppImages required to test installed/offline behavior are in scope but must not be presented as release artifacts. Do not accept raw FFmpeg arguments, client-supplied server paths, bearer tokens in URLs, or output writes outside a task-owned directory. All generated contracts and evidence must be deterministic after volatile fields are removed.
 
 ## Review Focus
 
@@ -56,6 +56,7 @@ Write one implementation plan per later stage only after this plan records all r
 Cargo.toml
 Cargo.lock
 rust-toolchain.toml
+.gitignore
 .cargo/config.toml
 config/
   ffmpeg-profile.toml
@@ -85,6 +86,7 @@ crates/
     src/lib.rs
     src/bin/verify_manifest.rs
     src/bin/run_manifest_samples.rs
+    src/bin/collect_sample_reports.rs
     tests/manifest.rs
     tests/cross_platform_samples.rs
   fluxform-atomic-output/
@@ -145,6 +147,7 @@ Add each new Rust crate to the root workspace in the task that creates it. Keep 
 ## Task 1: Bootstrap the Rust Workspace Through the Protocol Contract
 
 **Files:**
+- Modify: `.gitignore`
 - Create: `Cargo.toml`
 - Create: `rust-toolchain.toml`
 - Create: `.cargo/config.toml`
@@ -174,6 +177,8 @@ components = ["clippy", "rustfmt"]
 ```
 
 Create a Cargo workspace with resolver 3 and only `fluxform-protocol` as the first member. Add `serde`, `serde_json`, `schemars`, `thiserror`, and `uuid` as workspace dependencies. Then add `crates/fluxform-protocol/tests/contracts.rs`:
+
+Add root `/target/` to `.gitignore` before the first Cargo command. Evidence under `target/stage0` is always collected as an external CI/manual artifact and never committed.
 
 ```rust
 use fluxform_protocol::{
@@ -285,7 +290,7 @@ Expected: all commands PASS.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml crates/fluxform-protocol
+git add .gitignore Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml crates/fluxform-protocol
 git commit -m "feat(protocol): add versioned conversion contract"
 ```
 
@@ -565,6 +570,7 @@ git commit -m "feat(core): add capability manifest schema"
 - Create: `testdata/media/v1/samples.toml`
 - Create: `testdata/media/v1/files/*`
 - Create: `crates/fluxform-capabilities/src/bin/run_manifest_samples.rs`
+- Create: `crates/fluxform-capabilities/src/bin/collect_sample_reports.rs`
 - Create: `crates/fluxform-capabilities/tests/cross_platform_samples.rs`
 - Modify: `crates/fluxform-capabilities/tests/manifest.rs`
 
@@ -599,7 +605,7 @@ Add a test that derives the public format response exclusively from `CapabilityM
 
 - [ ] **Step 6: Execute every enabled edge and rejection case on every approved build**
 
-Implement `run_manifest_samples` without a shell. For each enabled edge it must select every referenced valid and invalid sample, run the exact manifest-derived mapping/muxer/codec arguments, validate successful output with the sibling approved FFprobe against the expected container, codec, topology, alpha/orientation/metadata policy and bounded dimensions/duration, and assert the stable error for every rejection sample. Emit a deterministic report containing the profile identity, sample hashes, edge IDs, exact argument vector, and result. A missing edge/sample/platform result is `BLOCKED`; feature-list validation alone cannot pass this gate.
+Implement `run_manifest_samples` without a shell. For each enabled edge it must select every referenced valid and invalid sample, run the exact manifest-derived mapping/muxer/codec arguments, validate successful output with the sibling approved FFprobe against the expected container, codec, topology, alpha/orientation/metadata policy and bounded dimensions/duration, and assert the stable error for every rejection sample. Canonicalize and hash the complete capability manifest and sample catalog. Emit a deterministic report containing both input digests, git commit, runner OS/architecture, profile identity, sample hashes, per-edge normalized specification digest, exact argument vector, output expectations, observed media properties, and result. A missing edge/sample/platform result is `BLOCKED`; feature-list validation alone cannot pass this gate.
 
 Run the runner natively against all four approved artifact rows and retain all four reports:
 
@@ -607,18 +613,29 @@ Run the runner natively against all four approved artifact rows and retain all f
 cargo run -p fluxform-capabilities --bin run_manifest_samples -- --manifest config/capabilities-v1.toml --samples testdata/media/v1/samples.toml --profile-report target/stage0/ffmpeg-windows-x86_64.json --ffmpeg FFMPEG_PATH --ffprobe FFPROBE_PATH --out target/stage0/samples-windows-x86_64.json
 ```
 
-Repeat on native macOS x86_64, macOS aarch64, and Linux x86_64. The runner verifies binary hashes against the report before execution. `cross_platform_samples.rs` consumes the four result documents and fails unless their normalized `{edge_id, sample_id, expected, actual}` sets exactly equal the approved manifest/sample cross-product.
+Repeat on native macOS x86_64, macOS aarch64, and Linux x86_64. The runner verifies binary hashes against the report before execution. `cross_platform_samples.rs` recomputes current manifest, sample-catalog, edge-specification, argument-vector, and output-expectation digests, then consumes the four result documents. It fails unless all report digests match the current inputs and their normalized result sets exactly equal the approved manifest/sample cross-product. A same-ID edit to codec, stream mapping, bounds, policies, or expectations therefore invalidates old evidence.
 
-- [ ] **Step 7: Run the profile-bound gate**
+- [ ] **Step 7: Collect the four native reports with provenance**
+
+Each native CI job uploads one artifact named `stage0-samples-<target>-<git-sha>` containing its FFmpeg profile report, sample report, and a provenance document with target triple, native runner OS/architecture, git commit, workflow run/job ID, and SHA-256 of both reports. A required aggregation job from the same workflow run downloads all four exact artifact names into `target/stage0/collected/<target>` and invokes:
+
+```powershell
+cargo run -p fluxform-capabilities --bin collect_sample_reports -- --input target/stage0/collected --manifest config/capabilities-v1.toml --samples testdata/media/v1/samples.toml --expected-commit GIT_SHA --out target/stage0/aggregate-sample-report.json
+```
+
+The collector rejects a duplicate/missing target, non-native architecture, commit mismatch, artifact/report hash mismatch, wrong approved profile identity, stale manifest/sample/edge digest, or unexpected file. For manual runs, copy the same three-file artifact from each named native machine and record reviewer plus transfer hash; do not point the aggregate test at unrelated per-machine `target` directories.
+
+- [ ] **Step 8: Run the profile-bound aggregate gate**
 
 ```powershell
 cargo test -p fluxform-capabilities --all-targets
-cargo run -p fluxform-capabilities --bin verify_manifest -- verify-manifest --manifest config/capabilities-v1.toml --reports target/stage0
+cargo run -p fluxform-capabilities --bin verify_manifest -- verify-manifest --manifest config/capabilities-v1.toml --reports target/stage0/collected
+cargo test -p fluxform-capabilities --test cross_platform_samples
 ```
 
 Expected: PASS only when every manifest edge is supported by all referenced platform reports. A missing macOS or Linux report is `BLOCKED`, never a skipped pass.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```powershell
 git add config/capabilities-v1.toml docs/architecture/adr/0002-v1-capability-matrix.md testdata/media/v1 crates/fluxform-capabilities
@@ -636,7 +653,9 @@ git commit -m "feat(core): freeze v1 capability manifest"
 - Create: `crates/fluxform-atomic-output/tests/commit.rs`
 
 **Interfaces:**
-- `OutputReservation::create(final_path, job_id, extension)`
+- `TaskOutputDir::open(trusted_root_handle, task_id) -> Result<Self, PathError>`
+- `RelativeOutputName::parse(file_name) -> Result<Self, PathError>`
+- `OutputReservation::create(task_dir: &TaskOutputDir, name: &RelativeOutputName, job_id, extension)`
 - `OutputReservation::partial_path()`
 - `OutputReservation::validate(validator: &dyn OutputValidator, expectation: &OutputExpectation) -> Result<ValidatedOutput, ValidationError>`
 - `FfprobeOutputValidator::new(ffprobe_path, protocol_whitelist)`
@@ -651,6 +670,12 @@ Cover all of these cases in a temporary directory:
 ```rust
 #[test]
 fn partial_file_is_created_beside_the_final_file() { /* same parent */ }
+
+#[test]
+fn absolute_parent_traversal_symlink_and_reparse_names_are_rejected() { /* confined */ }
+
+#[test]
+fn directory_swap_cannot_redirect_creation_outside_task_handle() { /* handle relative */ }
 
 #[test]
 fn reject_never_replaces_an_existing_destination() { /* bytes unchanged */ }
@@ -689,7 +714,9 @@ Expected: FAIL because the reservation API does not exist.
 
 - [ ] **Step 3: Implement no-clobber and replace as platform adapters**
 
-Create the partial file with `create_new(true)` in the destination directory. Keep the file handle and journal until commit. Keep the `ValidatedOutput` constructor private; only `OutputReservation::validate` may create it after the validator confirms the manifest edge's container, codec, stream map, and critical media properties. `FfprobeOutputValidator` executes the approved sibling binary directly, with fixed arguments, bounded output, timeout, and `-protocol_whitelist file,pipe`. Implement:
+Open the task-owned directory from a trusted server root and retain a platform directory handle for the reservation lifetime. Accept only a single validated relative filename component: reject absolute/rooted paths, separators, `.`/`..`, alternate data streams, device names, symlinks, junctions, and reparse points. Create the partial, journal, backup, and final names relative to that handle with no-follow/beneath semantics; never canonicalize a client string and then reopen it by path. On Linux use handle-relative operations with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) where available, on macOS use component-wise `openat`/`O_NOFOLLOW` plus parent identity checks, and on Windows use handle-relative creation plus reparse-point rejection and final parent-file-ID verification. The directory-swap race test must prove every created file remains under the originally opened task directory or the operation fails closed.
+
+Create the partial file exclusively in that directory. Keep the file and directory handles plus journal until commit. Keep the `ValidatedOutput` constructor private; only `OutputReservation::validate` may create it after the validator confirms the manifest edge's container, codec, stream map, and critical media properties. `FfprobeOutputValidator` executes the approved sibling binary directly, with fixed arguments, bounded output, timeout, and `-protocol_whitelist file,pipe`. Implement:
 
 - Windows no-replace with `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` and with `MOVEFILE_WRITE_THROUGH`; replace an existing target with `ReplaceFileW(final, replacement, backup, 0, ...)` after `FlushFileBuffers` on the replacement file. Before the call, persist and flush a journal containing final/replacement/backup paths plus hashes. Treat documented errors 1175, 1176, and 1177 as indeterminate states: inspect all three paths, accept only a hash-validated complete old or validated new candidate, restore the final path from the verified candidate using the same atomic primitives, and retain the backup/journal until the final path is re-opened and verified. Never assume a failed call left the old name intact. Record that `REPLACEFILE_WRITE_THROUGH` is unsupported and do not use it;
 - macOS with the documented `renameatx_np` no-replace/swap behavior;
@@ -1075,6 +1102,7 @@ The result model must require all fields:
 
 ```rust
 pub struct WindowProbeResult {
+    pub probe_mode: String,
     pub os: String,
     pub os_version: String,
     pub display_server: String,
@@ -1088,6 +1116,7 @@ pub struct WindowProbeResult {
     pub file_drop_works: bool,
     pub outside_orb_drop_reached_background_target: bool,
     pub focus_recovery_works: bool,
+    pub keyboard_input_works: bool,
     pub repeated_launch_created_second_window: bool,
     pub repeated_launch_backend_process_count: u32,
     pub single_window_close_works: bool,
@@ -1100,7 +1129,7 @@ pub struct WindowProbeResult {
 }
 ```
 
-Tests reject an unknown display server, negative percentages, a repeated-launch FluxForm backend process count other than one, or a supposedly passing record without every behavioral check. WebView helper processes are recorded separately and are not mistaken for extra Rust runtimes.
+Tests reject an unknown display server or probe mode, negative percentages, a repeated-launch FluxForm backend process count other than one, or a supposedly passing record without every behavior required by that exact mode. WebView helper processes are recorded separately and are not mistaken for extra Rust runtimes.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -1114,7 +1143,7 @@ Expected: FAIL because the probe model does not exist.
 
 Use a local `package.json` with scripts `tauri:dev` and `tauri:build`; install `@tauri-apps/cli@2` with `pnpm add --save-dev --save-exact` and commit `pnpm-lock.yaml`. Add `build.rs` calling `tauri_build::build()`, keep desktop application logic in `src/lib.rs`, and let `src/main.rs` call that library entry point. Add `tauri-plugin-single-instance`; a later process invocation sends its launch ID to the first process, which creates another 360×360 probe window without another Runtime.
 
-Configure transparent, undecorated windows. Enable Tauri's required macOS private API setting and configure `webviewInstallMode.type = "offlineInstaller"` for the Windows bundle. The UI contains a circular translucent CSS surface, visible corner markers, a drag handle, file-drop/focus/DPI/monitor counters, live process/window counts, and a button that saves result JSON. This is not the final water shader.
+Configure explicit build-time probe modes `transparent-orb`, `transparent-window-with-rectangular-hit-region`, and `opaque-frameless-fallback`; the initial artifact uses `transparent-orb`. Enable Tauri's required macOS private API setting and configure `webviewInstallMode.type = "offlineInstaller"` for the Windows bundle. The UI contains a circular translucent CSS surface, visible corner markers, a drag handle, file-drop/focus/keyboard/DPI/monitor counters, live process/window counts, and a button that saves result JSON. This is not the final water shader.
 
 The UI must show the exact manual test order:
 
@@ -1123,7 +1152,7 @@ The UI must show the exact manual test order:
 3. drag the window from the orb surface;
 4. drop a file on the orb and verify FluxForm receives it, then drop outside the circle but inside rectangular window bounds and verify FluxForm does not receive it while the visible background target does;
 5. switch away and restore focus ten times;
-6. start the executable again and verify a second window appears while the OS reports one application process;
+6. focus each interactive control and verify keyboard input, then start the executable again and verify a second window appears while the OS reports one application process;
 7. close a non-last window and verify the remaining window stays alive, then close the last idle window and verify the process exits;
 8. move the window between displays with different scale factors and verify size, hit region, and pointer coordinates after each DPI event;
 9. visit every monitor edge and reconnect a secondary display while the probe runs;
@@ -1148,6 +1177,7 @@ Expected: the model tests pass and the current platform produces its installable
 - Produce: signed/notarized macOS DMG evidence for native x86_64 and aarch64
 - Produce: offline Windows installer and Linux AppImage evidence
 - Produce: one `WindowProbeResult` JSON per required display backend
+- Produce: a separately built and installed fallback artifact/result for any platform that does not pass `transparent-orb`
 
 - [ ] **Step 1: Run the platform matrix from installed artifacts**
 
@@ -1168,6 +1198,8 @@ Document prerequisites and exact commands in the gate report: Microsoft C++ Buil
 
 - [ ] **Step 2: Make the architecture decision from evidence**
 
+If `transparent-orb` fails on a platform, choose at most one candidate fallback, build a new installed artifact with that explicit probe mode, and repeat all applicable installed/offline checks. A rectangular-hit-region fallback must record and test its different outside-circle drop behavior; an opaque fallback must repeat file drop, focus, keyboard, repeated launch, non-last/last close, DPI, multi-monitor, and idle-resource checks. Save the fallback artifact hash and a separate result JSON. A failure from transparent mode is not evidence that either fallback works.
+
 Record exactly one supported behavior per platform in the gate report:
 
 - `transparent-orb` when all required checks pass, including delivery of an outside-circle drop to the visible background target;
@@ -1175,7 +1207,7 @@ Record exactly one supported behavior per platform in the gate report:
 - `opaque-frameless-fallback` when transparency or hit testing is unreliable;
 - `unsupported` when file drop, focus, or stable rendering fails.
 
-Do not silently map a red result to green. If the accepted fallback changes the spec, amend the spec and obtain user approval before Stage 1.
+Only a mode with its own installed-artifact PASS evidence may be recorded as supported. Do not silently map a red result to green. If the accepted fallback changes the spec, amend the spec and obtain user approval before Stage 1.
 
 - [ ] **Step 3: Commit reviewed evidence and the platform decision**
 
@@ -1221,7 +1253,7 @@ The complete scripts must:
 
 - [ ] **Step 2: Implement both scripts with matching semantics**
 
-Scripts must accept a repeatable gate selector for focused testing, stop at the first failed selected gate, and print a final summary containing every selected gate and status. They may read candidate binaries but must not modify `tools-cache`, `publish`, or the existing .NET projects. `Automated` mode runs only reproducible checks available on that machine and exits zero when those selected checks pass while clearly reporting `stage0_complete=false`. `Complete` mode additionally validates every required report row and exact platform artifact; any `BLOCKED`, `FAIL`, missing evidence cell, or unreviewed artifact is nonzero. The two modes must never infer completion from the same exit code.
+Scripts must accept a repeatable gate selector for focused testing, stop at the first failed selected gate, and print a final summary containing every selected gate and status. They may read candidate binaries but must not modify `tools-cache`, `publish`, or the existing .NET projects. `Automated` mode runs only reproducible checks available on that machine and exits zero when those selected checks pass while clearly reporting `stage0_complete=false`. `Complete` mode additionally validates every required report row and exact platform artifact, reruns the aggregate sample collector against the current manifest/catalog/commit, and rejects stale digests or provenance. Any `BLOCKED`, `FAIL`, missing evidence cell, unreviewed artifact, or supported window mode without a matching installed-artifact result is nonzero. The two modes must never infer completion from the same exit code.
 
 - [ ] **Step 3: Add the CI matrix**
 
@@ -1230,6 +1262,7 @@ The workflow must use minimum `contents: read`, dependency caching keyed by lock
 - Windows: protocol, capability-manifest/profile fixtures, atomic output, server-probe unit tests, script behavior, and desktop-probe build with pinned pnpm dependencies;
 - macOS: protocol, capability-manifest/profile fixtures, atomic output, script behavior, and desktop-probe build. Native behavior evidence runs on separately registered self-hosted runners labeled `macOS-x64-native` and `macOS-arm64-native`; an arm64 runner under Rosetta cannot satisfy the Intel row;
 - Ubuntu: protocol, capability-manifest/profile fixtures, atomic output, server-probe tests, script behavior, and desktop-probe build after installing the documented WebKitGTK/GTK packages. Delegated-cgroup adversarial tests and the real public-startup integration run only on a required self-hosted runner labeled `linux-cgroupv2-delegated`; an ordinary hosted runner reports `BLOCKED`, not PASS.
+- aggregate evidence: after all four native profile/sample jobs, download only artifacts from that workflow run, execute `collect_sample_reports`, `verify_manifest`, and `cross_platform_samples`, upload the aggregate report, and make this job a prerequisite of the `Complete` gate.
 
 Do not mark manual transparent-window checks as automated. Upload non-secret test reports as artifacts; never upload capability tokens or uploaded sample contents.
 
