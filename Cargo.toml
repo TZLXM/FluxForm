@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fluxform-protocol"]
+members = ["crates/fluxform-protocol", "crates/fluxform-ffmpeg-profile"]
 resolver = "3"
 
 [workspace.package]
