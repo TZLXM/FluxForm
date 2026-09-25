@@ -1,3 +1,5 @@
+mod archive;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -12,6 +14,12 @@ use thiserror::Error;
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUIRED_STAGE0_TARGETS: &[&str] = &[
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+];
 const PROBES: &[&[&str]] = &[
     &["-hide_banner", "-version"],
     &["-hide_banner", "-protocols"],
@@ -56,6 +64,12 @@ pub enum ProfileError {
     },
     #[error("the report does not match an immutable profile artifact row")]
     IdentityMismatch,
+    #[error(
+        "archive identity mismatch: measured size or SHA-256 differs from the immutable profile row"
+    )]
+    ArchiveIdentityMismatch,
+    #[error("unsafe or unsupported FFmpeg archive: {0}")]
+    UnsafeArchive(String),
     #[error("report JSON could not be encoded: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -144,6 +158,14 @@ struct DistributionGate {
     required_target_triples: Vec<String>,
     #[serde(default = "required_owner_legal_review")]
     owner_legal_approval_required: bool,
+    #[serde(default)]
+    owner_approval_record_id: Option<String>,
+    #[serde(default)]
+    owner_approval_date: Option<String>,
+    #[serde(default)]
+    legal_approval_record_id: Option<String>,
+    #[serde(default)]
+    legal_approval_date: Option<String>,
 }
 
 impl Default for DistributionGate {
@@ -152,6 +174,10 @@ impl Default for DistributionGate {
             status: GateStatus::Blocked,
             required_target_triples: Vec::new(),
             owner_legal_approval_required: true,
+            owner_approval_record_id: None,
+            owner_approval_date: None,
+            legal_approval_record_id: None,
+            legal_approval_date: None,
         }
     }
 }
@@ -175,6 +201,7 @@ pub struct ApprovedArtifact {
     artifact: ArtifactRecord,
     profile_id: String,
     profile_digest: String,
+    distribution_gate_status: GateStatus,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -275,6 +302,7 @@ impl BuildProfile {
             artifact: artifact.clone(),
             profile_id: self.document.profile_id.clone(),
             profile_digest: self.profile_digest.clone(),
+            distribution_gate_status: self.document.distribution_gate.status,
         })
     }
 
@@ -307,10 +335,7 @@ impl BuildProfile {
 }
 
 impl ProbeReport {
-    pub fn collect(
-        ffmpeg: impl AsRef<Path>,
-        ffprobe: impl AsRef<Path>,
-    ) -> Result<Self, ProfileError> {
+    fn collect(ffmpeg: impl AsRef<Path>, ffprobe: impl AsRef<Path>) -> Result<Self, ProfileError> {
         let ffmpeg = ffmpeg.as_ref();
         let ffprobe = ffprobe.as_ref();
         let mut captured = CapturedProbeOutputs {
@@ -336,6 +361,54 @@ impl ProbeReport {
         )
     }
 
+    pub fn collect_from_archive(
+        profile: &BuildProfile,
+        artifact_id: &str,
+        archive_path: impl AsRef<Path>,
+    ) -> Result<Self, ProfileError> {
+        profile.ensure_unchanged()?;
+        let artifact = profile
+            .document
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == artifact_id)
+            .ok_or(ProfileError::IdentityMismatch)?;
+        archive::verify_archive_identity(artifact, archive_path.as_ref())?;
+        let native_target = current_target_triple();
+        if artifact.target_triple != native_target {
+            return Err(ProfileError::UnsafeArchive(format!(
+                "refusing to execute {} artifact on native target {native_target}",
+                artifact.target_triple
+            )));
+        }
+        let verified = archive::extract_and_verify(artifact, archive_path.as_ref())?;
+        let report_result = (|| {
+            let mut report = Self::collect(&verified.ffmpeg_path, &verified.ffprobe_path)?;
+            if report.ffmpeg_sha256 != verified.ffmpeg_sha256
+                || report.ffmpeg_size_bytes != verified.ffmpeg_size_bytes
+                || report.ffprobe_sha256 != verified.ffprobe_sha256
+                || report.ffprobe_size_bytes != verified.ffprobe_size_bytes
+            {
+                return Err(ProfileError::IdentityMismatch);
+            }
+            report.artifact_sha256 = verified.artifact_sha256.clone();
+            report.artifact_size_bytes = verified.artifact_size_bytes;
+            report.license_text_sha256 = verified.license_text_sha256.clone();
+            report.license_text_size_bytes = verified.license_text_size_bytes;
+            report.apply_profile(profile, artifact);
+            report.validate(profile)?;
+            Ok(report)
+        })();
+        match (report_result, verified.close()) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(error), Err(cleanup_error)) => Err(ProfileError::UnsafeArchive(format!(
+                "{error}; temporary archive cleanup also failed: {cleanup_error}"
+            ))),
+        }
+    }
+
     pub fn from_captured(
         profile: &BuildProfile,
         artifact: &ArtifactRecord,
@@ -358,6 +431,12 @@ impl ProbeReport {
             artifact.ffprobe_size_bytes,
             artifact.target_triple.clone(),
         )?;
+        // This constructor accepts caller-captured data for deterministic test fixtures; the
+        // production CLI uses collect_from_archive and supplies independently measured values.
+        report.artifact_sha256 = artifact.artifact_sha256.clone();
+        report.artifact_size_bytes = artifact.artifact_size_bytes;
+        report.license_text_sha256 = artifact.license_text_sha256.clone();
+        report.license_text_size_bytes = artifact.license_text_size_bytes;
         report.apply_profile(profile, artifact);
         Ok(report)
     }
@@ -373,6 +452,13 @@ impl ProbeReport {
 
         let artifact = profile.artifact_for_report(self)?.clone();
         if !self.artifact_id.is_empty() && self.artifact_id != artifact.artifact_id {
+            return Err(ProfileError::IdentityMismatch);
+        }
+        if self.artifact_sha256 != artifact.artifact_sha256
+            || self.artifact_size_bytes != artifact.artifact_size_bytes
+            || self.license_text_sha256 != artifact.license_text_sha256
+            || self.license_text_size_bytes != artifact.license_text_size_bytes
+        {
             return Err(ProfileError::IdentityMismatch);
         }
         if self.version != self.ffprobe_version {
@@ -428,19 +514,29 @@ impl ProbeReport {
 
     pub fn verify_identity(&self, approved: &ApprovedArtifact) -> Result<(), ProfileError> {
         let artifact = &approved.artifact;
+        let gate_status = match approved.distribution_gate_status {
+            GateStatus::Blocked => "blocked",
+            GateStatus::Approved => "approved",
+        };
         if artifact.status != ArtifactStatus::Approved
             || self.profile_id != approved.profile_id
             || self.profile_digest != approved.profile_digest
+            || self.distribution_gate_status != gate_status
             || self.artifact_id != artifact.artifact_id
             || self.artifact_status != artifact.status
             || self.target_triple != artifact.target_triple
             || self.artifact_uri != artifact.artifact_uri
             || self.artifact_sha256 != artifact.artifact_sha256
+            || self.artifact_size_bytes != artifact.artifact_size_bytes
             || self.ffmpeg_sha256 != artifact.ffmpeg_sha256
             || self.ffmpeg_size_bytes != artifact.ffmpeg_size_bytes
             || self.ffprobe_sha256 != artifact.ffprobe_sha256
             || self.ffprobe_size_bytes != artifact.ffprobe_size_bytes
             || self.source_revision != artifact.source_revision
+            || self
+                .source_revision_reported_by_binary
+                .as_deref()
+                .is_some_and(|revision| revision != artifact.source_revision)
             || self.license_declaration != artifact.license
             || self.license_text_path != artifact.license_text_path
             || self.license_text_sha256 != artifact.license_text_sha256
@@ -527,18 +623,10 @@ impl ProbeReport {
         self.artifact_id = artifact.artifact_id.clone();
         self.artifact_status = artifact.status;
         self.artifact_uri = artifact.artifact_uri.clone();
-        self.artifact_sha256 = artifact.artifact_sha256.clone();
-        self.artifact_size_bytes = artifact.artifact_size_bytes;
         self.target_triple = artifact.target_triple.clone();
-        self.ffmpeg_sha256 = artifact.ffmpeg_sha256.clone();
-        self.ffmpeg_size_bytes = artifact.ffmpeg_size_bytes;
-        self.ffprobe_sha256 = artifact.ffprobe_sha256.clone();
-        self.ffprobe_size_bytes = artifact.ffprobe_size_bytes;
         self.source_revision = artifact.source_revision.clone();
         self.license_declaration = profile.document.license_declaration.clone();
         self.license_text_path = artifact.license_text_path.clone();
-        self.license_text_sha256 = artifact.license_text_sha256.clone();
-        self.license_text_size_bytes = artifact.license_text_size_bytes;
         self.approval_record_id = artifact.approval_record_id.clone();
         self.approval_date = artifact.approval_date.clone();
     }
@@ -740,6 +828,59 @@ fn validate_document(document: &ProfileDocument) -> Result<(), ProfileError> {
                     .to_owned(),
             ));
         }
+        let required_targets = document
+            .distribution_gate
+            .required_target_triples
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let stage0_targets = REQUIRED_STAGE0_TARGETS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if required_targets != stage0_targets {
+            return Err(ProfileError::InvalidProfile(
+                "approved distribution gate must require the exact four Stage 0 target triples"
+                    .to_owned(),
+            ));
+        }
+        for (id_field, date_field, id, date) in [
+            (
+                "owner_approval_record_id",
+                "owner_approval_date",
+                document
+                    .distribution_gate
+                    .owner_approval_record_id
+                    .as_deref()
+                    .unwrap_or_default(),
+                document
+                    .distribution_gate
+                    .owner_approval_date
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+            (
+                "legal_approval_record_id",
+                "legal_approval_date",
+                document
+                    .distribution_gate
+                    .legal_approval_record_id
+                    .as_deref()
+                    .unwrap_or_default(),
+                document
+                    .distribution_gate
+                    .legal_approval_date
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+        ] {
+            require_nonempty(id_field, id)?;
+            if !valid_date(date) {
+                return Err(ProfileError::InvalidProfile(format!(
+                    "approved distribution gate requires a valid {date_field}"
+                )));
+            }
+        }
         for target in &document.distribution_gate.required_target_triples {
             let approved = document.artifacts.iter().any(|artifact| {
                 artifact.target_triple == *target && artifact.status == ArtifactStatus::Approved
@@ -846,13 +987,33 @@ fn validate_unique(field: &str, values: &[String]) -> Result<(), ProfileError> {
 
 fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
             .iter()
             .enumerate()
             .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[0..4].parse::<u32>().ok();
+    let month = value[5..7].parse::<u32>().ok();
+    let day = value[8..10].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    day <= days_in_month
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -883,6 +1044,351 @@ fn normalized_digest(document: &ProfileDocument) -> Result<String, ProfileError>
 
     let serialized = serde_json::to_vec(&normalized)?;
     Ok(hex_digest(&serialized))
+}
+
+#[cfg(test)]
+mod zip_inventory_tests {
+    use super::*;
+    use crate::archive::{ZipEntry, inspect_zip_archive};
+    use std::io::Cursor;
+
+    #[derive(Clone)]
+    struct TestEntry {
+        central_name: Vec<u8>,
+        local_name: Vec<u8>,
+        flags: u16,
+        method: u16,
+        disk_start: u16,
+        external_attributes: u32,
+        central_extra: Vec<u8>,
+        payload: Vec<u8>,
+        uncompressed_size_override: Option<u32>,
+    }
+
+    impl TestEntry {
+        fn regular(name: &str) -> Self {
+            Self {
+                central_name: name.as_bytes().to_vec(),
+                local_name: name.as_bytes().to_vec(),
+                flags: 0,
+                method: 0,
+                disk_start: 0,
+                external_attributes: 0x81a4_0000,
+                central_extra: Vec::new(),
+                payload: Vec::new(),
+                uncompressed_size_override: None,
+            }
+        }
+
+        fn with_payload(name: &str, payload: &[u8]) -> Self {
+            let mut entry = Self::regular(name);
+            entry.payload = payload.to_vec();
+            entry
+        }
+
+        fn directory(name: &str) -> Self {
+            let mut entry = Self::regular(name);
+            entry.external_attributes = 0x41ed_0010;
+            entry
+        }
+    }
+
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    fn test_zip(entries: &[TestEntry], eocd_disk: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::new();
+        for entry in entries {
+            offsets.push(bytes.len() as u32);
+            let size = entry.payload.len() as u32;
+            let uncompressed_size = entry.uncompressed_size_override.unwrap_or(size);
+            let checksum = crc32(&entry.payload);
+            push_u32(&mut bytes, 0x0403_4b50);
+            push_u16(&mut bytes, 20);
+            push_u16(&mut bytes, entry.flags);
+            push_u16(&mut bytes, entry.method);
+            push_u16(&mut bytes, 0);
+            push_u16(&mut bytes, 0);
+            push_u32(&mut bytes, checksum);
+            push_u32(&mut bytes, size);
+            push_u32(&mut bytes, uncompressed_size);
+            push_u16(&mut bytes, entry.local_name.len() as u16);
+            push_u16(&mut bytes, 0);
+            bytes.extend_from_slice(&entry.local_name);
+            bytes.extend_from_slice(&entry.payload);
+        }
+
+        let central_offset = bytes.len() as u32;
+        for (entry, local_offset) in entries.iter().zip(offsets) {
+            let size = entry.payload.len() as u32;
+            let uncompressed_size = entry.uncompressed_size_override.unwrap_or(size);
+            let checksum = crc32(&entry.payload);
+            push_u32(&mut bytes, 0x0201_4b50);
+            push_u16(&mut bytes, 0x0314);
+            push_u16(&mut bytes, 20);
+            push_u16(&mut bytes, entry.flags);
+            push_u16(&mut bytes, entry.method);
+            push_u16(&mut bytes, 0);
+            push_u16(&mut bytes, 0);
+            push_u32(&mut bytes, checksum);
+            push_u32(&mut bytes, size);
+            push_u32(&mut bytes, uncompressed_size);
+            push_u16(&mut bytes, entry.central_name.len() as u16);
+            push_u16(&mut bytes, entry.central_extra.len() as u16);
+            push_u16(&mut bytes, 0);
+            push_u16(&mut bytes, entry.disk_start);
+            push_u16(&mut bytes, 0);
+            push_u32(&mut bytes, entry.external_attributes);
+            push_u32(&mut bytes, local_offset);
+            bytes.extend_from_slice(&entry.central_name);
+            bytes.extend_from_slice(&entry.central_extra);
+        }
+        let central_size = bytes.len() as u32 - central_offset;
+        push_u32(&mut bytes, 0x0605_4b50);
+        push_u16(&mut bytes, eocd_disk);
+        push_u16(&mut bytes, eocd_disk);
+        push_u16(&mut bytes, entries.len() as u16);
+        push_u16(&mut bytes, entries.len() as u16);
+        push_u32(&mut bytes, central_size);
+        push_u32(&mut bytes, central_offset);
+        push_u16(&mut bytes, 0);
+        bytes
+    }
+
+    fn inspect(bytes: &[u8]) -> Result<Vec<ZipEntry>, ProfileError> {
+        inspect_zip_archive(&mut Cursor::new(bytes), bytes.len() as u64)
+    }
+
+    #[cfg(windows)]
+    fn test_artifact(
+        bytes: &[u8],
+        ffmpeg: &[u8],
+        ffprobe: &[u8],
+        license: &[u8],
+    ) -> ArtifactRecord {
+        ArtifactRecord {
+            artifact_id: "test-windows-candidate".to_owned(),
+            status: ArtifactStatus::Candidate,
+            target_triple: current_target_triple(),
+            artifact_uri: "https://artifacts.example.invalid/test.zip".to_owned(),
+            artifact_sha256: hex_digest(bytes),
+            artifact_size_bytes: bytes.len() as u64,
+            ffmpeg_sha256: hex_digest(ffmpeg),
+            ffmpeg_size_bytes: ffmpeg.len() as u64,
+            ffprobe_sha256: hex_digest(ffprobe),
+            ffprobe_size_bytes: ffprobe.len() as u64,
+            license: "MIT".to_owned(),
+            license_text_path: "bundle/LICENSE.txt".to_owned(),
+            license_text_sha256: hex_digest(license),
+            license_text_size_bytes: license.len() as u64,
+            source_revision: "test-revision".to_owned(),
+            source_offer_url: "https://artifacts.example.invalid/source".to_owned(),
+            approval_record_id: None,
+            approval_date: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn small_candidate_zip(ffmpeg: &[u8], ffprobe: &[u8], license: &[u8]) -> Vec<u8> {
+        test_zip(
+            &[
+                TestEntry::directory("bundle/"),
+                TestEntry::directory("bundle/bin/"),
+                TestEntry::with_payload("bundle/bin/ffmpeg.exe", ffmpeg),
+                TestEntry::with_payload("bundle/bin/ffprobe.exe", ffprobe),
+                TestEntry::with_payload("bundle/LICENSE.txt", license),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn accepts_regular_safe_zip_entries() {
+        let bytes = test_zip(
+            &[
+                TestEntry::directory("bundle/"),
+                TestEntry::with_payload("bundle/bin/ffmpeg.exe", b"safe fixture"),
+            ],
+            0,
+        );
+        let entries = inspect(&bytes).expect("safe archive");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].name, "bundle/bin/ffmpeg.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_extraction_measures_archive_executables_and_license_then_cleans_temp() {
+        let ffmpeg = b"non-executable ffmpeg fixture";
+        let ffprobe = b"non-executable ffprobe fixture";
+        let license = b"license fixture";
+        let bytes = small_candidate_zip(ffmpeg, ffprobe, license);
+        let artifact = test_artifact(&bytes, ffmpeg, ffprobe, license);
+        let archive_directory = tempfile::tempdir().expect("archive fixture directory");
+        let archive_path = archive_directory.path().join("candidate.zip");
+        fs::write(&archive_path, &bytes).expect("write archive fixture");
+
+        let verified =
+            archive::extract_and_verify(&artifact, &archive_path).expect("verified extraction");
+        assert_eq!(verified.artifact_sha256, hex_digest(&bytes));
+        assert_eq!(verified.artifact_size_bytes, bytes.len() as u64);
+        assert_eq!(verified.ffmpeg_sha256, hex_digest(ffmpeg));
+        assert_eq!(verified.ffmpeg_size_bytes, ffmpeg.len() as u64);
+        assert_eq!(verified.ffprobe_sha256, hex_digest(ffprobe));
+        assert_eq!(verified.ffprobe_size_bytes, ffprobe.len() as u64);
+        assert_eq!(verified.license_text_sha256, hex_digest(license));
+        assert_eq!(verified.license_text_size_bytes, license.len() as u64);
+        let temp_path = verified.temp_root().to_path_buf();
+        assert!(temp_path.exists());
+
+        verified.close().expect("explicit temporary cleanup");
+        assert!(
+            !temp_path.exists(),
+            "explicit cleanup removes extracted contents"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extracted_executable_or_license_mismatch_fails_before_probe_invocation() {
+        let ffmpeg = b"non-executable ffmpeg fixture";
+        let ffprobe = b"non-executable ffprobe fixture";
+        let license = b"license fixture";
+        let bytes = small_candidate_zip(ffmpeg, ffprobe, license);
+        let archive_directory = tempfile::tempdir().expect("archive fixture directory");
+        let archive_path = archive_directory.path().join("candidate.zip");
+        fs::write(&archive_path, &bytes).expect("write archive fixture");
+
+        let mut wrong_ffmpeg = test_artifact(&bytes, ffmpeg, ffprobe, license);
+        wrong_ffmpeg.ffmpeg_sha256 = hex_digest(b"substituted ffmpeg");
+        let error = archive::extract_and_verify(&wrong_ffmpeg, &archive_path)
+            .err()
+            .expect("unverified executable must not be returned for probing");
+        assert!(error.to_string().contains("ffmpeg.exe identity mismatch"));
+
+        let mut wrong_license = test_artifact(&bytes, ffmpeg, ffprobe, license);
+        wrong_license.license_text_sha256 = hex_digest(b"substituted license");
+        let error = archive::extract_and_verify(&wrong_license, &archive_path)
+            .err()
+            .expect("unverified license must fail before any probe");
+        assert!(error.to_string().contains("license text identity mismatch"));
+    }
+
+    #[test]
+    fn rejects_absolute_traversal_and_ambiguous_entry_paths() {
+        for name in [
+            "../escape.txt",
+            "bundle/../../escape.txt",
+            "/rooted.txt",
+            "C:/drive.txt",
+            "bundle\\backslash.txt",
+            "bundle//empty.txt",
+            "bundle/./dot.txt",
+            "bundle/name.",
+            "bundle/name ",
+            "bundle/CON.txt",
+        ] {
+            let bytes = test_zip(&[TestEntry::regular(name)], 0);
+            assert!(inspect(&bytes).is_err(), "unsafe path {name:?} must fail");
+        }
+    }
+
+    #[test]
+    fn rejects_symlink_reparse_and_unknown_unix_entry_types() {
+        let mut symlink = TestEntry::regular("bundle/link");
+        symlink.external_attributes = 0xa1ff_0000;
+        let mut reparse = TestEntry::regular("bundle/reparse");
+        reparse.external_attributes |= 0x0000_0400;
+        let mut fifo = TestEntry::regular("bundle/fifo");
+        fifo.external_attributes = 0x11a4_0000;
+        for entry in [symlink, reparse, fifo] {
+            assert!(inspect(&test_zip(&[entry], 0)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_device_entries() {
+        let mut device = TestEntry::regular("bundle/device");
+        device.external_attributes |= 0x0040;
+        assert!(inspect(&test_zip(&[device], 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_stored_entries_with_inconsistent_sizes() {
+        let mut inconsistent = TestEntry::with_payload("bundle/data.bin", b"four");
+        inconsistent.uncompressed_size_override = Some(5);
+        assert!(inspect(&test_zip(&[inconsistent], 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_case_collisions_and_file_directory_prefix_conflicts() {
+        let duplicate = [
+            TestEntry::regular("bundle/ffmpeg.exe"),
+            TestEntry::regular("BUNDLE/FFMPEG.EXE"),
+        ];
+        assert!(inspect(&test_zip(&duplicate, 0)).is_err());
+        let prefix = [
+            TestEntry::regular("bundle"),
+            TestEntry::regular("bundle/file.txt"),
+        ];
+        assert!(inspect(&test_zip(&prefix, 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_encryption_unsupported_compression_and_multidisk_archives() {
+        let mut encrypted = TestEntry::regular("bundle/file");
+        encrypted.flags = 1;
+        assert!(inspect(&test_zip(&[encrypted], 0)).is_err());
+        let mut unsupported = TestEntry::regular("bundle/file");
+        unsupported.method = 12;
+        assert!(inspect(&test_zip(&[unsupported], 0)).is_err());
+        let mut multidisk = TestEntry::regular("bundle/file");
+        multidisk.disk_start = 1;
+        assert!(inspect(&test_zip(&[multidisk], 0)).is_err());
+        assert!(inspect(&test_zip(&[TestEntry::regular("bundle/file")], 1)).is_err());
+    }
+
+    #[test]
+    fn rejects_zip64_and_local_header_central_directory_mismatch() {
+        let mut zip64 = TestEntry::regular("bundle/file");
+        zip64.central_extra.extend_from_slice(&1_u16.to_le_bytes());
+        zip64.central_extra.extend_from_slice(&0_u16.to_le_bytes());
+        assert!(inspect(&test_zip(&[zip64], 0)).is_err());
+
+        let mut mismatched = TestEntry::regular("bundle/safe.txt");
+        mismatched.local_name = b"bundle/evil.txt".to_vec();
+        assert!(inspect(&test_zip(&[mismatched], 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_zip_bomb_sized_entries_before_extraction() {
+        let mut oversized = TestEntry::regular("bundle/large.bin");
+        oversized.uncompressed_size_override =
+            Some(crate::archive::MAX_ENTRY_UNCOMPRESSED_BYTES as u32 + 1);
+        let bytes = test_zip(&[oversized], 0);
+        assert!(inspect(&bytes).is_err());
+    }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

@@ -14,7 +14,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some("verify") {
-        return Err("usage: fluxform-ffmpeg-profile verify --profile PROFILE_PATH --ffmpeg FFMPEG_PATH --ffprobe FFPROBE_PATH --out REPORT_PATH".into());
+        return Err("usage: fluxform-ffmpeg-profile verify --profile PROFILE_PATH --artifact-id ARTIFACT_ID --archive ARCHIVE_PATH --out REPORT_PATH".into());
     }
 
     let mut options = BTreeMap::new();
@@ -24,7 +24,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             .ok_or_else(|| format!("missing value for {option}"))?;
         if !matches!(
             option.as_str(),
-            "--profile" | "--ffmpeg" | "--ffprobe" | "--out"
+            "--profile" | "--artifact-id" | "--archive" | "--out"
         ) {
             return Err(format!("unknown option {option}").into());
         }
@@ -39,13 +39,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             .ok_or_else(|| format!("missing required option {name}"))
     };
     let profile_path = required("--profile")?;
-    let ffmpeg_path = required("--ffmpeg")?;
-    let ffprobe_path = required("--ffprobe")?;
+    let artifact_id = options
+        .get("--artifact-id")
+        .ok_or("missing required option --artifact-id")?;
+    let archive_path = required("--archive")?;
     let output_path = required("--out")?;
 
     let profile = BuildProfile::load(profile_path)?;
-    let mut report = ProbeReport::collect(ffmpeg_path, ffprobe_path)?;
-    report.validate(&profile)?;
+    let report = ProbeReport::collect_from_archive(&profile, artifact_id, archive_path)?;
     if report.artifact_status == ArtifactStatus::Approved {
         let approval = profile.approved_artifact(&report.artifact_id)?;
         report.verify_identity(&approval)?;
