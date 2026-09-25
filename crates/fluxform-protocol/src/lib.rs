@@ -1,5 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub const PROTOCOL_VERSION: &str = "v1";
 
@@ -315,7 +318,9 @@ pub struct InvalidDiagnosticIdV1;
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct DiagnosticIdV1(String);
+pub struct DiagnosticIdV1(
+    #[schemars(regex(pattern = r"^diag_[A-Za-z0-9_-]+$"), length(max = 128))] String,
+);
 
 impl DiagnosticIdV1 {
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidDiagnosticIdV1> {
@@ -417,4 +422,120 @@ impl<'de> Deserialize<'de> for ApiErrorV1 {
             diagnostic_id: wire.diagnostic_id,
         })
     }
+}
+
+#[must_use]
+pub fn canonical_fixtures() -> BTreeMap<&'static str, Value> {
+    BTreeMap::from([
+        (
+            "contracts/v1/fixtures/completed-image-job.json",
+            serde_json::to_value(JobEventV1::Completed {
+                job_id: "job_image_01".to_owned(),
+                revision: 4,
+                artifact_id: "artifact_image_01".to_owned(),
+            })
+            .expect("canonical completed event must serialize"),
+        ),
+        (
+            "contracts/v1/fixtures/create-image-job.json",
+            serde_json::to_value(ConversionRequestV1 {
+                protocol_version: ProtocolVersionV1::V1,
+                input_ids: vec!["input_image_01".to_owned(), "input_image_02".to_owned()],
+                category: CategoryV1::Image,
+                output_format: "png".to_owned(),
+                output_target: OutputTargetV1::ManagedArtifact,
+                overwrite_policy: OverwritePolicyV1::Reject,
+                options: ConversionOptionsV1 {
+                    image: Some(ImageOptionsV1 {
+                        quality: Some(90),
+                        width: Some(1920),
+                        height: Some(1080),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                client_context: ClientContextV1 {
+                    request_id: Some("request_image_01".to_owned()),
+                },
+            })
+            .expect("canonical conversion request must serialize"),
+        ),
+        (
+            "contracts/v1/fixtures/unsupported-conversion.json",
+            serde_json::to_value(ApiErrorV1::new(ErrorCodeV1::UnsupportedConversion))
+                .expect("canonical API error must serialize"),
+        ),
+    ])
+}
+
+#[must_use]
+pub fn exported_contracts() -> BTreeMap<&'static str, Value> {
+    let mut job_event_schema = serde_json::to_value(schemars::schema_for!(JobEventV1))
+        .expect("job event schema must serialize");
+    job_event_schema
+        .pointer_mut("/$defs/ApiErrorV1")
+        .and_then(Value::as_object_mut)
+        .expect("job event schema must define ApiErrorV1")
+        .insert("allOf".to_owned(), Value::Array(error_conditions()));
+
+    let mut contracts = BTreeMap::from([
+        (
+            "contracts/v1/conversion-request.schema.json",
+            serde_json::to_value(schemars::schema_for!(ConversionRequestV1))
+                .expect("conversion request schema must serialize"),
+        ),
+        ("contracts/v1/error.schema.json", error_schema()),
+        ("contracts/v1/job-event.schema.json", job_event_schema),
+    ]);
+    contracts.extend(canonical_fixtures());
+    contracts
+}
+
+fn error_schema() -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(ApiErrorV1))
+        .expect("API error schema must serialize");
+    schema
+        .as_object_mut()
+        .expect("root schema must be an object")
+        .insert("allOf".to_owned(), Value::Array(error_conditions()));
+    schema
+}
+
+fn error_conditions() -> Vec<Value> {
+    [
+        ErrorCodeV1::UnsupportedInput,
+        ErrorCodeV1::UnsupportedConversion,
+        ErrorCodeV1::MixedCategory,
+        ErrorCodeV1::InvalidOption,
+        ErrorCodeV1::FileTooLarge,
+        ErrorCodeV1::QuotaExceeded,
+        ErrorCodeV1::QueueFull,
+        ErrorCodeV1::FfprobeFailed,
+        ErrorCodeV1::ConversionFailed,
+        ErrorCodeV1::OutputTooLarge,
+        ErrorCodeV1::Timeout,
+        ErrorCodeV1::Cancelled,
+        ErrorCodeV1::Interrupted,
+        ErrorCodeV1::StorageUnavailable,
+    ]
+    .into_iter()
+    .map(|code| {
+        json!({
+            "if": {
+                "properties": { "code": { "const": code } },
+                "required": ["code"]
+            },
+            "then": {
+                "properties": { "message": { "const": code.public_message() } }
+            }
+        })
+    })
+    .collect()
+}
+
+#[must_use]
+pub fn contract_digest() -> String {
+    let normalized =
+        serde_json::to_vec(&exported_contracts()).expect("normalized contracts must serialize");
+    format!("{:x}", Sha256::digest(normalized))
 }

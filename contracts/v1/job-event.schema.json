@@ -1,0 +1,503 @@
+{
+  "$defs": {
+    "ApiErrorV1": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unsupported_input"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "input format is not supported"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unsupported_conversion"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "requested conversion is not supported"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "mixed_category"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "inputs must use one conversion category"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "invalid_option"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "one or more conversion options are invalid"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "file_too_large"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "input exceeds the allowed size"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "quota_exceeded"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "conversion quota has been exceeded"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "queue_full"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "conversion queue is full"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "ffprobe_failed"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "media inspection failed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "conversion_failed"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "conversion failed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "output_too_large"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "output exceeds the allowed size"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "conversion timed out"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "conversion was cancelled"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "interrupted"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "conversion was interrupted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "storage_unavailable"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "const": "artifact storage is unavailable"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCodeV1"
+        },
+        "diagnostic_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiagnosticIdV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "DiagnosticIdV1": {
+      "maxLength": 128,
+      "pattern": "^diag_[A-Za-z0-9_-]+$",
+      "type": "string"
+    },
+    "ErrorCodeV1": {
+      "enum": [
+        "unsupported_input",
+        "unsupported_conversion",
+        "mixed_category",
+        "invalid_option",
+        "file_too_large",
+        "quota_exceeded",
+        "queue_full",
+        "ffprobe_failed",
+        "conversion_failed",
+        "output_too_large",
+        "timeout",
+        "cancelled",
+        "interrupted",
+        "storage_unavailable"
+      ],
+      "type": "string"
+    },
+    "JobStateV1": {
+      "enum": [
+        "created",
+        "validating",
+        "queued",
+        "probing",
+        "converting",
+        "finalizing",
+        "completed",
+        "failed",
+        "cancelling",
+        "cancelled",
+        "interrupted"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/JobStateV1"
+        },
+        "type": {
+          "const": "job.state_changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job_id",
+        "revision",
+        "state"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "progress_percent": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "job.progress",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job_id",
+        "revision",
+        "progress_percent"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "job.warning",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job_id",
+        "revision",
+        "message"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "job.completed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job_id",
+        "revision",
+        "artifact_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ApiErrorV1"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "job.failed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job_id",
+        "revision",
+        "error"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "position": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "queue.position_changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job_id",
+        "revision",
+        "position"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "JobEventV1"
+}
