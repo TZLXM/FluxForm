@@ -18,7 +18,7 @@
 - A public worker must remain inside its filesystem, network, process-count, aggregate-memory, and aggregate-CPU boundary even after it forks or changes process groups; Tasks 7, 8, and 9 pin this behavior.
 - A conversion edge must never appear in the protocol or UI unless the versioned manifest binds it to codecs, muxers, stream rules, samples, and an approved platform build profile; Tasks 4 and 5 pin this behavior.
 - A completed output must become visible only after FFprobe validation and an atomic policy-specific commit; process crashes must expose either the old final file or the validated new file, never a partial result; Task 6 pins this behavior.
-- A transparent desktop window must be tested separately for rendering, transparent-pixel hit testing, repeated launch, close, DPI changes, and multiple monitors on every supported display backend; Task 15 pins this behavior.
+- A transparent desktop window must be tested separately for rendering, transparent-pixel hit testing, repeated launch, close, DPI changes, and multiple monitors on every supported display backend; Tasks 15 and 16 pin this behavior.
 
 ---
 
@@ -44,11 +44,11 @@ Write one implementation plan per later stage only after this plan records all r
 | No-network, aggregate-resource-limited Linux worker | Tasks 7, 8, and 9 |
 | Streaming limits, reservations, IP quota primitives, token authorization | Tasks 10, 11, and 12 |
 | SSE recovery and fail-closed public startup | Tasks 13 and 14 |
-| Transparent independent windows and platform fallbacks | Task 15 |
-| Offline Windows WebView2 first launch | Task 15 |
+| Transparent independent windows and platform fallbacks | Tasks 15 and 16 |
+| Offline Windows WebView2 first launch | Task 16 |
 | Verified FFmpeg/FFprobe artifacts for each supported platform/architecture | Task 3 |
-| Legacy implementation remains available during migration | Tasks 1 and 16 |
-| Evidence-backed gate before Water Lab and product code | Task 16 and final verification |
+| Legacy implementation remains available during migration | Tasks 1 and 17 |
+| Evidence-backed gate before Water Lab and product code | Task 17 and final verification |
 
 ## Target File Structure
 
@@ -61,6 +61,7 @@ config/
   ffmpeg-profile.toml
   capabilities-v1.toml
 contracts/v1/
+  compatibility.sha256
   conversion-request.schema.json
   job-event.schema.json
   error.schema.json
@@ -83,7 +84,9 @@ crates/
     Cargo.toml
     src/lib.rs
     src/bin/verify_manifest.rs
+    src/bin/run_manifest_samples.rs
     tests/manifest.rs
+    tests/cross_platform_samples.rs
   fluxform-atomic-output/
     Cargo.toml
     src/lib.rs
@@ -125,7 +128,12 @@ apps/
     ui/probe.js
 docs/architecture/
   adr/0001-ffmpeg-distribution-profile.md
+  adr/0002-v1-capability-matrix.md
   stage-0-gate-report.md
+testdata/media/v1/
+  samples.toml
+  files/
+    ...tiny versioned media samples...
 scripts/
   check-stage0.ps1
   check-stage0.sh
@@ -391,6 +399,7 @@ git commit -m "feat(protocol): publish deterministic v1 fixtures"
 - `BuildProfile::load(path)`
 - `ProbeReport::collect(ffmpeg, ffprobe)`
 - `ProbeReport::validate(&BuildProfile)`
+- `ProbeReport::verify_identity(&ApprovedArtifact) -> Result<(), ProfileError>`
 - CLI: `fluxform-ffmpeg-profile verify --profile PROFILE_PATH --ffmpeg FFMPEG_PATH --ffprobe FFPROBE_PATH --out REPORT_PATH`
 
 - [ ] **Step 1: Add failing policy tests**
@@ -428,7 +437,7 @@ const PROBES: &[&[&str]] = &[
 ];
 ```
 
-Apply a timeout, capture bounded stdout/stderr, and hash both executables. Never invoke a shell. The JSON report must include target triple, file hashes, FFmpeg version, source revision when reported, build configuration, license declaration, and sorted capability lists.
+Apply a timeout, capture bounded stdout/stderr, and hash both executables. Never invoke a shell. The JSON report must include profile ID, normalized profile digest, approval record ID/date, target triple, file hashes, FFmpeg version, source revision when reported, build configuration, license declaration, and sorted capability lists. `ProbeReport::verify_identity` must reject a report unless its target, binary hashes, profile digest, and approval record exactly match one immutable artifact row in `ffmpeg-profile.toml`; a report with compatible-looking feature lists but a different binary is not evidence.
 
 - [ ] **Step 4: Encode the existing Windows build as an explicit candidate, not an implicit dependency**
 
@@ -497,7 +506,7 @@ git commit -m "build(ffmpeg): define verified distribution profile"
 
 - [ ] **Step 1: Write failing manifest-policy tests**
 
-Add tests proving that the manifest rejects duplicate edge IDs, wildcard codecs, extension-only input matching, an output codec or muxer absent from any bound platform profile, missing parameter bounds/defaults, missing stream mapping, missing Alpha/orientation/metadata policies, and missing valid or invalid sample IDs.
+Add tests proving that the manifest rejects duplicate edge IDs, wildcard codecs, extension-only input matching, an output codec or muxer absent from any bound platform profile, missing parameter bounds/defaults, missing stream mapping, missing Alpha/orientation/metadata policies, and missing valid or invalid sample IDs. Add substitution tests proving that a report with a wrong executable hash, target triple, profile digest, approval ID, or approval date is rejected even when its capability lists match.
 
 Use one complete edge as the positive fixture:
 
@@ -538,7 +547,7 @@ Expected: FAIL because the crate and validator do not exist.
 
 - [ ] **Step 3: Implement strict loading and profile binding**
 
-Deserialize with `deny_unknown_fields` on every manifest struct. Normalize extensions to lowercase without a leading dot, require exact enum values for policies, and reject implicit input/output cross-products. `validate_profiles` must verify every declared demuxer, decoder, muxer, and encoder against every referenced immutable `ProbeReport`; a missing report keeps the gate blocked.
+Deserialize with `deny_unknown_fields` on every manifest struct. Normalize extensions to lowercase without a leading dot, require exact enum values for policies, and reject implicit input/output cross-products. Before checking capabilities, `validate_profiles` must call `ProbeReport::verify_identity` against the approved artifact row for that target. It then verifies every declared demuxer, decoder, muxer, and encoder against every referenced immutable report. A missing, substituted, unapproved, or stale report keeps the gate blocked.
 
 - [ ] **Step 4: Run and commit the schema validator**
 
@@ -552,6 +561,11 @@ git commit -m "feat(core): add capability manifest schema"
 
 **Files:**
 - Create: `config/capabilities-v1.toml`
+- Create: `docs/architecture/adr/0002-v1-capability-matrix.md`
+- Create: `testdata/media/v1/samples.toml`
+- Create: `testdata/media/v1/files/*`
+- Create: `crates/fluxform-capabilities/src/bin/run_manifest_samples.rs`
+- Create: `crates/fluxform-capabilities/tests/cross_platform_samples.rs`
 - Modify: `crates/fluxform-capabilities/tests/manifest.rs`
 
 **Interfaces:**
@@ -559,9 +573,9 @@ git commit -m "feat(core): add capability manifest schema"
 - Produces: the immutable `config/capabilities-v1.toml` product promise
 - Produces: normalized public capability response derived only from the manifest
 
-- [ ] **Step 1: Add a failing completeness test**
+- [ ] **Step 1: Add a failing exact-matrix test**
 
-Load `config/capabilities-v1.toml` and assert it has at least one approved video, audio, and image edge; every candidate input/output family from spec section 6 is either referenced by an enabled edge or listed in a top-level `deferred_formats` record with a reason; every enabled edge binds all four target profiles and names both valid and invalid samples. The test fails if the manifest file is absent.
+First write `docs/architecture/adr/0002-v1-capability-matrix.md` with the complete proposed set of `{edge_id, status}` rows, where status is exactly `enabled` or `deferred`; each deferred row has a reason, owner, and reconsideration condition. Record dated product-owner approval before freezing v1. Load both the ADR's machine-readable matrix block and `config/capabilities-v1.toml`, normalize them, and assert exact set equality. The test must fail for an extra, missing, renamed, or status-changed row; a minimum count or “one edge per category” is insufficient. Every enabled edge binds all four target profiles and names both valid and invalid sample IDs.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -575,11 +589,27 @@ Expected: FAIL because `config/capabilities-v1.toml` does not exist.
 
 Encode each approved directed edge from the candidate families in spec section 6. Every edge must contain the fields shown above plus category-appropriate audio/video/image options. Do not add an edge merely because one FFmpeg binary lists a codec: it must have the same required capability on every referenced target and named real samples. Animated GIF, animated WebP, and multi-page TIFF are represented only as invalid sample cases returning `unsupported_conversion`.
 
-- [ ] **Step 4: Prove the manifest is the only capability source**
+- [ ] **Step 4: Add a small, real, versioned sample corpus**
+
+Commit the actual bytes referenced by every enabled edge and rejection case under `testdata/media/v1/files`. Keep the corpus intentionally tiny (each file at most 512 KiB and the complete corpus at most 10 MiB) so it does not violate the repository's large-binary rule. `samples.toml` records sample ID, relative path, SHA-256, provenance/license, expected category, container, codecs, stream topology, dimensions/duration where applicable, alpha/orientation/metadata expectations, and whether the expected outcome is success or a stable error code. Tests hash every file, reject an unreferenced sample, and reject a manifest sample ID without real bytes. Generated-at-test-time media is useful supplemental coverage but cannot replace this corpus.
+
+- [ ] **Step 5: Prove the manifest is the only capability source**
 
 Add a test that derives the public format response exclusively from `CapabilityManifestV1` and compares it with a committed normalized fixture. Add a negative test showing an FFmpeg-reported encoder that is absent from the manifest never appears in the response.
 
-- [ ] **Step 5: Run the profile-bound gate**
+- [ ] **Step 6: Execute every enabled edge and rejection case on every approved build**
+
+Implement `run_manifest_samples` without a shell. For each enabled edge it must select every referenced valid and invalid sample, run the exact manifest-derived mapping/muxer/codec arguments, validate successful output with the sibling approved FFprobe against the expected container, codec, topology, alpha/orientation/metadata policy and bounded dimensions/duration, and assert the stable error for every rejection sample. Emit a deterministic report containing the profile identity, sample hashes, edge IDs, exact argument vector, and result. A missing edge/sample/platform result is `BLOCKED`; feature-list validation alone cannot pass this gate.
+
+Run the runner natively against all four approved artifact rows and retain all four reports:
+
+```powershell
+cargo run -p fluxform-capabilities --bin run_manifest_samples -- --manifest config/capabilities-v1.toml --samples testdata/media/v1/samples.toml --profile-report target/stage0/ffmpeg-windows-x86_64.json --ffmpeg FFMPEG_PATH --ffprobe FFPROBE_PATH --out target/stage0/samples-windows-x86_64.json
+```
+
+Repeat on native macOS x86_64, macOS aarch64, and Linux x86_64. The runner verifies binary hashes against the report before execution. `cross_platform_samples.rs` consumes the four result documents and fails unless their normalized `{edge_id, sample_id, expected, actual}` sets exactly equal the approved manifest/sample cross-product.
+
+- [ ] **Step 7: Run the profile-bound gate**
 
 ```powershell
 cargo test -p fluxform-capabilities --all-targets
@@ -588,10 +618,10 @@ cargo run -p fluxform-capabilities --bin verify_manifest -- verify-manifest --ma
 
 Expected: PASS only when every manifest edge is supported by all referenced platform reports. A missing macOS or Linux report is `BLOCKED`, never a skipped pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```powershell
-git add config/capabilities-v1.toml crates/fluxform-capabilities/tests/manifest.rs
+git add config/capabilities-v1.toml docs/architecture/adr/0002-v1-capability-matrix.md testdata/media/v1 crates/fluxform-capabilities
 git commit -m "feat(core): freeze v1 capability manifest"
 ```
 
@@ -635,13 +665,19 @@ fn replace_atomically_supersedes_an_existing_destination() { /* old or new, neve
 fn abort_removes_only_the_owned_partial_file() { /* final file preserved */ }
 
 #[test]
-fn ffmpeg_output_args_name_muxer_and_codecs_explicitly() { /* includes -f/-c:v/-c:a */ }
+fn image_args_name_map_muxer_and_video_codec_only() { /* -map 0:v:0 -f image2 -c:v png; no -c:a */ }
+
+#[test]
+fn audio_args_name_map_muxer_and_audio_codec_only() { /* -map 0:a:0 -f mp3 -c:a libmp3lame; no -c:v */ }
+
+#[test]
+fn mixed_av_args_name_both_maps_muxer_and_codecs() { /* explicit -map/-f/-c:v/-c:a */ }
 
 #[test]
 fn unvalidated_output_cannot_be_committed() { /* no public commit method on reservation */ }
 ```
 
-Also add a process-crash helper with two modes: crash before commit and crash immediately after the platform rename returns. On restart, assert that the final path contains either the complete old bytes or the complete validated new bytes, never a missing or partial file, and that reconciliation recognizes only partial files with a valid owned journal record.
+Also add a process-crash helper with two modes: crash before commit and crash immediately after the platform rename returns. On restart, assert that the final path contains either the complete old bytes or the complete validated new bytes, never a missing or partial file, and that reconciliation recognizes only partial files with a valid owned journal record. A concurrent observer continuously opens the final path during each test and fails on any missing/partial observation. A filesystem-operation adapter must inject failure before and after every replacement sub-step, including the documented Windows `ReplaceFileW` failure states, so the proof covers error recovery rather than only the happy path.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -655,11 +691,11 @@ Expected: FAIL because the reservation API does not exist.
 
 Create the partial file with `create_new(true)` in the destination directory. Keep the file handle and journal until commit. Keep the `ValidatedOutput` constructor private; only `OutputReservation::validate` may create it after the validator confirms the manifest edge's container, codec, stream map, and critical media properties. `FfprobeOutputValidator` executes the approved sibling binary directly, with fixed arguments, bounded output, timeout, and `-protocol_whitelist file,pipe`. Implement:
 
-- Windows no-replace with `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` and with `MOVEFILE_WRITE_THROUGH`; replace an existing target with `ReplaceFileW(..., 0, ...)` after `FlushFileBuffers` on the replacement file. Record that `REPLACEFILE_WRITE_THROUGH` is unsupported and do not use it;
+- Windows no-replace with `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` and with `MOVEFILE_WRITE_THROUGH`; replace an existing target with `ReplaceFileW(final, replacement, backup, 0, ...)` after `FlushFileBuffers` on the replacement file. Before the call, persist and flush a journal containing final/replacement/backup paths plus hashes. Treat documented errors 1175, 1176, and 1177 as indeterminate states: inspect all three paths, accept only a hash-validated complete old or validated new candidate, restore the final path from the verified candidate using the same atomic primitives, and retain the backup/journal until the final path is re-opened and verified. Never assume a failed call left the old name intact. Record that `REPLACEFILE_WRITE_THROUGH` is unsupported and do not use it;
 - macOS with the documented `renameatx_np` no-replace/swap behavior;
 - Linux with `renameat2` and `RENAME_NOREPLACE` where supported.
 
-Do not implement `replace` as delete-then-rename. Return `AtomicCommitUnsupported` when the filesystem or platform primitive cannot meet the contract. Flush file contents before commit and sync the parent directory where the platform supports it. The gate report must state the tested durability boundary: the automated crash test covers process termination, not sudden power loss.
+Do not implement `replace` as delete-then-rename. Return `AtomicCommitUnsupported` when the filesystem or platform primitive, backup reconciliation, or injected-failure suite cannot meet the contract. In particular, if any injected Windows 1175/1176/1177 outcome lets the concurrent observer see a missing final path—even if startup reconciliation can later repair it—mark Windows `replace` unsupported/red and do not advertise that overwrite policy. Flush file contents before commit and sync the parent directory where the platform supports it. The gate report must state the tested durability boundary: the automated crash test covers process termination, not sudden power loss.
 
 - [ ] **Step 4: Linearize cancellation and finalization**
 
@@ -700,8 +736,9 @@ git commit -m "feat(runtime): prove atomic output commits"
 **Interfaces:**
 - Produces: `SandboxPolicy { input, job_dir, tool_dir, limits }`
 - Produces: `FilesystemPrerequisites::inspect() -> Result<FilesystemEvidence, SandboxError>`
-- Produces: `ResourceBoundary` trait with `attach(pid)`, `kill_all()`, and `is_empty()`
-- Produces: `Sandbox::spawn(program: &Path, args: &[OsString], policy: &SandboxPolicy, boundary: &dyn ResourceBoundary) -> Result<SandboxChild, SandboxError>`
+- Produces: `ResourceBoundary` trait with `prepare_spawn()`, `kill_all()`, and `is_empty()`
+- Produces: `SpawnPlacement::CloneIntoCgroup(cgroup_fd) | ParentAttachBarrier { ready, release }`
+- Produces: `Sandbox::spawn_blocked(program: &Path, args: &[OsString], policy: &SandboxPolicy, placement: SpawnPlacement) -> Result<SandboxChild, SandboxError>`
 
 - [ ] **Step 1: Add Linux-only failing filesystem tests**
 
@@ -717,7 +754,7 @@ Expected: FAIL because namespace and mount setup do not exist. On non-Linux host
 
 - [ ] **Step 3: Implement the rootless isolation boundary**
 
-Create user, mount, and PID namespaces before executing untrusted media tooling. Assemble a minimal `pivot_root` tree with the tool directory and one input bind-mounted read-only, one task directory bind-mounted writable, an empty private `/tmp`, no host root mount, and no inherited descriptors other than declared pipes/files. Apply `no_new_privs`, drop all capabilities, and deny namespace-creation and mount syscalls after setup. Never invoke a shell. Task 7 tests may use a probe-only boundary implementation, but it cannot satisfy the public-server prerequisite until Tasks 8 and 9 add network and resource containment.
+Create user, mount, and PID namespaces before executing untrusted media tooling. Assemble a minimal `pivot_root` tree with the tool directory and one input bind-mounted read-only, one task directory bind-mounted writable, an empty private `/tmp`, no host root mount, and no inherited descriptors other than declared pipes/files. Apply `no_new_privs`, drop all capabilities, and deny namespace-creation and mount syscalls after setup. Never invoke a shell. The spawned child must remain blocked before any tool code, parser, or fork-capable setup runs until its resource placement is confirmed; a post-spawn best-effort `attach(pid)` API is forbidden. Task 7 tests may use a probe-only blocked placement implementation, but it cannot satisfy the public-server prerequisite until Tasks 8 and 9 add network and resource containment.
 
 - [ ] **Step 4: Make prerequisite failure explicit**
 
@@ -740,7 +777,7 @@ Expected: all filesystem-boundary tests PASS.
 - Create: `crates/fluxform-sandbox-probe/tests/linux_network.rs`
 
 **Interfaces:**
-- Consumes: `Sandbox::spawn` from Task 7
+- Consumes: `Sandbox::spawn_blocked` from Task 7
 - Produces: `NetworkPrerequisites::inspect() -> Result<NetworkEvidence, SandboxError>`
 
 - [ ] **Step 1: Add a failing OS-network test**
@@ -751,11 +788,19 @@ Bind controlled IPv4 and IPv6 listeners in the host namespace. Launch a sandbox 
 
 Run the approved Linux FFprobe candidate directly against a valid local sample and an HTTP URL using fixed `-protocol_whitelist file,pipe`. Local probing must succeed and the URL must fail with a protocol-policy diagnostic. Name this test `ffprobe_protocol_policy_rejects_urls`; it must never satisfy or replace the OS-network test.
 
-- [ ] **Step 3: Implement and inspect the network boundary**
+- [ ] **Step 3: Run and verify failure**
+
+```bash
+cargo test -p fluxform-sandbox-probe --test linux_network
+```
+
+Expected: FAIL because the private network namespace and seccomp policy do not exist.
+
+- [ ] **Step 4: Implement and inspect the network boundary**
 
 Add a private network namespace and a post-setup seccomp allowlist that denies IPv4/IPv6 socket creation, packet sockets, and namespace escape. `NetworkPrerequisites::inspect` must actively execute the controlled-listener probe; checking for kernel flags or crate support alone is insufficient.
 
-- [ ] **Step 4: Run and commit**
+- [ ] **Step 5: Run and commit**
 
 ```bash
 cargo test -p fluxform-sandbox-probe --test linux_network
@@ -770,14 +815,14 @@ git commit -m "feat(server): prove Linux network isolation"
 - Create: `crates/fluxform-sandbox-probe/tests/linux_resources.rs`
 
 **Interfaces:**
-- Consumes: `ResourceBoundary` and `Sandbox::spawn` from Task 7
+- Consumes: `ResourceBoundary`, `SpawnPlacement`, and `Sandbox::spawn_blocked` from Task 7
 - Produces: `CgroupV2Job::create(delegated_root, job_id, limits) -> Result<Self, SandboxError>`
 - Produces: `CgroupV2Job::kill_all()`
 - Produces: `CgroupV2Job::evidence() -> CgroupEvidence`
 
 - [ ] **Step 1: Add failing aggregate-limit tests**
 
-Under a delegated test subtree, prove that `pids.max` limits the combined worker and descendants, `memory.max` limits aggregate resident memory across multiple children, `memory.swap.max = 0` prevents swap escape, and `cpu.max` throttles total CPU bandwidth. Create a child that forks, calls `setsid`, and forks again; after timeout, assert `cgroup.events` reports no populated descendants and the escaped process is gone.
+Under a delegated test subtree, prove that `pids.max` limits the combined worker and descendants, `memory.max` limits aggregate resident memory across multiple children, `memory.swap.max = 0` prevents swap escape, and `cpu.max` throttles total CPU bandwidth. Create a child whose first instruction after the release barrier immediately forks, calls `setsid`, and forks again; assert the original and every descendant were born in the job cgroup. After timeout, assert `cgroup.events` reports no populated descendants and the escaped process is gone.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -789,7 +834,7 @@ Expected: FAIL because the per-job cgroup does not exist. If the runner lacks a 
 
 - [ ] **Step 3: Implement the cgroup v2 boundary**
 
-Require the production service to run under a systemd unit with `Delegate=yes` or an equivalent container delegation. For every job, create a child cgroup, write `pids.max`, `memory.max`, `memory.swap.max`, and `cpu.max`, then place the worker in it before untrusted parsing begins. Keep `RLIMIT_FSIZE` and `RLIMIT_NOFILE` as per-process defense in depth, but do not use `RLIMIT_NPROC`, `RLIMIT_AS`, or a process group as evidence for aggregate containment.
+Require the production service to run under a systemd unit with `Delegate=yes` or an equivalent container delegation. For every job, create a child cgroup and write `pids.max`, `memory.max`, `memory.swap.max`, and `cpu.max` before spawning. Prefer `clone3(CLONE_INTO_CGROUP)` with an opened cgroup file descriptor. When the approved Linux baseline cannot use that primitive, use a child-side pipe/eventfd barrier installed before `exec`: the child blocks without running tool code, the parent writes its PID to `cgroup.procs`, verifies `/proc/<pid>/cgroup` names the exact job cgroup, and only then releases the child. Any attach or verification failure kills the still-blocked child and fails the job. Keep `RLIMIT_FSIZE` and `RLIMIT_NOFILE` as per-process defense in depth, but do not use `RLIMIT_NPROC`, `RLIMIT_AS`, or a process group as evidence for aggregate containment.
 
 - [ ] **Step 4: Implement timeout and cancellation with `cgroup.kill`**
 
@@ -848,10 +893,11 @@ git commit -m "feat(server): add transactional upload reservations"
 **Files:**
 - Create: `apps/server-probe/src/auth.rs`
 - Create: `apps/server-probe/src/routes.rs`
+- Modify: `apps/server-probe/src/lib.rs`
 - Create: `apps/server-probe/tests/capability_auth.rs`
 
 **Interfaces:**
-- `POST /v1/upload-sessions`
+- `POST /v1/upload-sessions` is the anonymous bootstrap route; it enforces Origin/IP/limit policy and returns an upload capability
 - `PUT /v1/upload-sessions/{session_id}/content` requires `upload`
 - `GET /v1/jobs/{job_id}` requires `status`
 - `GET /v1/jobs/{job_id}/events` requires `events`
@@ -862,7 +908,9 @@ git commit -m "feat(server): add transactional upload reservations"
 
 - [ ] **Step 1: Add failing authorization tests for every concrete route**
 
-Generate 32 random bytes from the OS CSPRNG, return the base64url token once, and persist only its SHA-256 hash, subject, scope set, and expiry. For each route listed above, test absent, expired, wrong-scope, and cross-job/cross-artifact tokens. Include the upload-content `PUT`, actual artifact-download path, and SSE path explicitly. Reject tokens in paths and query strings. Test that web requests containing local output targets are rejected before job creation.
+Generate 32 random bytes from the OS CSPRNG, return the base64url token once, and persist only its SHA-256 hash, subject, scope set, and expiry. For each route listed above, first prove that a correctly scoped, unexpired token for the exact subject succeeds through the real router, then test absent, expired, wrong-scope, and cross-job/cross-artifact tokens. Include the upload-content `PUT`, actual artifact-download path, and SSE path explicitly. Reject tokens in paths and query strings. Test that web requests containing local output targets are rejected before job creation.
+
+For every state-changing browser request (`POST`, `PUT`, and `DELETE`), require an `Origin` header that exactly matches the configured public origin; test allowed, absent, `null`, malformed, and cross-origin values. The anonymous bootstrap `POST` gets a positive success case under the same rules even though it has no pre-existing token. Resolve quota IP from the transport peer by default. Honor `Forwarded`/`X-Forwarded-For` only when the immediate peer belongs to an explicitly configured trusted-proxy CIDR, parse a bounded chain using one documented rule, and reject ambiguous or malformed chains. Tests prove that spoofed forwarded headers from an untrusted peer cannot change the quota identity and that a trusted proxy produces the expected client identity.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -874,13 +922,13 @@ Expected: FAIL because capability issuance and middleware do not exist.
 
 - [ ] **Step 3: Implement scoped capability middleware**
 
-Use the same middleware for every protected route. Compare stored and presented hashes in constant time, verify subject and required scope on every request, and never log plaintext tokens. The download handler must use `Content-Disposition: attachment`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. Error responses contain stable codes and diagnostic IDs but no server paths or command lines.
+Use the same middleware for every protected route. Compare stored and presented hashes in constant time, verify subject and required scope on every request, enforce the public-origin and trusted-proxy policy before quota reservation, and never log plaintext tokens. The download handler must use `Content-Disposition: attachment`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. Error responses contain stable codes and diagnostic IDs but no server paths or command lines.
 
 - [ ] **Step 4: Run and commit**
 
 ```powershell
 cargo test -p fluxform-server-probe --test capability_auth
-git add apps/server-probe/src/auth.rs apps/server-probe/src/routes.rs apps/server-probe/tests/capability_auth.rs
+git add apps/server-probe/src/auth.rs apps/server-probe/src/routes.rs apps/server-probe/src/lib.rs apps/server-probe/tests/capability_auth.rs
 git commit -m "feat(server): enforce capability scopes"
 ```
 
@@ -924,6 +972,8 @@ git commit -m "feat(server): enforce streaming upload limits"
 
 **Files:**
 - Create: `apps/server-probe/src/events.rs`
+- Modify: `apps/server-probe/src/routes.rs`
+- Modify: `apps/server-probe/src/lib.rs`
 - Create: `apps/server-probe/tests/sse_recovery.rs`
 
 **Interfaces:**
@@ -951,7 +1001,7 @@ Persist the current snapshot and a bounded ordered event suffix in SQLite. Parse
 
 ```powershell
 cargo test -p fluxform-server-probe --test sse_recovery
-git add apps/server-probe/src/events.rs apps/server-probe/tests/sse_recovery.rs
+git add apps/server-probe/src/events.rs apps/server-probe/src/routes.rs apps/server-probe/src/lib.rs apps/server-probe/tests/sse_recovery.rs
 git commit -m "feat(server): prove SSE event recovery"
 ```
 
@@ -959,6 +1009,8 @@ git commit -m "feat(server): prove SSE event recovery"
 
 **Files:**
 - Create: `apps/server-probe/src/startup.rs`
+- Modify: `apps/server-probe/src/main.rs`
+- Modify: `apps/server-probe/src/lib.rs`
 - Create: `apps/server-probe/tests/public_startup.rs`
 
 **Interfaces:**
@@ -968,7 +1020,7 @@ git commit -m "feat(server): prove SSE event recovery"
 
 - [ ] **Step 1: Add failing startup-mode tests**
 
-Inject a `SandboxChecker` test double. In `Public` mode, force filesystem, network, cgroup-controller, and `cgroup.kill` checks to fail one at a time and assert `prepare_server` returns an error before any TCP listener is bound or upload route is exposed. `LocalDevelopment` may start without the Linux sandbox only when selected explicitly, binds loopback by default, and prints an unambiguous non-production warning.
+Inject a `SandboxChecker` test double for deterministic unit coverage. In `Public` mode, force filesystem, network, cgroup-controller, and `cgroup.kill` checks to fail one at a time and assert `prepare_server` returns an error before any TCP listener is bound or upload route is exposed. Include a positive double so an implementation that always rejects cannot pass. `LocalDevelopment` may start without the Linux sandbox only when selected explicitly, binds loopback by default, and prints an unambiguous non-production warning.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -982,11 +1034,15 @@ Expected: FAIL because startup validation does not exist.
 
 Make `prepare_server` complete configuration validation plus filesystem, network, cgroup delegation/controller, and `cgroup.kill` checks before returning any bindable server object. `main` binds only after successful preparation. Add a process-level test that starts the binary with a forced failing checker and proves the chosen port remains connectable by the test harness because the server never claimed it.
 
-- [ ] **Step 4: Run and commit**
+- [ ] **Step 4: Exercise the real public startup path on delegated Linux**
+
+Run the packaged server binary under the same delegated cgroup v2 and namespace/seccomp prerequisites intended for deployment; do not inject a checker. In the positive case, verify the child placement barrier, filesystem/network probes, required controllers, and `cgroup.kill`, then bind an ephemeral public-mode listener and call a protected status route with a valid capability token. In the negative case, run the same binary and startup path with the delegated subtree unavailable (and separately with the network seccomp prerequisite unavailable), assert a nonzero exit, and prove the reserved port was never bound. These two process-level results are mandatory public-startup evidence; test doubles alone cannot mark the row green.
+
+- [ ] **Step 5: Run and commit**
 
 ```powershell
 cargo test -p fluxform-server-probe --test public_startup
-git add apps/server-probe/src/startup.rs apps/server-probe/tests/public_startup.rs
+git add apps/server-probe/src/startup.rs apps/server-probe/src/main.rs apps/server-probe/src/lib.rs apps/server-probe/tests/public_startup.rs
 git commit -m "feat(server): fail closed before public bind"
 ```
 
@@ -1022,10 +1078,15 @@ pub struct WindowProbeResult {
     pub os: String,
     pub os_version: String,
     pub display_server: String,
+    pub installed_artifact_sha256: String,
+    pub installed_launch_path: String,
+    pub network_disconnected: bool,
+    pub first_launch_succeeded: bool,
     pub transparent_pixels_visible: bool,
     pub transparent_pixels_click_through: bool,
     pub frameless_drag_works: bool,
     pub file_drop_works: bool,
+    pub outside_orb_drop_reached_background_target: bool,
     pub focus_recovery_works: bool,
     pub repeated_launch_created_second_window: bool,
     pub repeated_launch_backend_process_count: u32,
@@ -1060,7 +1121,7 @@ The UI must show the exact manual test order:
 1. verify the desktop is visible through all four corners;
 2. click a control behind each transparent corner;
 3. drag the window from the orb surface;
-4. drop a file on the surface and outside the circle but inside window bounds;
+4. drop a file on the orb and verify FluxForm receives it, then drop outside the circle but inside rectangular window bounds and verify FluxForm does not receive it while the visible background target does;
 5. switch away and restore focus ten times;
 6. start the executable again and verify a second window appears while the OS reports one application process;
 7. close a non-last window and verify the remaining window stays alive, then close the last idle window and verify the process exits;
@@ -1068,9 +1129,29 @@ The UI must show the exact manual test order:
 9. visit every monitor edge and reconnect a secondary display while the probe runs;
 10. measure 60 seconds of idle CPU/GPU.
 
-- [ ] **Step 4: Run the platform matrix**
+- [ ] **Step 4: Build, test, and commit the probe**
 
-Execute and save evidence for:
+```powershell
+cargo test --manifest-path apps/desktop-probe/src-tauri/Cargo.toml
+pnpm --dir apps/desktop-probe install --frozen-lockfile
+pnpm --dir apps/desktop-probe run tauri:build
+git add Cargo.toml Cargo.lock apps/desktop-probe
+git commit -m "test(desktop): add transparent window feasibility probe"
+```
+
+Expected: the model tests pass and the current platform produces its installable probe artifact. This step proves the probe is buildable; it does not claim cross-platform behavior.
+
+## Task 16: Collect Native Window, Installer, and Offline Evidence
+
+**Files:**
+- Create: `docs/architecture/stage-0-gate-report.md`
+- Produce: signed/notarized macOS DMG evidence for native x86_64 and aarch64
+- Produce: offline Windows installer and Linux AppImage evidence
+- Produce: one `WindowProbeResult` JSON per required display backend
+
+- [ ] **Step 1: Run the platform matrix from installed artifacts**
+
+Build distributable artifacts first, then launch only through the installed application path—never `tauri dev` or a build-tree executable—and save the resolved executable/bundle path and artifact SHA-256 in every result. Execute and save evidence for:
 
 - Windows 11 x86_64 with the offline WebView2 installer;
 - macOS natively on Intel x86_64 hardware and natively on Apple Silicon, using the intended signed/notarized direct distribution path; Rosetta evidence is supplemental and cannot replace native Intel evidence;
@@ -1081,43 +1162,53 @@ For Wayland, record lack of global positioning or always-on-top support as an ex
 
 For Windows, build the probe installer with `webviewInstallMode.type = "offlineInstaller"`, disconnect a clean Windows 11 VM before installation, and prove installation plus first launch without a pre-existing evergreen WebView2 runtime or network access. Record installer size and first-launch result. If the offline installer mode cannot satisfy this, Stage 0 remains red until a fixed-runtime design is tested and approved.
 
+For macOS, install the signed and notarized DMG on clean, disconnected native Intel and Apple Silicon machines. Record `codesign --verify --deep --strict`, `spctl --assess`, and stapler validation output before first launch. For Linux, install/run the AppImage on the documented clean baseline with networking disabled before first launch. In all three operating-system families, bundle the approved FFmpeg/FFprobe candidates as inert probe sidecars and prove their hashes and fixed `-version` commands work offline; no conversion product code is added in Stage 0.
+
 Document prerequisites and exact commands in the gate report: Microsoft C++ Build Tools on Windows, Xcode Command Line Tools on macOS, and the Tauri-documented WebKitGTK 4.1, GTK/AppIndicator, OpenSSL, librsvg, and build packages on the chosen Linux baseline. Build with `pnpm --dir apps/desktop-probe install --frozen-lockfile` followed by `pnpm --dir apps/desktop-probe run tauri:build`; CI must use the committed lockfiles.
 
-- [ ] **Step 5: Make the architecture decision from evidence**
+- [ ] **Step 2: Make the architecture decision from evidence**
 
 Record exactly one supported behavior per platform in the gate report:
 
-- `transparent-orb` when all required checks pass;
+- `transparent-orb` when all required checks pass, including delivery of an outside-circle drop to the visible background target;
 - `transparent-window-with-rectangular-hit-region` only if the product owner accepts the interaction consequence;
 - `opaque-frameless-fallback` when transparency or hit testing is unreliable;
 - `unsupported` when file drop, focus, or stable rendering fails.
 
 Do not silently map a red result to green. If the accepted fallback changes the spec, amend the spec and obtain user approval before Stage 1.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 3: Commit reviewed evidence and the platform decision**
 
 ```powershell
-git add Cargo.toml Cargo.lock apps/desktop-probe
-git commit -m "test(desktop): add transparent window feasibility probe"
+git add docs/architecture/stage-0-gate-report.md
+git commit -m "docs(desktop): record native window feasibility evidence"
 ```
 
-## Task 16: Add Reproducible Gate Commands and CI
+## Task 17: Add Reproducible Gate Commands and CI
 
 **Files:**
 - Create: `scripts/check-stage0.ps1`
 - Create: `scripts/check-stage0.sh`
 - Create: `.github/workflows/stage0-gates.yml`
-- Create: `docs/architecture/stage-0-gate-report.md`
+- Modify: `docs/architecture/stage-0-gate-report.md`
 - Create: `crates/fluxform-protocol/tests/stage0_scripts.rs`
 - Modify: `AGENTS.md`
 
 **Interfaces:**
-- PowerShell: `./scripts/check-stage0.ps1 [-Ffmpeg FFMPEG_PATH] [-Ffprobe FFPROBE_PATH] [-Gate GATE_NAME]`
-- Bash: `./scripts/check-stage0.sh [--ffmpeg FFMPEG_PATH] [--ffprobe FFPROBE_PATH] [--gate GATE_NAME]`
+- PowerShell: `./scripts/check-stage0.ps1 -Mode Automated|Complete [-Ffmpeg FFMPEG_PATH] [-Ffprobe FFPROBE_PATH] [-Gate GATE_NAME]`
+- Bash: `./scripts/check-stage0.sh --mode automated|complete [--ffmpeg FFMPEG_PATH] [--ffprobe FFPROBE_PATH] [--gate GATE_NAME]`
 
 - [ ] **Step 1: Add failing behavioral tests for both gate scripts**
 
-Add `crates/fluxform-protocol/tests/stage0_scripts.rs`. On Windows, create a temporary failing `cargo.cmd`, prepend it to `PATH`, run `check-stage0.ps1 -Gate protocol`, and assert a nonzero exit plus `protocol=FAIL`. On Linux, do the same with an executable `cargo` shim and `check-stage0.sh --gate protocol`. Repeat with a successful shim and assert the scripts continue to contract drift verification. These tests execute the scripts; they do not merely search their source text.
+Add `crates/fluxform-protocol/tests/stage0_scripts.rs`. On Windows, create a temporary failing `cargo.cmd`, prepend it to `PATH`, run `check-stage0.ps1 -Mode Automated -Gate protocol`, and assert a nonzero exit plus `protocol=FAIL`. On Linux, do the same with an executable `cargo` shim and `check-stage0.sh --mode automated --gate protocol`. Repeat with a successful shim and assert the scripts continue to contract drift verification. Add report fixtures proving `Complete` exits nonzero for `BLOCKED` and zero only for a fully reviewed all-PASS report. These tests execute the scripts; they do not merely search their source text.
+
+Run these tests before implementing the scripts:
+
+```powershell
+cargo test -p fluxform-protocol --test stage0_scripts
+```
+
+Expected: FAIL because the executable scripts and mode semantics do not exist.
 
 The complete scripts must:
 
@@ -1130,15 +1221,15 @@ The complete scripts must:
 
 - [ ] **Step 2: Implement both scripts with matching semantics**
 
-Scripts must accept a repeatable gate selector for focused testing, stop at the first failed selected gate, and print a final summary containing every selected gate and status. They may read candidate binaries but must not modify `tools-cache`, `publish`, or the existing .NET projects. `BLOCKED` is a nonzero result for the complete Stage 0 command.
+Scripts must accept a repeatable gate selector for focused testing, stop at the first failed selected gate, and print a final summary containing every selected gate and status. They may read candidate binaries but must not modify `tools-cache`, `publish`, or the existing .NET projects. `Automated` mode runs only reproducible checks available on that machine and exits zero when those selected checks pass while clearly reporting `stage0_complete=false`. `Complete` mode additionally validates every required report row and exact platform artifact; any `BLOCKED`, `FAIL`, missing evidence cell, or unreviewed artifact is nonzero. The two modes must never infer completion from the same exit code.
 
 - [ ] **Step 3: Add the CI matrix**
 
 The workflow must use minimum `contents: read`, dependency caching keyed by lockfiles, and concurrency cancellation. Required jobs:
 
 - Windows: protocol, capability-manifest/profile fixtures, atomic output, server-probe unit tests, script behavior, and desktop-probe build with pinned pnpm dependencies;
-- macOS: protocol, capability-manifest/profile fixtures, atomic output, script behavior, and desktop-probe build on both supported architectures;
-- Ubuntu: protocol, capability-manifest/profile fixtures, atomic output, server-probe tests, script behavior, delegated-cgroup sandbox adversarial tests, and desktop-probe build after installing the documented WebKitGTK/GTK packages.
+- macOS: protocol, capability-manifest/profile fixtures, atomic output, script behavior, and desktop-probe build. Native behavior evidence runs on separately registered self-hosted runners labeled `macOS-x64-native` and `macOS-arm64-native`; an arm64 runner under Rosetta cannot satisfy the Intel row;
+- Ubuntu: protocol, capability-manifest/profile fixtures, atomic output, server-probe tests, script behavior, and desktop-probe build after installing the documented WebKitGTK/GTK packages. Delegated-cgroup adversarial tests and the real public-startup integration run only on a required self-hosted runner labeled `linux-cgroupv2-delegated`; an ordinary hosted runner reports `BLOCKED`, not PASS.
 
 Do not mark manual transparent-window checks as automated. Upload non-secret test reports as artifacts; never upload capability tokens or uploaded sample contents.
 
@@ -1151,20 +1242,24 @@ The report must contain one row for each item below, with `PASS`, `FAIL`, or `BL
 3. macOS x86_64 FFmpeg profile and license record;
 4. macOS aarch64 FFmpeg profile and license record;
 5. Linux x86_64 FFmpeg profile and license record;
-6. capability manifest validation against every referenced profile;
-7. atomic reject/rename/replace and crash recovery on each supported local filesystem;
-8. Linux filesystem sandbox denial;
-9. Linux OS network denial, separately from FFmpeg protocol-policy denial;
-10. Linux cgroup v2 aggregate process/memory/CPU containment and kill;
-11. streaming upload, reservation expansion, and early body termination;
-12. capability authorization on every concrete endpoint;
-13. SSE reconnect, replay, resync snapshot, and expiry;
-14. fail-closed public-server startup;
-15. Windows window, repeated-launch, close, DPI, and multi-monitor behavior;
-16. native Intel and Apple Silicon macOS window behavior;
-17. Linux X11 window behavior;
-18. Linux Wayland fallback behavior;
-19. Windows offline WebView2 installation strategy.
+6. exact approved/deferred capability matrix and product-owner approval;
+7. every enabled edge and rejection sample executed against all four approved native profiles;
+8. atomic reject/rename/replace, injected replacement failures, and crash recovery on each supported local filesystem;
+9. Linux filesystem sandbox denial;
+10. Linux OS network denial, separately from FFmpeg protocol-policy denial;
+11. Linux cgroup v2 birth placement, aggregate process/memory/CPU containment, and kill;
+12. streaming upload, reservation expansion, and early body termination;
+13. capability authorization success/failure on every concrete endpoint, Origin enforcement, and trusted-proxy IP provenance;
+14. SSE reconnect, replay, resync snapshot, and expiry;
+15. real positive and negative fail-closed public-server startup;
+16. Windows installed-app window, repeated-launch, close, DPI, and multi-monitor behavior;
+17. native Intel and Apple Silicon installed-app macOS window behavior;
+18. Linux X11 installed-AppImage window behavior;
+19. Linux Wayland installed-AppImage fallback behavior;
+20. Windows offline WebView2 installation and first launch;
+21. macOS signed/notarized disconnected installation and first launch on both architectures;
+22. Linux disconnected AppImage first launch;
+23. bundled FFmpeg/FFprobe sidecar hash and offline execution on each platform.
 
 No blank evidence cells are permitted. A blocked row explains the external prerequisite and keeps Stage 0 incomplete.
 
@@ -1175,12 +1270,20 @@ Add the Rust workspace commands and the rule that later Rust stages may not begi
 - [ ] **Step 6: Run the complete local verification**
 
 ```powershell
-./scripts/check-stage0.ps1
+./scripts/check-stage0.ps1 -Mode Automated
 ./scripts/build.ps1
 ./scripts/test.ps1
 ```
 
 Expected: Stage 0 automated checks PASS and the legacy .NET build/tests remain PASS. Manual cross-platform rows may remain `BLOCKED`, but then this plan is not complete and Stage 1 must not begin.
+
+After every native/manual artifact has been reviewed, run:
+
+```powershell
+./scripts/check-stage0.ps1 -Mode Complete
+```
+
+Expected: PASS only when no report row is `BLOCKED` or `FAIL` and all artifact identities match. Before that point, this command is expected to exit nonzero.
 
 - [ ] **Step 7: Request code review against the approved spec**
 
@@ -1201,11 +1304,13 @@ git commit -m "ci: enforce Rust rewrite feasibility gates"
 - [ ] Regenerate `contracts/v1` twice and confirm the second run produces no diff.
 - [ ] Confirm Windows x86_64, macOS x86_64, macOS aarch64, and Linux x86_64 FFmpeg reports match approved artifacts and license records.
 - [ ] Confirm every capability-manifest edge validates against every profile it references.
+- [ ] Confirm every enabled edge and every declared rejection sample was actually executed against all four approved native profiles, with hashes and expected media properties matching the versioned corpus.
 - [ ] Confirm public-server startup fails when the Linux sandbox self-check is forced to fail.
 - [ ] Confirm an under-declared upload expands its reservation before writing, while a denied expansion or over-limit upload stops polling the remaining body.
 - [ ] Confirm every protected endpoint rejects a token for another job.
 - [ ] Confirm atomic commit tests never expose a partial file at the final path.
 - [ ] Confirm transparent-window evidence covers visuals, hit testing, repeated launch, close, DPI, and multiple monitors on every target/fallback.
+- [ ] Run the complete gate command and require a zero exit only after every report row is reviewed and `PASS`.
 - [ ] Run `./scripts/build.ps1` and `./scripts/test.ps1` for the legacy solution.
 - [ ] Scan the new tree for unfinished markers, ignored tests, and unconditional skips; resolve each occurrence.
 - [ ] Verify `git status --short` contains only intended Stage 0 changes.
