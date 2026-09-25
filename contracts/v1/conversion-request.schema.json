@@ -164,6 +164,7 @@
     "OutputTargetV1": {
       "oneOf": [
         {
+          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "managed_artifact",
@@ -176,6 +177,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "properties": {
             "directory_token": {
               "type": "string"
@@ -192,6 +194,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "local_path",
@@ -208,6 +211,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "managed_job_directory",

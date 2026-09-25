@@ -109,6 +109,17 @@ fn exported_error_schema_constrains_public_messages_and_diagnostic_ids() {
     }
 }
 
+#[test]
+fn conversion_request_schema_rejects_extra_output_target_fields() {
+    let schema =
+        &fluxform_protocol::exported_contracts()["contracts/v1/conversion-request.schema.json"];
+    let validator = jsonschema::validator_for(schema).unwrap();
+    let mut request = serde_json::to_value(valid_request()).unwrap();
+    request["output_target"]["path"] = serde_json::json!(r"C:\server\escape.png");
+
+    assert!(!validator.is_valid(&request));
+}
+
 fn code_to_public_message(code: &str) -> &'static str {
     match code {
         "unsupported_input" => "input format is not supported",

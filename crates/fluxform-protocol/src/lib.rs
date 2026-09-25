@@ -481,14 +481,28 @@ pub fn exported_contracts() -> BTreeMap<&'static str, Value> {
     let mut contracts = BTreeMap::from([
         (
             "contracts/v1/conversion-request.schema.json",
-            serde_json::to_value(schemars::schema_for!(ConversionRequestV1))
-                .expect("conversion request schema must serialize"),
+            conversion_request_schema(),
         ),
         ("contracts/v1/error.schema.json", error_schema()),
         ("contracts/v1/job-event.schema.json", job_event_schema),
     ]);
     contracts.extend(canonical_fixtures());
     contracts
+}
+
+fn conversion_request_schema() -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(ConversionRequestV1))
+        .expect("conversion request schema must serialize");
+    for variant in schema["$defs"]["OutputTargetV1"]["oneOf"]
+        .as_array_mut()
+        .expect("output target schema must define variants")
+    {
+        variant
+            .as_object_mut()
+            .expect("output target variant must be an object")
+            .insert("additionalProperties".to_owned(), Value::Bool(false));
+    }
+    schema
 }
 
 fn error_schema() -> Value {
