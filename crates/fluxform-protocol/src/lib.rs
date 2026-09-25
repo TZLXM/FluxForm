@@ -286,11 +286,135 @@ pub enum ErrorCodeV1 {
     StorageUnavailable,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+impl ErrorCodeV1 {
+    #[must_use]
+    pub const fn public_message(self) -> &'static str {
+        match self {
+            Self::UnsupportedInput => "input format is not supported",
+            Self::UnsupportedConversion => "requested conversion is not supported",
+            Self::MixedCategory => "inputs must use one conversion category",
+            Self::InvalidOption => "one or more conversion options are invalid",
+            Self::FileTooLarge => "input exceeds the allowed size",
+            Self::QuotaExceeded => "conversion quota has been exceeded",
+            Self::QueueFull => "conversion queue is full",
+            Self::FfprobeFailed => "media inspection failed",
+            Self::ConversionFailed => "conversion failed",
+            Self::OutputTooLarge => "output exceeds the allowed size",
+            Self::Timeout => "conversion timed out",
+            Self::Cancelled => "conversion was cancelled",
+            Self::Interrupted => "conversion was interrupted",
+            Self::StorageUnavailable => "artifact storage is unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error("diagnostic ID must start with 'diag_' and contain only ASCII letters, digits, '_' or '-'")]
+pub struct InvalidDiagnosticIdV1;
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct DiagnosticIdV1(String);
+
+impl DiagnosticIdV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidDiagnosticIdV1> {
+        let value = value.into();
+        let suffix = value.strip_prefix("diag_").unwrap_or_default();
+        if suffix.is_empty()
+            || value.len() > 128
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(InvalidDiagnosticIdV1);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DiagnosticIdV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApiErrorV1 {
-    pub code: ErrorCodeV1,
-    pub message: String,
+    code: ErrorCodeV1,
+    message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub diagnostic_id: Option<String>,
+    diagnostic_id: Option<DiagnosticIdV1>,
+}
+
+impl ApiErrorV1 {
+    #[must_use]
+    pub fn new(code: ErrorCodeV1) -> Self {
+        Self {
+            code,
+            message: code.public_message().to_owned(),
+            diagnostic_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_diagnostic_id(code: ErrorCodeV1, diagnostic_id: DiagnosticIdV1) -> Self {
+        Self {
+            code,
+            message: code.public_message().to_owned(),
+            diagnostic_id: Some(diagnostic_id),
+        }
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> ErrorCodeV1 {
+        self.code
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub fn diagnostic_id(&self) -> Option<&str> {
+        self.diagnostic_id.as_ref().map(DiagnosticIdV1::as_str)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiErrorWireV1 {
+    code: ErrorCodeV1,
+    message: String,
+    diagnostic_id: Option<DiagnosticIdV1>,
+}
+
+impl<'de> Deserialize<'de> for ApiErrorV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ApiErrorWireV1::deserialize(deserializer)?;
+        if wire.message != wire.code.public_message() {
+            return Err(serde::de::Error::custom(
+                "message must match the stable public message for the error code",
+            ));
+        }
+        Ok(Self {
+            code: wire.code,
+            message: wire.message,
+            diagnostic_id: wire.diagnostic_id,
+        })
+    }
 }

@@ -1,6 +1,6 @@
 use fluxform_protocol::{
-    ApiErrorV1, CategoryV1, ConversionRequestV1, ErrorCodeV1, ImageOptionsV1, JobEventV1,
-    JobStateV1, OutputTargetV1, OverwritePolicyV1, ProtocolVersionV1,
+    ApiErrorV1, CategoryV1, ConversionRequestV1, DiagnosticIdV1, ErrorCodeV1, ImageOptionsV1,
+    JobEventV1, JobStateV1, OutputTargetV1, OverwritePolicyV1, ProtocolVersionV1,
 };
 
 fn valid_request() -> ConversionRequestV1 {
@@ -90,11 +90,7 @@ fn unknown_request_fields_are_rejected() {
 
 #[test]
 fn every_job_event_contains_job_id_and_positive_revision() {
-    let error = ApiErrorV1 {
-        code: ErrorCodeV1::ConversionFailed,
-        message: "conversion failed".to_owned(),
-        diagnostic_id: None,
-    };
+    let error = ApiErrorV1::new(ErrorCodeV1::ConversionFailed);
     let events = [
         (
             JobEventV1::StateChanged {
@@ -187,11 +183,10 @@ fn cancelling_is_distinct_from_terminal_states() {
 
 #[test]
 fn api_errors_expose_only_stable_redacted_fields() {
-    let value = serde_json::to_value(ApiErrorV1 {
-        code: ErrorCodeV1::FfprobeFailed,
-        message: "media inspection failed".to_owned(),
-        diagnostic_id: Some("diag_01HXYZ".to_owned()),
-    })
+    let value = serde_json::to_value(ApiErrorV1::with_diagnostic_id(
+        ErrorCodeV1::FfprobeFailed,
+        DiagnosticIdV1::new("diag_01HXYZ").unwrap(),
+    ))
     .unwrap();
 
     assert_eq!(value["code"], "ffprobe_failed");
@@ -201,13 +196,54 @@ fn api_errors_expose_only_stable_redacted_fields() {
     assert!(value.get("command_line").is_none());
     assert!(value.get("path").is_none());
 
-    let without_diagnostic = serde_json::to_value(ApiErrorV1 {
-        code: ErrorCodeV1::Timeout,
-        message: "conversion timed out".to_owned(),
-        diagnostic_id: None,
-    })
-    .unwrap();
+    let without_diagnostic = serde_json::to_value(ApiErrorV1::new(ErrorCodeV1::Timeout)).unwrap();
     assert!(without_diagnostic.get("diagnostic_id").is_none());
+}
+
+#[test]
+fn api_errors_reject_sensitive_messages_during_deserialization() {
+    for message in [
+        r"failed to inspect C:\server\secret.mov",
+        "failed to inspect /srv/media/secret.mov",
+        "ffmpeg -i input.mov output.mp4",
+    ] {
+        let value = serde_json::json!({
+            "code": "ffprobe_failed",
+            "message": message
+        });
+        assert!(serde_json::from_value::<ApiErrorV1>(value).is_err());
+    }
+}
+
+#[test]
+fn api_errors_reject_sensitive_diagnostic_ids_during_deserialization() {
+    for diagnostic_id in [
+        r"C:\server\secret.mov",
+        "/srv/media/secret.mov",
+        "ffmpeg -i input.mov output.mp4",
+    ] {
+        let value = serde_json::json!({
+            "code": "ffprobe_failed",
+            "message": "media inspection failed",
+            "diagnostic_id": diagnostic_id
+        });
+        assert!(serde_json::from_value::<ApiErrorV1>(value).is_err());
+    }
+}
+
+#[test]
+fn api_errors_prevent_sensitive_public_strings_from_construction() {
+    for sensitive_value in [
+        r"C:\server\secret.mov",
+        "/srv/media/secret.mov",
+        "ffmpeg -i secret.mov output.mp4",
+    ] {
+        assert!(DiagnosticIdV1::new(sensitive_value).is_err());
+    }
+
+    let value = serde_json::to_value(ApiErrorV1::new(ErrorCodeV1::ConversionFailed)).unwrap();
+    assert_eq!(value["message"], "conversion failed");
+    assert!(!value.to_string().contains("secret.mov"));
 }
 
 #[test]
