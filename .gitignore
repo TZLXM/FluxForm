@@ -1,4 +1,5 @@
 # Build outputs
+/target/
 bin/
 obj/
 publish/
