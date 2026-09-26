@@ -229,6 +229,179 @@ impl Default for SandboxLimits {
     }
 }
 
+/// Result state for the cgroup v2 setup evidence. A ready record proves that
+/// the delegated job cgroup and its controls were installed; aggregate
+/// behavior still requires the native adversarial tests on a delegated Linux
+/// runner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupEvidenceStatus {
+    Ready,
+    Blocked,
+}
+
+/// Setup facts for one per-job cgroup. This is configuration evidence, not a
+/// substitute for aggregate-limit stress evidence from the Linux tests.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CgroupEvidence {
+    pub status: CgroupEvidenceStatus,
+    pub detail: String,
+    pub job_id: Option<String>,
+    pub pids_max: Option<u64>,
+    pub memory_max_bytes: Option<u64>,
+    pub memory_swap_max_bytes: Option<u64>,
+    pub cpu_quota_micros: Option<u64>,
+    pub cpu_period_micros: Option<u64>,
+}
+
+impl CgroupEvidence {
+    fn blocked(detail: impl Into<String>) -> Self {
+        Self {
+            status: CgroupEvidenceStatus::Blocked,
+            detail: detail.into(),
+            job_id: None,
+            pids_max: None,
+            memory_max_bytes: None,
+            memory_swap_max_bytes: None,
+            cpu_quota_micros: None,
+            cpu_period_micros: None,
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn ready(job_id: &str, limits: SandboxLimits) -> Self {
+        Self {
+            status: CgroupEvidenceStatus::Ready,
+            detail: "delegated cgroup v2 job and aggregate resource limits are configured; native stress evidence is recorded separately".into(),
+            job_id: Some(job_id.to_owned()),
+            pids_max: Some(limits.pids_max),
+            memory_max_bytes: Some(limits.memory_max_bytes),
+            memory_swap_max_bytes: Some(0),
+            cpu_quota_micros: Some(limits.cpu_quota_micros),
+            cpu_period_micros: Some(limits.cpu_period_micros),
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn with_detail(mut self, detail: String) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    pub fn all_passed(&self) -> bool {
+        self.status == CgroupEvidenceStatus::Ready
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CgroupLimitControls {
+    pids_max: String,
+    memory_max: String,
+    memory_swap_max: String,
+    cpu_max: String,
+}
+
+fn validate_cgroup_job_id(job_id: &str) -> Result<(), &'static str> {
+    let bytes = job_id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        return Err("job id must contain 1 to 64 ASCII characters");
+    }
+    if !bytes[0].is_ascii_alphanumeric()
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(*byte, b'.' | b'_' | b'-'))
+        || job_id == "."
+        || job_id == ".."
+    {
+        return Err("job id must be one safe ASCII path component");
+    }
+    Ok(())
+}
+
+fn cgroup_limit_controls(limits: SandboxLimits) -> Result<CgroupLimitControls, &'static str> {
+    if limits.pids_max == 0
+        || limits.memory_max_bytes == 0
+        || limits.cpu_quota_micros == 0
+        || !(1_000..=1_000_000).contains(&limits.cpu_period_micros)
+    {
+        return Err("pids, memory, and CPU limits must be valid positive cgroup v2 values");
+    }
+    if limits.memory_swap_max_bytes != 0 {
+        return Err("cgroup v2 swap must be disabled with memory.swap.max = 0");
+    }
+
+    Ok(CgroupLimitControls {
+        pids_max: format!("{}\n", limits.pids_max),
+        memory_max: format!("{}\n", limits.memory_max_bytes),
+        memory_swap_max: "0\n".into(),
+        cpu_max: format!("{} {}\n", limits.cpu_quota_micros, limits.cpu_period_micros),
+    })
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_cgroup_populated(events: &str) -> Result<bool, &'static str> {
+    let mut populated = None;
+    for line in events.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let Some(value) = fields.next() else {
+            if name == "populated" {
+                return Err("cgroup.events populated value is missing");
+            }
+            continue;
+        };
+        if fields.next().is_some() {
+            if name == "populated" {
+                return Err("cgroup.events populated record is malformed");
+            }
+            continue;
+        }
+        if name == "populated" {
+            if populated.is_some() || !matches!(value, "0" | "1") {
+                return Err("cgroup.events populated record is duplicated or invalid");
+            }
+            populated = Some(value == "1");
+        }
+    }
+    populated.ok_or("cgroup.events has no populated record")
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn proc_cgroup_matches(contents: &str, expected_path: &str) -> bool {
+    if !expected_path.starts_with('/') || expected_path.ends_with('/') {
+        return false;
+    }
+    let mut unified = None;
+    for line in contents.lines() {
+        if let Some(path) = line.strip_prefix("0::")
+            && unified.replace(path).is_some()
+        {
+            return false;
+        }
+    }
+    unified == Some(expected_path)
+}
+
 /// Paths and resource limits declared by the trusted server for one job.
 ///
 /// On Linux, `job_dir` must be a private empty directory owned by the
@@ -255,6 +428,161 @@ pub trait ResourceBoundary: Send + Sync {
     fn is_empty(&self) -> Result<bool, SandboxError>;
 }
 
+/// Per-job Linux cgroup v2 resource boundary.
+///
+/// The delegated root must be the current service process's cgroup and must
+/// already expose the `cpu`, `memory`, and `pids` controllers to children.
+/// `create` installs every aggregate limit before `prepare_spawn` can return a
+/// placement. A ready configuration record is not native stress evidence.
+#[derive(Debug)]
+pub struct CgroupV2Job {
+    evidence: CgroupEvidence,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    inner: linux::CgroupV2JobInner,
+}
+
+impl CgroupV2Job {
+    pub fn create(
+        delegated_root: impl AsRef<Path>,
+        job_id: &str,
+        limits: SandboxLimits,
+    ) -> Result<Self, SandboxError> {
+        validate_cgroup_job_id(job_id)
+            .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
+        let controls = cgroup_limit_controls(limits)
+            .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            let (inner, detail) =
+                linux::create_cgroup_job(delegated_root.as_ref(), job_id, limits, controls)?;
+            Ok(Self {
+                evidence: CgroupEvidence::ready(job_id, limits).with_detail(detail),
+                inner,
+            })
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let _ = (delegated_root, controls);
+            Err(SandboxError::CgroupPrerequisitesFailed(Box::new(
+                CgroupEvidence::blocked(
+                    "BLOCKED: native cgroup v2 delegation can only be inspected on supported Linux targets",
+                ),
+            )))
+        }
+    }
+
+    /// Returns the setup evidence for this job. Aggregate enforcement remains
+    /// unproven until the native Linux resource tests pass.
+    pub fn evidence(&self) -> CgroupEvidence {
+        self.evidence.clone()
+    }
+
+    /// Absolute path to the job cgroup, useful for diagnostics and native
+    /// integration assertions.
+    pub fn path(&self) -> &Path {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            &self.inner.path
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            Path::new("")
+        }
+    }
+}
+
+impl ResourceBoundary for CgroupV2Job {
+    fn prepare_spawn(&self) -> Result<SpawnPlacement, SandboxError> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            Ok(SpawnPlacement::CgroupV2(CgroupPlacement {
+                inner: self.inner.prepare_spawn()?,
+            }))
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            Err(SandboxError::CgroupPrerequisitesFailed(Box::new(
+                CgroupEvidence::blocked("BLOCKED: cgroup v2 is unavailable on this platform"),
+            )))
+        }
+    }
+
+    fn kill_all(&self) -> Result<(), SandboxError> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            self.inner.kill_all()
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            Err(SandboxError::CgroupPrerequisitesFailed(Box::new(
+                CgroupEvidence::blocked("BLOCKED: cgroup v2 is unavailable on this platform"),
+            )))
+        }
+    }
+
+    fn is_empty(&self) -> Result<bool, SandboxError> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            self.inner.is_empty()
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            Err(SandboxError::CgroupPrerequisitesFailed(Box::new(
+                CgroupEvidence::blocked("BLOCKED: cgroup v2 is unavailable on this platform"),
+            )))
+        }
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl Drop for CgroupV2Job {
+    fn drop(&mut self) {
+        let _ = self.inner.kill_all();
+    }
+}
+
 /// Placement signal handed to a sandbox child before it can fork or exec a
 /// tool. `ready` is the child-to-controller pipe; `release` is the controller-
 /// to-child pipe. Their ownership transfers to `spawn_blocked`.
@@ -268,6 +596,20 @@ pub enum SpawnPlacement {
         ready: std::fs::File,
         release: std::fs::File,
     },
+    /// Managed cgroup placement. The sandbox completes either atomic clone3
+    /// placement or the blocked parent-attach handshake before returning.
+    CgroupV2(CgroupPlacement),
+}
+
+/// Opaque placement created by `CgroupV2Job`; callers cannot forge cgroup
+/// descriptors or bypass the parent-side membership check.
+#[derive(Debug)]
+pub struct CgroupPlacement {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    inner: linux::CgroupPlacement,
 }
 
 /// Fail-closed errors returned by the platform and namespace probes.
@@ -279,6 +621,8 @@ pub enum SandboxError {
     Prerequisites(Box<FilesystemEvidence>),
     #[error("required Linux network prerequisites failed: {0:?}")]
     NetworkPrerequisitesFailed(Box<NetworkEvidence>),
+    #[error("required cgroup v2 prerequisites failed: {0:?}")]
+    CgroupPrerequisitesFailed(Box<CgroupEvidence>),
     #[error("invalid sandbox policy: {0}")]
     InvalidPolicy(String),
     #[error("sandbox operation {operation} failed: {source}")]
@@ -694,7 +1038,7 @@ pub struct SandboxChild;
 pub struct SandboxChild {
     pid: libc::pid_t,
     root: Option<linux::TempRoot>,
-    status: Option<std::process::ExitStatus>,
+    reaper: std::sync::Arc<linux::ChildReaper>,
 }
 
 #[cfg(all(
@@ -709,29 +1053,21 @@ impl SandboxChild {
     }
 
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if let Some(status) = self.status {
-            return Ok(status);
-        }
-        let status = linux::wait_for_child(self.pid)?;
-        self.status = Some(status);
+        let status = self.reaper.wait()?;
         self.root.take();
         Ok(status)
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        if let Some(status) = self.status {
-            return Ok(Some(status));
-        }
-        let Some(status) = linux::try_wait_for_child(self.pid)? else {
+        let Some(status) = self.reaper.try_wait()? else {
             return Ok(None);
         };
-        self.status = Some(status);
         self.root.take();
         Ok(Some(status))
     }
 
     pub fn kill(&mut self) -> std::io::Result<()> {
-        if self.status.is_some() {
+        if self.reaper.try_wait()?.is_some() {
             return Ok(());
         }
         linux::kill_process_group(self.pid)?;
@@ -746,11 +1082,9 @@ impl SandboxChild {
 ))]
 impl Drop for SandboxChild {
     fn drop(&mut self) {
-        if self.status.is_none() {
+        if self.reaper.try_wait().ok().flatten().is_none() {
             let _ = linux::kill_process_group(self.pid);
-            if let Ok(status) = linux::wait_for_child(self.pid) {
-                self.status = Some(status);
-            }
+            let _ = self.reaper.wait();
         }
         self.root.take();
     }
@@ -765,17 +1099,17 @@ impl Drop for SandboxChild {
 #[allow(unsafe_op_in_unsafe_fn)]
 mod linux {
     use super::{
-        FileIdentity, FilesystemEvidence, FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES,
-        NetworkEvidence, NetworkPolicy, NetworkPrerequisites, NetworkSocketDomain, NetworkSyscall,
-        PolicyPathIdentityGraph, ProbeEvidence, SandboxChild, SandboxError, SandboxLimits,
-        SandboxPolicy, SpawnPlacement, ToolEntryEvidence, ToolInventory,
-        network_namespace_is_private, validate_open_files_limit, validate_policy_path_identities,
-        validate_tool_inventory,
+        CgroupEvidence, CgroupLimitControls, FileIdentity, FilesystemEvidence,
+        FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES, NetworkEvidence, NetworkPolicy,
+        NetworkPrerequisites, NetworkSocketDomain, NetworkSyscall, PolicyPathIdentityGraph,
+        ProbeEvidence, SandboxChild, SandboxError, SandboxLimits, SandboxPolicy, SpawnPlacement,
+        ToolEntryEvidence, ToolInventory, network_namespace_is_private, validate_open_files_limit,
+        validate_policy_path_identities, validate_tool_inventory,
     };
     use std::collections::{BTreeMap, HashSet};
     use std::ffi::CString;
-    use std::fs;
-    use std::io;
+    use std::fs::{self, File};
+    use std::io::{self, Read, Write};
     use std::mem::{size_of, zeroed};
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -784,7 +1118,8 @@ mod linux {
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const MSG_READY: u32 = 1;
@@ -893,7 +1228,7 @@ mod linux {
         0
     }
 
-    struct TempRoot(PathBuf);
+    pub(super) struct TempRoot(PathBuf);
 
     impl TempRoot {
         fn create() -> io::Result<Self> {
@@ -976,6 +1311,858 @@ mod linux {
         cgroup: Option<RawFd>,
         ready: Option<RawFd>,
         release: Option<RawFd>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CgroupV2JobInner {
+        root_fd: OwnedFd,
+        job_fd: OwnedFd,
+        job_name: CString,
+        pub(super) path: PathBuf,
+        expected_cgroup_path: String,
+        placement: CgroupPlacementKind,
+        state: Arc<CgroupJobStateShared>,
+        cleanup: Mutex<()>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CgroupPlacement {
+        kind: CgroupPlacementMode,
+        reaper: Arc<ChildReaper>,
+        _lease: CgroupLease,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CgroupPlacementKind {
+        CloneIntoCgroup,
+        ParentAttachBarrier,
+    }
+
+    #[derive(Debug)]
+    enum CgroupPlacementMode {
+        CloneIntoCgroup(OwnedFd),
+        ParentAttachBarrier {
+            child_ready: File,
+            child_release: File,
+            parent_ready: File,
+            parent_release: File,
+            cgroup_procs: File,
+            cgroup_kill: File,
+            expected_cgroup_path: String,
+        },
+    }
+
+    #[derive(Debug)]
+    struct CgroupJobState {
+        closing: bool,
+        removed: bool,
+        active_spawns: usize,
+        reapers: Vec<Arc<ChildReaper>>,
+    }
+
+    #[derive(Debug)]
+    struct CgroupJobStateShared {
+        state: Mutex<CgroupJobState>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Debug)]
+    struct CgroupLease {
+        state: Arc<CgroupJobStateShared>,
+    }
+
+    impl Drop for CgroupLease {
+        fn drop(&mut self) {
+            if let Ok(mut state) = self.state.state.lock() {
+                state.active_spawns = state.active_spawns.saturating_sub(1);
+                self.state.changed.notify_all();
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct ChildReaper {
+        pid: AtomicI32,
+        status: Mutex<Option<ExitStatus>>,
+    }
+
+    impl ChildReaper {
+        pub(super) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                pid: AtomicI32::new(0),
+                status: Mutex::new(None),
+            })
+        }
+
+        pub(super) fn register(&self, pid: libc::pid_t) -> io::Result<()> {
+            self.pid
+                .compare_exchange(0, pid, Ordering::Release, Ordering::Relaxed)
+                .map(|_| ())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::AlreadyExists, "reaper already owns a child")
+                })
+        }
+
+        pub(super) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+            let mut cached = self
+                .status
+                .lock()
+                .map_err(|_| io::Error::other("sandbox child reaper lock was poisoned"))?;
+            if cached.is_some() {
+                return Ok(cached.clone());
+            }
+            let pid = self.pid.load(Ordering::Acquire);
+            if pid <= 0 {
+                return Ok(None);
+            }
+            let Some(status) = try_wait_for_child(pid)? else {
+                return Ok(None);
+            };
+            *cached = Some(status);
+            Ok(Some(status))
+        }
+
+        pub(super) fn wait(&self) -> io::Result<ExitStatus> {
+            let mut cached = self
+                .status
+                .lock()
+                .map_err(|_| io::Error::other("sandbox child reaper lock was poisoned"))?;
+            if let Some(status) = *cached {
+                return Ok(status);
+            }
+            let pid = self.pid.load(Ordering::Acquire);
+            if pid <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sandbox child has not been registered with its reaper",
+                ));
+            }
+            let status = wait_for_child(pid)?;
+            *cached = Some(status);
+            Ok(status)
+        }
+
+        fn wait_bounded(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+            loop {
+                if let Some(status) = self.try_wait()? {
+                    return Ok(Some(status));
+                }
+                if self.pid.load(Ordering::Acquire) <= 0 {
+                    return Ok(None);
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out reaping cgroup sandbox supervisor",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl CgroupV2JobInner {
+        pub(super) fn prepare_spawn(&self) -> Result<CgroupPlacement, SandboxError> {
+            let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
+                operation: "lock job cgroup lifecycle",
+                source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+            })?;
+            if state.closing || state.removed {
+                return Err(SandboxError::InvalidPolicy(
+                    "cannot spawn into a closing or removed job cgroup".into(),
+                ));
+            }
+            let reaper = ChildReaper::new();
+            state.active_spawns += 1;
+            state.reapers.push(Arc::clone(&reaper));
+            drop(state);
+            let lease = CgroupLease {
+                state: Arc::clone(&self.state),
+            };
+            let kind = match self.placement {
+                CgroupPlacementKind::CloneIntoCgroup => {
+                    CgroupPlacementMode::CloneIntoCgroup(duplicate_fd(self.job_fd.as_raw_fd())?)
+                }
+                CgroupPlacementKind::ParentAttachBarrier => create_parent_attach_placement(
+                    open_cgroup_control(self.job_fd.as_raw_fd(), "cgroup.procs", true).map_err(
+                        |source| SandboxError::Io {
+                            operation: "open cgroup.procs controller",
+                            source,
+                        },
+                    )?,
+                    open_cgroup_control(self.job_fd.as_raw_fd(), "cgroup.kill", true).map_err(
+                        |source| SandboxError::Io {
+                            operation: "open cgroup.kill controller",
+                            source,
+                        },
+                    )?,
+                    self.expected_cgroup_path.clone(),
+                )?,
+            };
+            Ok(CgroupPlacement {
+                kind,
+                reaper,
+                _lease: lease,
+            })
+        }
+
+        pub(super) fn is_empty(&self) -> Result<bool, SandboxError> {
+            let state = self.state.state.lock().map_err(|_| SandboxError::Io {
+                operation: "lock job cgroup lifecycle",
+                source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+            })?;
+            if state.removed {
+                return Ok(true);
+            }
+            drop(state);
+            let events =
+                read_cgroup_file(self.job_fd.as_raw_fd(), "cgroup.events").map_err(|source| {
+                    SandboxError::Io {
+                        operation: "read job cgroup.events",
+                        source,
+                    }
+                })?;
+            parse_cgroup_populated(&events)
+                .map(|populated| !populated)
+                .map_err(|reason| SandboxError::Io {
+                    operation: "parse job cgroup.events",
+                    source: io::Error::new(io::ErrorKind::InvalidData, reason),
+                })
+        }
+
+        pub(super) fn kill_all(&self) -> Result<(), SandboxError> {
+            let _cleanup = self.cleanup.lock().map_err(|_| SandboxError::Io {
+                operation: "serialize job cgroup cleanup",
+                source: io::Error::other("job cgroup cleanup lock was poisoned"),
+            })?;
+            let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
+                operation: "lock job cgroup lifecycle",
+                source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+            })?;
+            if state.removed {
+                return Ok(());
+            }
+            state.closing = true;
+            let lease_deadline = Instant::now() + Duration::from_secs(5);
+            while state.active_spawns != 0 {
+                let now = Instant::now();
+                if now >= lease_deadline {
+                    return Err(SandboxError::Io {
+                        operation: "wait for active cgroup placements",
+                        source: io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "an in-flight spawn still owns a cgroup placement",
+                        ),
+                    });
+                }
+                let (next, timeout) = self
+                    .state
+                    .changed
+                    .wait_timeout(state, lease_deadline.saturating_duration_since(now))
+                    .map_err(|_| SandboxError::Io {
+                        operation: "wait for active cgroup placements",
+                        source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+                    })?;
+                state = next;
+                if timeout.timed_out() && state.active_spawns != 0 {
+                    return Err(SandboxError::Io {
+                        operation: "wait for active cgroup placements",
+                        source: io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "an in-flight spawn still owns a cgroup placement",
+                        ),
+                    });
+                }
+            }
+            let reapers = state.reapers.clone();
+            drop(state);
+            write_cgroup_file(self.job_fd.as_raw_fd(), "cgroup.kill", b"1\n").map_err(
+                |source| SandboxError::Io {
+                    operation: "write job cgroup.kill",
+                    source,
+                },
+            )?;
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if self.is_empty()? {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(SandboxError::Io {
+                        operation: "wait for empty job cgroup",
+                        source: io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "cgroup.events did not report populated 0 within five seconds",
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            for reaper in reapers {
+                reaper
+                    .wait_bounded(reap_deadline)
+                    .map_err(|source| SandboxError::Io {
+                        operation: "reap cgroup sandbox supervisor",
+                        source,
+                    })?;
+            }
+
+            let result = unsafe {
+                libc::unlinkat(
+                    self.root_fd.as_raw_fd(),
+                    self.job_name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            };
+            if result != 0 {
+                return Err(SandboxError::Io {
+                    operation: "remove empty job cgroup",
+                    source: io::Error::last_os_error(),
+                });
+            }
+            let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
+                operation: "lock job cgroup lifecycle",
+                source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+            })?;
+            state.removed = true;
+            Ok(())
+        }
+    }
+
+    impl CgroupPlacement {
+        fn ensure_open(&self) -> Result<(), SandboxError> {
+            ensure_cgroup_job_open(&self._lease.state)
+        }
+
+        fn kill_members(&mut self, supervisor_pid: libc::pid_t) -> io::Result<()> {
+            let cgroup_result = match &mut self.kind {
+                CgroupPlacementMode::CloneIntoCgroup(cgroup) => {
+                    write_cgroup_file(cgroup.as_raw_fd(), "cgroup.kill", b"1\n")
+                }
+                CgroupPlacementMode::ParentAttachBarrier { cgroup_kill, .. } => {
+                    cgroup_kill.write_all(b"1\n")
+                }
+            };
+            let supervisor_result = kill_process_group(supervisor_pid);
+            cgroup_result.and(supervisor_result)
+        }
+
+        fn attach_and_release(&mut self, supervisor_pid: libc::pid_t) -> Result<(), SandboxError> {
+            let state = Arc::clone(&self._lease.state);
+            let CgroupPlacementMode::ParentAttachBarrier {
+                parent_ready,
+                parent_release,
+                cgroup_procs,
+                cgroup_kill,
+                expected_cgroup_path,
+                ..
+            } = &mut self.kind
+            else {
+                return Ok(());
+            };
+
+            let attach = (|| -> io::Result<()> {
+                ensure_cgroup_job_open(&state).map_err(|error| {
+                    io::Error::new(io::ErrorKind::Interrupted, error.to_string())
+                })?;
+                let mut reported_pid = [0_u8; size_of::<libc::pid_t>()];
+                parent_ready.read_exact(&mut reported_pid)?;
+                let reported_pid = libc::pid_t::from_ne_bytes(reported_pid);
+                if reported_pid != supervisor_pid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "blocked supervisor reported a different host PID",
+                    ));
+                }
+
+                writeln!(cgroup_procs, "{supervisor_pid}")?;
+                let membership = fs::read_to_string(format!("/proc/{supervisor_pid}/cgroup"))?;
+                if !super::proc_cgroup_matches(&membership, expected_cgroup_path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "blocked supervisor did not enter exact cgroup {expected_cgroup_path}"
+                        ),
+                    ));
+                }
+                ensure_cgroup_job_open(&state).map_err(|error| {
+                    io::Error::new(io::ErrorKind::Interrupted, error.to_string())
+                })?;
+                parent_release.write_all(&[1])?;
+                Ok(())
+            })();
+
+            if let Err(source) = attach {
+                let _ = cgroup_kill.write_all(b"1\n");
+                let _ = kill_process_group(supervisor_pid);
+                return Err(SandboxError::Io {
+                    operation: "attach blocked supervisor to job cgroup",
+                    source,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn ensure_cgroup_job_open(shared: &Arc<CgroupJobStateShared>) -> Result<(), SandboxError> {
+        let state = shared.state.lock().map_err(|_| SandboxError::Io {
+            operation: "lock job cgroup lifecycle",
+            source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+        })?;
+        if state.closing || state.removed {
+            return Err(SandboxError::InvalidPolicy(
+                "job cgroup was cancelled before tool release".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_cgroup_job(
+        delegated_root: &Path,
+        job_id: &str,
+        _limits: SandboxLimits,
+        controls: CgroupLimitControls,
+    ) -> Result<(CgroupV2JobInner, String), SandboxError> {
+        let blocked = |reason: String| {
+            SandboxError::CgroupPrerequisitesFailed(Box::new(CgroupEvidence::blocked(format!(
+                "BLOCKED: {reason}"
+            ))))
+        };
+        let root_fd = open_cgroup_directory(delegated_root)
+            .map_err(|error| blocked(format!("cannot open delegated cgroup v2 root: {error}")))?;
+        verify_cgroup2_fs(root_fd.as_raw_fd())
+            .map_err(|error| blocked(format!("delegated root is not cgroup v2: {error}")))?;
+
+        let current_path = process_cgroup_path()
+            .map_err(|error| blocked(format!("cannot read current process cgroup: {error}")))?;
+        verify_delegated_root_is_current_cgroup(root_fd.as_raw_fd(), delegated_root, &current_path)
+            .map_err(|error| {
+                blocked(format!("delegated root is not the service cgroup: {error}"))
+            })?;
+
+        let available = read_cgroup_file(root_fd.as_raw_fd(), "cgroup.controllers")
+            .map_err(|error| blocked(format!("cannot read cgroup.controllers: {error}")))?;
+        let enabled = read_cgroup_file(root_fd.as_raw_fd(), "cgroup.subtree_control")
+            .map_err(|error| blocked(format!("cannot read cgroup.subtree_control: {error}")))?;
+        for controller in ["cpu", "memory", "pids"] {
+            if !available
+                .split_ascii_whitespace()
+                .any(|item| item == controller)
+                || !enabled
+                    .split_ascii_whitespace()
+                    .any(|item| item == controller)
+            {
+                return Err(blocked(format!(
+                    "delegated cgroup root must expose and enable the {controller} controller"
+                )));
+            }
+        }
+
+        let job_name = CString::new(job_id)
+            .map_err(|_| SandboxError::InvalidPolicy("job id contains NUL".into()))?;
+        if unsafe { libc::mkdirat(root_fd.as_raw_fd(), job_name.as_ptr(), 0o755) } != 0 {
+            return Err(blocked(format!(
+                "cannot create exclusive per-job cgroup {job_id}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let job_raw = unsafe {
+            libc::openat(
+                root_fd.as_raw_fd(),
+                job_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if job_raw < 0 {
+            let source = io::Error::last_os_error();
+            remove_empty_cgroup(root_fd.as_raw_fd(), &job_name);
+            return Err(blocked(format!(
+                "cannot pin per-job cgroup {job_id}: {source}"
+            )));
+        }
+        let job_fd = unsafe { OwnedFd::from_raw_fd(job_raw) };
+
+        let configured = (|| -> Result<(CgroupPlacementKind, String), String> {
+            verify_cgroup2_fs(job_fd.as_raw_fd()).map_err(|error| error.to_string())?;
+            write_cgroup_file(job_fd.as_raw_fd(), "pids.max", controls.pids_max.as_bytes())
+                .map_err(|error| format!("cannot set pids.max: {error}"))?;
+            write_cgroup_file(
+                job_fd.as_raw_fd(),
+                "memory.max",
+                controls.memory_max.as_bytes(),
+            )
+            .map_err(|error| format!("cannot set memory.max: {error}"))?;
+            write_cgroup_file(
+                job_fd.as_raw_fd(),
+                "memory.swap.max",
+                controls.memory_swap_max.as_bytes(),
+            )
+            .map_err(|error| format!("cannot set memory.swap.max: {error}"))?;
+            write_cgroup_file(job_fd.as_raw_fd(), "cpu.max", controls.cpu_max.as_bytes())
+                .map_err(|error| format!("cannot set cpu.max: {error}"))?;
+            verify_cgroup_control(job_fd.as_raw_fd(), "pids.max", controls.pids_max.trim())?;
+            verify_cgroup_control(job_fd.as_raw_fd(), "memory.max", controls.memory_max.trim())?;
+            verify_cgroup_control(job_fd.as_raw_fd(), "memory.swap.max", "0")?;
+            verify_cgroup_control(job_fd.as_raw_fd(), "cpu.max", controls.cpu_max.trim())?;
+
+            drop(
+                open_cgroup_control(job_fd.as_raw_fd(), "cgroup.kill", true)
+                    .map_err(|error| format!("cgroup.kill is unavailable: {error}"))?,
+            );
+            let events = read_cgroup_file(job_fd.as_raw_fd(), "cgroup.events")
+                .map_err(|error| format!("cgroup.events is unavailable: {error}"))?;
+            parse_cgroup_populated(&events).map_err(str::to_owned)?;
+            drop(
+                open_cgroup_control(job_fd.as_raw_fd(), "cgroup.procs", true)
+                    .map_err(|error| format!("cgroup.procs is not writable: {error}"))?,
+            );
+            let expected_cgroup_path = format!("{}/{}", current_path.trim_end_matches('/'), job_id);
+            if expected_cgroup_path.starts_with("//") {
+                return Err("current cgroup path is malformed".into());
+            }
+            let clone3_supported =
+                probe_clone3_into_cgroup(job_fd.as_raw_fd(), &expected_cgroup_path)
+                    .map_err(|error| format!("CLONE_INTO_CGROUP probe failed: {error}"))?;
+            let placement = if clone3_supported {
+                CgroupPlacementKind::CloneIntoCgroup
+            } else {
+                CgroupPlacementKind::ParentAttachBarrier
+            };
+            Ok((placement, expected_cgroup_path))
+        })();
+
+        let (placement, expected_cgroup_path) = match configured {
+            Ok(configured) => configured,
+            Err(reason) => {
+                let _ = write_cgroup_file(job_fd.as_raw_fd(), "cgroup.kill", b"1\n");
+                remove_empty_cgroup(root_fd.as_raw_fd(), &job_name);
+                return Err(blocked(reason));
+            }
+        };
+        let path = delegated_root.join(job_id);
+        let detail = match placement {
+            CgroupPlacementKind::CloneIntoCgroup => format!(
+                "delegated cgroup {job_id} is configured with pids.max, memory.max, memory.swap.max=0, cpu.max, cgroup.kill, and atomic clone3 placement"
+            ),
+            CgroupPlacementKind::ParentAttachBarrier => format!(
+                "delegated cgroup {job_id} is configured with pids.max, memory.max, memory.swap.max=0, cpu.max, and cgroup.kill; blocked parent-attach placement will verify exact membership"
+            ),
+        };
+        Ok((
+            CgroupV2JobInner {
+                root_fd,
+                job_fd,
+                job_name,
+                path,
+                expected_cgroup_path,
+                placement,
+                state: Arc::new(CgroupJobStateShared {
+                    state: Mutex::new(CgroupJobState {
+                        closing: false,
+                        removed: false,
+                        active_spawns: 0,
+                        reapers: Vec::new(),
+                    }),
+                    changed: std::sync::Condvar::new(),
+                }),
+                cleanup: Mutex::new(()),
+            },
+            detail,
+        ))
+    }
+
+    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+
+    fn open_cgroup_directory(path: &Path) -> io::Result<OwnedFd> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "delegated cgroup root must be absolute",
+            ));
+        }
+        let root = unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if root < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut current = unsafe { OwnedFd::from_raw_fd(root) };
+        for component in path.components() {
+            let std::path::Component::Normal(name) = component else {
+                if matches!(component, std::path::Component::RootDir) {
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "delegated cgroup root contains a dot or prefix component",
+                ));
+            };
+            let name = CString::new(name.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contains NUL")
+            })?;
+            let next = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if next < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            current = unsafe { OwnedFd::from_raw_fd(next) };
+        }
+        Ok(current)
+    }
+
+    fn verify_cgroup2_fs(fd: RawFd) -> io::Result<()> {
+        let mut stat: libc::statfs = unsafe { zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if stat.f_type as libc::c_long != CGROUP2_SUPER_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory is not on a cgroup2 filesystem",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_cgroup_control(dir_fd: RawFd, name: &str, write: bool) -> io::Result<File> {
+        let name = CString::new(name).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid cgroup control name")
+        })?;
+        let flags = if write {
+            libc::O_WRONLY
+        } else {
+            libc::O_RDONLY
+        };
+        let raw = unsafe {
+            libc::openat(
+                dir_fd,
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(raw) })
+    }
+
+    fn read_cgroup_file(dir_fd: RawFd, name: &str) -> io::Result<String> {
+        let mut file = open_cgroup_control(dir_fd, name, false)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    fn write_cgroup_file(dir_fd: RawFd, name: &str, value: &[u8]) -> io::Result<()> {
+        let mut file = open_cgroup_control(dir_fd, name, true)?;
+        file.write_all(value)
+    }
+
+    fn verify_cgroup_control(dir_fd: RawFd, name: &str, expected: &str) -> Result<(), String> {
+        let actual = read_cgroup_file(dir_fd, name)
+            .map_err(|error| format!("cannot read back {name}: {error}"))?;
+        if actual.trim() != expected {
+            return Err(format!(
+                "{name} read back {:?}, expected {:?}",
+                actual.trim(),
+                expected
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_empty_cgroup(root_fd: RawFd, name: &CString) {
+        unsafe {
+            libc::unlinkat(root_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+        }
+    }
+
+    fn process_cgroup_path() -> io::Result<String> {
+        let contents = fs::read_to_string("/proc/self/cgroup")?;
+        let mut unified = None;
+        for line in contents.lines() {
+            if let Some(path) = line.strip_prefix("0::") {
+                if unified.replace(path.to_owned()).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "/proc/self/cgroup contains duplicate unified records",
+                    ));
+                }
+            }
+        }
+        unified.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "/proc/self/cgroup has no unified cgroup v2 record",
+            )
+        })
+    }
+
+    fn decode_mountinfo_path(value: &str) -> String {
+        value
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    }
+
+    fn cgroup2_mountpoint() -> io::Result<PathBuf> {
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        for line in mountinfo.lines() {
+            let Some((before, after)) = line.split_once(" - ") else {
+                continue;
+            };
+            let left = before.split_ascii_whitespace().collect::<Vec<_>>();
+            let right = after.split_ascii_whitespace().collect::<Vec<_>>();
+            if right.first() == Some(&"cgroup2") && left.len() >= 5 {
+                return Ok(PathBuf::from(decode_mountinfo_path(left[4])));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no cgroup2 mount is visible",
+        ))
+    }
+
+    fn verify_delegated_root_is_current_cgroup(
+        root_fd: RawFd,
+        _delegated_root: &Path,
+        current_path: &str,
+    ) -> io::Result<()> {
+        if !current_path.starts_with('/') || current_path.ends_with('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current cgroup path is malformed",
+            ));
+        }
+        let mountpoint = cgroup2_mountpoint()?;
+        let current_dir = mountpoint.join(current_path.trim_start_matches('/'));
+        let expected = fs::canonicalize(current_dir)?;
+        let actual = fs::canonicalize(format!("/proc/self/fd/{root_fd}"))?;
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the caller's own delegated cgroup can be used as the root",
+            ));
+        }
+        Ok(())
+    }
+
+    fn probe_clone3_into_cgroup(fd: RawFd, expected_path: &str) -> io::Result<bool> {
+        let pipe = create_pipe_above_stdio()?;
+        let args = CloneArgs {
+            flags: CLONE_INTO_CGROUP,
+            pidfd: 0,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: libc::SIGCHLD as u64,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: fd as u64,
+        };
+        let child = unsafe { libc::syscall(libc::SYS_clone3, &args, size_of::<CloneArgs>()) }
+            as libc::pid_t;
+        if child < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS)
+                    | Some(libc::EINVAL)
+                    | Some(libc::EPERM)
+                    | Some(libc::EACCES)
+                    | Some(libc::EOPNOTSUPP)
+            ) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        if child == 0 {
+            unsafe {
+                libc::close(pipe[1]);
+                let mut release = 0_u8;
+                let read = read_one(pipe[0], &mut release);
+                libc::close(pipe[0]);
+                libc::_exit(if read == 1 && release == 1 { 0 } else { 125 });
+            }
+        }
+        unsafe { libc::close(pipe[0]) };
+        let membership = fs::read_to_string(format!("/proc/{child}/cgroup"));
+        if !membership
+            .as_deref()
+            .is_ok_and(|contents| super::proc_cgroup_matches(contents, expected_path))
+        {
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+                libc::close(pipe[1]);
+            }
+            let _ = wait_for_child(child);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CLONE_INTO_CGROUP child did not enter exact cgroup {expected_path}"),
+            ));
+        }
+        let mut release = unsafe { File::from_raw_fd(pipe[1]) };
+        if let Err(error) = release.write_all(&[1]) {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let _ = wait_for_child(child);
+            return Err(error);
+        }
+        let status = wait_for_child(child)?;
+        if !status.success() {
+            return Err(io::Error::other("CLONE_INTO_CGROUP probe child failed"));
+        }
+        Ok(true)
+    }
+
+    fn create_parent_attach_placement(
+        cgroup_procs: File,
+        cgroup_kill: File,
+        expected_cgroup_path: String,
+    ) -> Result<CgroupPlacementMode, SandboxError> {
+        let ready_pipe = create_pipe_above_stdio().map_err(|source| SandboxError::Io {
+            operation: "create cgroup parent-attach ready pipe",
+            source,
+        })?;
+        let release_pipe = match create_pipe_above_stdio() {
+            Ok(pipe) => pipe,
+            Err(source) => {
+                unsafe {
+                    libc::close(ready_pipe[0]);
+                    libc::close(ready_pipe[1]);
+                }
+                return Err(SandboxError::Io {
+                    operation: "create cgroup parent-attach release pipe",
+                    source,
+                });
+            }
+        };
+        Ok(CgroupPlacementMode::ParentAttachBarrier {
+            parent_ready: unsafe { File::from_raw_fd(ready_pipe[0]) },
+            child_ready: unsafe { File::from_raw_fd(ready_pipe[1]) },
+            child_release: unsafe { File::from_raw_fd(release_pipe[0]) },
+            parent_release: unsafe { File::from_raw_fd(release_pipe[1]) },
+            cgroup_procs,
+            cgroup_kill,
+            expected_cgroup_path,
+        })
     }
 
     struct PreparedSpawn<'a> {
@@ -1857,7 +3044,7 @@ mod linux {
                 Err(_) => failed_with_errno(STAGE_NETWORK_UNIX_SOCKET, libc::EINVAL),
             };
         }
-        if install_seccomp(&build_sandbox_filter()) != 0 {
+        if install_seccomp(&build_sandbox_filter(false)) != 0 {
             return failed(STAGE_SECCOMP);
         }
 
@@ -2204,8 +3391,15 @@ mod linux {
         program: &Path,
         args: &[std::ffi::OsString],
         policy: &SandboxPolicy,
-        placement: SpawnPlacement,
+        mut placement: SpawnPlacement,
     ) -> Result<SandboxChild, SandboxError> {
+        ensure_spawn_allowed(&placement)?;
+        let reaper = match &placement {
+            SpawnPlacement::CgroupV2(managed) => Arc::clone(&managed.inner.reaper),
+            SpawnPlacement::CloneIntoCgroup(_) | SpawnPlacement::ParentAttachBarrier { .. } => {
+                ChildReaper::new()
+            }
+        };
         validate_limits(policy.limits)?;
         let input = open_pinned_path(&policy.input, false, "input")?;
         let task = open_pinned_path(&policy.job_dir, true, "task directory")?;
@@ -2371,7 +3565,8 @@ mod linux {
                 });
             }
         };
-        let seccomp = build_sandbox_filter();
+        let allow_session_escape = matches!(&placement, SpawnPlacement::CgroupV2(_));
+        let seccomp = build_sandbox_filter(allow_session_escape);
         let policy_fds = build_policy_fd_list(
             input.fd.as_raw_fd(),
             task.fd.as_raw_fd(),
@@ -2438,7 +3633,6 @@ mod linux {
             libc::close(ack_pipe[0]);
             libc::close(null_fd);
         }
-        drop(placement);
         let mut report = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
         let parent_ack = unsafe { std::fs::File::from_raw_fd(ack_pipe[1]) };
         let mut message = Message {
@@ -2450,7 +3644,7 @@ mod linux {
             network_namespace_inode: 0,
         };
         if let Err(source) = read_struct(&mut report, &mut message) {
-            let _ = kill_process_group(pid);
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::Io {
                 operation: "read sandbox setup report",
@@ -2458,6 +3652,7 @@ mod linux {
             });
         }
         if message.kind == MSG_ERROR {
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::ChildSetup {
                 operation: operation_name(message.operation),
@@ -2465,7 +3660,7 @@ mod linux {
             });
         }
         if message.kind != MSG_NAMESPACE_ATTESTATION || message.pid != pid {
-            let _ = kill_process_group(pid);
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::Io {
                 operation: "validate network namespace attestation",
@@ -2487,7 +3682,7 @@ mod linux {
             } else {
                 libc::EPROTO
             };
-            let _ = kill_process_group(pid);
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::ChildSetup {
                 operation: "network namespace identity attestation",
@@ -2495,8 +3690,14 @@ mod linux {
             });
         }
 
+        if let Err(error) = ensure_spawn_allowed(&placement) {
+            let _ = kill_spawn_members(&mut placement, pid);
+            let _ = wait_for_child(pid);
+            return Err(error);
+        }
+
         if let Err(source) = write_parent_ack(parent_ack.as_raw_fd()) {
-            let _ = kill_process_group(pid);
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::Io {
                 operation: "acknowledge network namespace attestation",
@@ -2514,7 +3715,7 @@ mod linux {
             network_namespace_inode: 0,
         };
         if let Err(source) = read_struct(&mut report, &mut readiness) {
-            let _ = kill_process_group(pid);
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::Io {
                 operation: "read post-attestation sandbox readiness",
@@ -2522,6 +3723,7 @@ mod linux {
             });
         }
         if readiness.kind == MSG_ERROR {
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::ChildSetup {
                 operation: operation_name(readiness.operation),
@@ -2538,7 +3740,7 @@ mod linux {
             || readiness.pid != pid
             || ready_network_namespace != reported_network_namespace
         {
-            let _ = kill_process_group(pid);
+            let _ = kill_spawn_members(&mut placement, pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::Io {
                 operation: "validate post-attestation sandbox readiness",
@@ -2548,11 +3750,52 @@ mod linux {
                 ),
             });
         }
+        if let Err(error) = ensure_spawn_allowed(&placement) {
+            let _ = kill_spawn_members(&mut placement, pid);
+            let _ = wait_for_child(pid);
+            return Err(error);
+        }
+        if let SpawnPlacement::CgroupV2(managed) = &mut placement {
+            if let Err(error) = managed.inner.attach_and_release(pid) {
+                let _ = kill_process_group(pid);
+                let _ = wait_for_child(pid);
+                return Err(error);
+            }
+        }
+        if let Err(source) = reaper.register(pid) {
+            let _ = kill_spawn_members(&mut placement, pid);
+            let _ = wait_for_child(pid);
+            return Err(SandboxError::Io {
+                operation: "register sandbox supervisor with reaper",
+                source,
+            });
+        }
         Ok(SandboxChild {
             pid,
             root: Some(temp_root),
-            status: None,
+            reaper,
         })
+    }
+
+    fn ensure_spawn_allowed(placement: &SpawnPlacement) -> Result<(), SandboxError> {
+        match placement {
+            SpawnPlacement::CgroupV2(managed) => managed.inner.ensure_open(),
+            SpawnPlacement::CloneIntoCgroup(_) | SpawnPlacement::ParentAttachBarrier { .. } => {
+                Ok(())
+            }
+        }
+    }
+
+    fn kill_spawn_members(
+        placement: &mut SpawnPlacement,
+        supervisor_pid: libc::pid_t,
+    ) -> io::Result<()> {
+        match placement {
+            SpawnPlacement::CgroupV2(managed) => managed.inner.kill_members(supervisor_pid),
+            SpawnPlacement::CloneIntoCgroup(_) | SpawnPlacement::ParentAttachBarrier { .. } => {
+                kill_process_group(supervisor_pid)
+            }
+        }
     }
 
     fn placement_fds(
@@ -2585,6 +3828,38 @@ mod linux {
                     vec![ready, release],
                 ))
             }
+            SpawnPlacement::CgroupV2(managed) => match &managed.inner.kind {
+                CgroupPlacementMode::CloneIntoCgroup(cgroup) => {
+                    let owner = duplicate_fd(cgroup.as_raw_fd())?;
+                    let raw = owner.as_raw_fd();
+                    Ok((
+                        PlacementFds {
+                            cgroup: Some(raw),
+                            ready: None,
+                            release: None,
+                        },
+                        vec![owner],
+                    ))
+                }
+                CgroupPlacementMode::ParentAttachBarrier {
+                    child_ready,
+                    child_release,
+                    ..
+                } => {
+                    let ready = duplicate_fd(child_ready.as_raw_fd())?;
+                    let release = duplicate_fd(child_release.as_raw_fd())?;
+                    let ready_fd = ready.as_raw_fd();
+                    let release_fd = release.as_raw_fd();
+                    Ok((
+                        PlacementFds {
+                            cgroup: None,
+                            ready: Some(ready_fd),
+                            release: Some(release_fd),
+                        },
+                        vec![ready, release],
+                    ))
+                }
+            },
         }
     }
 
@@ -3714,8 +4989,8 @@ mod linux {
         0
     }
 
-    fn build_sandbox_filter() -> Vec<libc::sock_filter> {
-        let setup_denied = [
+    fn build_sandbox_filter(allow_session_escape: bool) -> Vec<libc::sock_filter> {
+        let mut setup_denied = vec![
             libc::SYS_mount as u32,
             libc::SYS_umount2 as u32,
             libc::SYS_pivot_root as u32,
@@ -3730,9 +5005,11 @@ mod linux {
             libc::SYS_mount_setattr as u32,
             libc::SYS_chroot as u32,
             libc::SYS_setpgid as u32,
-            libc::SYS_setsid as u32,
             libc::SYS_io_uring_setup as u32,
         ];
+        if !allow_session_escape {
+            setup_denied.push(libc::SYS_setsid as u32);
+        }
         let network_policy = NetworkPolicy::default();
         let socket_filter_len = 1
             + 2 * network_policy.denied_socket_domains.len()
@@ -5106,5 +6383,88 @@ mod review_regression_tests {
             NetworkPrerequisites::inspect(),
             Err(SandboxError::UnsupportedPlatform)
         ));
+    }
+
+    #[test]
+    fn cgroup_job_id_is_exactly_one_safe_ascii_component() {
+        assert!(validate_cgroup_job_id("job-42").is_ok());
+        assert!(validate_cgroup_job_id("job_42.x").is_ok());
+
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../job",
+            "job/child",
+            "job\\child",
+            "/job",
+            "job name",
+            "é",
+        ] {
+            assert!(
+                validate_cgroup_job_id(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_limit_controls_encode_pids_memory_swap_and_cpu() {
+        let limits = SandboxLimits {
+            pids_max: 7,
+            memory_max_bytes: 12_345,
+            memory_swap_max_bytes: 0,
+            cpu_quota_micros: 25_000,
+            cpu_period_micros: 100_000,
+            file_size_max_bytes: 1024,
+            open_files_max: 16,
+            tmpfs_max_bytes: 1024,
+        };
+
+        assert_eq!(
+            cgroup_limit_controls(limits).expect("valid aggregate limits"),
+            CgroupLimitControls {
+                pids_max: "7\n".into(),
+                memory_max: "12345\n".into(),
+                memory_swap_max: "0\n".into(),
+                cpu_max: "25000 100000\n".into(),
+            }
+        );
+
+        assert!(
+            cgroup_limit_controls(SandboxLimits {
+                memory_swap_max_bytes: 1,
+                ..limits
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cgroup_population_and_proc_membership_require_exact_records() {
+        assert_eq!(parse_cgroup_populated("populated 0\nfrozen 0\n"), Ok(false));
+        assert_eq!(parse_cgroup_populated("populated 1\nfrozen 0\n"), Ok(true));
+        assert!(parse_cgroup_populated("frozen 0\n").is_err());
+
+        assert!(proc_cgroup_matches(
+            "12:cpu:/user.slice\n0::/delegated/job-42\n",
+            "/delegated/job-42"
+        ));
+        assert!(!proc_cgroup_matches(
+            "0::/delegated/job-42-extra\n",
+            "/delegated/job-42"
+        ));
+        assert!(!proc_cgroup_matches(
+            "0::/delegated/job-42\n0::/other\n",
+            "/delegated/job-42"
+        ));
+    }
+
+    #[test]
+    fn blocked_cgroup_evidence_is_not_reported_as_ready() {
+        let evidence = CgroupEvidence::blocked("BLOCKED: no native Linux cgroup v2 delegation");
+        assert_eq!(evidence.status, CgroupEvidenceStatus::Blocked);
+        assert!(!evidence.all_passed());
+        assert!(evidence.detail.contains("BLOCKED"));
     }
 }

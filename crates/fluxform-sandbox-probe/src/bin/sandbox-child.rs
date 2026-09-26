@@ -342,8 +342,192 @@ fn main() {
                 _ => 70,
             }
         }
+        "resource-pids" => resource_pids(),
+        "resource-memory" => match arguments
+            .next()
+            .and_then(|raw| raw.to_string_lossy().parse::<usize>().ok())
+        {
+            Some(mebibytes) => resource_memory(mebibytes),
+            None => 120,
+        },
+        "resource-cpu" => match arguments
+            .next()
+            .and_then(|raw| raw.to_string_lossy().parse::<u64>().ok())
+        {
+            Some(milliseconds) => resource_cpu(milliseconds),
+            None => 120,
+        },
+        "resource-tree" => resource_tree(),
+        "resource-fork-race" => resource_fork_race(),
         _ => 120,
     };
 
     std::process::exit(code);
+}
+
+#[cfg(target_os = "linux")]
+fn append_task_line(name: &str, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(name)?;
+    writeln!(file, "{line}")
+}
+
+#[cfg(target_os = "linux")]
+fn keepalive() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resource_pids() -> i32 {
+    let mut successful = 0_u64;
+    loop {
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            keepalive();
+        }
+        if child > 0 {
+            successful += 1;
+            continue;
+        }
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+            break;
+        }
+        return 121;
+    }
+    if append_task_line("pids-count.txt", &successful.to_string()).is_err() {
+        return 122;
+    }
+    keepalive();
+}
+
+#[cfg(target_os = "linux")]
+fn resource_memory(mebibytes: usize) -> i32 {
+    let bytes = match mebibytes.checked_mul(1024 * 1024) {
+        Some(bytes) if bytes > 0 => bytes,
+        _ => return 123,
+    };
+    for _ in 0..2 {
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let memory = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if memory == libc::MAP_FAILED {
+                unsafe { libc::_exit(124) };
+            }
+            for offset in (0..bytes).step_by(4096) {
+                unsafe { (memory.cast::<u8>().add(offset)).write_volatile(0xa5) };
+            }
+            keepalive();
+        }
+        if child < 0 {
+            return 125;
+        }
+    }
+    keepalive();
+}
+
+#[cfg(target_os = "linux")]
+fn resource_cpu(milliseconds: u64) -> i32 {
+    if append_task_line("cpu-ready.txt", "ready").is_err() {
+        return 135;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(milliseconds);
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let mut value = 0_u64;
+            while std::time::Instant::now() < deadline {
+                value = value.wrapping_add(1);
+                std::hint::black_box(value);
+            }
+            unsafe { libc::_exit(0) };
+        }
+        if child < 0 {
+            for worker in workers {
+                unsafe { libc::kill(worker, libc::SIGKILL) };
+            }
+            return 126;
+        }
+        workers.push(child);
+    }
+    for worker in workers {
+        let mut status = 0;
+        if unsafe { libc::waitpid(worker, &mut status, 0) } != worker
+            || !libc::WIFEXITED(status)
+            || libc::WEXITSTATUS(status) != 0
+        {
+            return 127;
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn resource_tree() -> i32 {
+    let session_child = unsafe { libc::fork() };
+    if session_child == 0 {
+        let session = unsafe { libc::setsid() };
+        if session < 0 {
+            unsafe { libc::_exit(129) };
+        }
+        let grandchild = unsafe { libc::fork() };
+        if grandchild == 0 {
+            if append_task_line("tree-pids.txt", &unsafe { libc::getpid() }.to_string()).is_err() {
+                unsafe { libc::_exit(130) };
+            }
+            keepalive();
+        }
+        if grandchild < 0
+            || append_task_line("tree-session.txt", &session.to_string()).is_err()
+            || append_task_line("tree-pids.txt", &unsafe { libc::getpid() }.to_string()).is_err()
+        {
+            unsafe { libc::_exit(131) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+    if session_child < 0 {
+        return 132;
+    }
+    if append_task_line("tree-pids.txt", &unsafe { libc::getpid() }.to_string()).is_err() {
+        return 133;
+    }
+    keepalive();
+}
+
+#[cfg(target_os = "linux")]
+fn resource_fork_race() -> i32 {
+    loop {
+        if append_task_line("race-pids.txt", &unsafe { libc::getpid() }.to_string()).is_err() {
+            return 133;
+        }
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            continue;
+        }
+        if child > 0 {
+            continue;
+        }
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        return 134;
+    }
 }
