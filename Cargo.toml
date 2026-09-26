@@ -5,6 +5,7 @@ members = [
     "crates/fluxform-capabilities",
     "crates/fluxform-atomic-output",
     "crates/fluxform-sandbox-probe",
+    "apps/server-probe",
 ]
 resolver = "3"
 
