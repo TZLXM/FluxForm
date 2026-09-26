@@ -153,7 +153,10 @@ pub struct NetworkEvidence {
     pub packet_socket_denial: ProbeEvidence,
     pub ipv4_listener_isolated: ProbeEvidence,
     pub ipv6_listener_isolated: ProbeEvidence,
+    /// Pre-seccomp Unix path-visibility probe; success requires connect(2) to
+    /// fail with ENOENT after pivot_root, so it is not confused with seccomp.
     pub unix_socket_escape: ProbeEvidence,
+    /// Post-seccomp connect(2) probe; success requires EACCES from the filter.
     pub connect_denial: ProbeEvidence,
     pub socketpair_denial: ProbeEvidence,
     pub bpf_denial: ProbeEvidence,
@@ -314,6 +317,33 @@ fn network_namespace_is_private(host: FileIdentity, reported: Option<FileIdentit
         && reported.is_some_and(|candidate| {
             candidate.device != 0 && candidate.inode != 0 && candidate != host
         })
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn after_parent_ack(
+    read_ack: impl FnOnce() -> io::Result<Option<u8>>,
+    after_ack: impl FnOnce(),
+) -> io::Result<()> {
+    match read_ack()? {
+        Some(1) => {
+            after_ack();
+            Ok(())
+        }
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "parent readiness acknowledgment was invalid",
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "parent readiness acknowledgment was missing",
+        )),
+    }
 }
 
 #[cfg(any(
@@ -759,6 +789,7 @@ mod linux {
 
     const MSG_READY: u32 = 1;
     const MSG_ERROR: u32 = 2;
+    const MSG_NAMESPACE_ATTESTATION: u32 = 3;
     const PROBE_OK: i32 = 0;
     const MAX_TOOL_INVENTORY_ENTRIES: usize = 256;
     const MAX_TOOL_INVENTORY_DEPTH: usize = 8;
@@ -800,12 +831,14 @@ mod linux {
     const STAGE_NETWORK_UNIX_SOCKET: i32 = 32;
     const STAGE_NETWORK_ESCAPE: i32 = 33;
     const STAGE_NETWORK_SYSCALL: i32 = 34;
+    const STAGE_PARENT_ACK: i32 = 35;
     const CLONE_INTO_CGROUP: u64 = 1 << 33;
     const SECCOMP_DATA_NR_OFFSET: u32 = 0;
     const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
     const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
     const CAP_VERSION_3: u32 = 0x2008_0522;
     const ACTIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+    const ACTIVE_PROBE_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -964,6 +997,7 @@ mod linux {
         placement: PlacementFds,
         _placement_owners: Vec<OwnedFd>,
         report_fd: RawFd,
+        parent_ack_fd: RawFd,
         null_fd: RawFd,
         _exec_strings: Vec<CString>,
         argv: Vec<usize>,
@@ -1208,7 +1242,7 @@ mod linux {
                     ProbeKind::NetworkUnixEscape,
                     host_uid,
                     host_gid,
-                    "host Unix socket path was not reachable outside the sandbox root",
+                    "pre-seccomp path-visibility probe reached ENOENT outside the sandbox root",
                 );
                 match listener.accept() {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => result,
@@ -1236,7 +1270,7 @@ mod linux {
                     ProbeKind::NetworkConnect,
                     host_uid,
                     host_gid,
-                    "AF_UNIX socket creation remained allowed while connect returned the seccomp denial",
+                    "post-seccomp AF_UNIX socket creation remained allowed while connect returned EACCES",
                 )
             },
         );
@@ -1579,7 +1613,10 @@ mod linux {
                     "active probe exit deadline expired",
                 ));
             }
-            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let timeout_ms = remaining
+                .min(ACTIVE_PROBE_REAP_POLL_INTERVAL)
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as i32;
             let waited = unsafe { libc::poll(std::ptr::null_mut(), 0, timeout_ms) };
             if waited < 0 {
                 let error = io::Error::last_os_error();
@@ -2310,33 +2347,30 @@ mod linux {
             raw_null_fd
         };
         let (placement_fds, placement_owners) = placement_fds(&placement)?;
-        let mut pipe = [0; 2];
-        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            unsafe { libc::close(null_fd) };
-            return Err(SandboxError::Io {
-                operation: "create child setup report pipe",
-                source: io::Error::last_os_error(),
-            });
-        }
-        for index in 0..pipe.len() {
-            if pipe[index] < 3 {
-                let duplicate = unsafe { libc::fcntl(pipe[index], libc::F_DUPFD_CLOEXEC, 3) };
-                if duplicate < 0 {
-                    let source = io::Error::last_os_error();
-                    unsafe {
-                        libc::close(pipe[0]);
-                        libc::close(pipe[1]);
-                        libc::close(null_fd);
-                    }
-                    return Err(SandboxError::Io {
-                        operation: "reserve setup report descriptors above stdio",
-                        source,
-                    });
-                }
-                unsafe { libc::close(pipe[index]) };
-                pipe[index] = duplicate;
+        let pipe = match create_pipe_above_stdio() {
+            Ok(pipe) => pipe,
+            Err(source) => {
+                unsafe { libc::close(null_fd) };
+                return Err(SandboxError::Io {
+                    operation: "create child setup report pipe",
+                    source,
+                });
             }
-        }
+        };
+        let ack_pipe = match create_pipe_above_stdio() {
+            Ok(pipe) => pipe,
+            Err(source) => {
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                    libc::close(null_fd);
+                }
+                return Err(SandboxError::Io {
+                    operation: "create parent-acknowledgment pipe",
+                    source,
+                });
+            }
+        };
         let seccomp = build_sandbox_filter();
         let policy_fds = build_policy_fd_list(
             input.fd.as_raw_fd(),
@@ -2347,6 +2381,7 @@ mod linux {
             &tool_inventory,
             &placement_fds,
             pipe[1],
+            ack_pipe[0],
         );
         let spec = PreparedSpawn {
             root,
@@ -2367,6 +2402,7 @@ mod linux {
             placement: placement_fds,
             _placement_owners: placement_owners,
             report_fd: pipe[1],
+            parent_ack_fd: ack_pipe[0],
             null_fd,
             _exec_strings: exec_strings,
             argv,
@@ -2380,6 +2416,8 @@ mod linux {
             unsafe {
                 libc::close(pipe[0]);
                 libc::close(pipe[1]);
+                libc::close(ack_pipe[0]);
+                libc::close(ack_pipe[1]);
                 libc::close(null_fd);
             }
             return Err(SandboxError::Io {
@@ -2390,16 +2428,19 @@ mod linux {
         if pid == 0 {
             unsafe {
                 libc::close(pipe[0]);
+                libc::close(ack_pipe[1]);
                 sandbox_supervisor(&spec);
             }
         }
 
         unsafe {
             libc::close(pipe[1]);
+            libc::close(ack_pipe[0]);
             libc::close(null_fd);
         }
         drop(placement);
         let mut report = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let parent_ack = unsafe { std::fs::File::from_raw_fd(ack_pipe[1]) };
         let mut message = Message {
             kind: MSG_ERROR,
             operation: STAGE_FORK,
@@ -2423,14 +2464,14 @@ mod linux {
                 errno: message.errno,
             });
         }
-        if message.kind != MSG_READY || message.pid != pid {
+        if message.kind != MSG_NAMESPACE_ATTESTATION || message.pid != pid {
             let _ = kill_process_group(pid);
             let _ = wait_for_child(pid);
             return Err(SandboxError::Io {
-                operation: "validate sandbox setup report",
+                operation: "validate network namespace attestation",
                 source: io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid child readiness message",
+                    "invalid child namespace-attestation message",
                 ),
             });
         }
@@ -2451,6 +2492,60 @@ mod linux {
             return Err(SandboxError::ChildSetup {
                 operation: "network namespace identity attestation",
                 errno: error,
+            });
+        }
+
+        if let Err(source) = write_parent_ack(parent_ack.as_raw_fd()) {
+            let _ = kill_process_group(pid);
+            let _ = wait_for_child(pid);
+            return Err(SandboxError::Io {
+                operation: "acknowledge network namespace attestation",
+                source,
+            });
+        }
+        drop(parent_ack);
+
+        let mut readiness = Message {
+            kind: MSG_ERROR,
+            operation: STAGE_FORK,
+            errno: libc::ECHILD,
+            pid,
+            network_namespace_device: 0,
+            network_namespace_inode: 0,
+        };
+        if let Err(source) = read_struct(&mut report, &mut readiness) {
+            let _ = kill_process_group(pid);
+            let _ = wait_for_child(pid);
+            return Err(SandboxError::Io {
+                operation: "read post-attestation sandbox readiness",
+                source,
+            });
+        }
+        if readiness.kind == MSG_ERROR {
+            let _ = wait_for_child(pid);
+            return Err(SandboxError::ChildSetup {
+                operation: operation_name(readiness.operation),
+                errno: readiness.errno,
+            });
+        }
+        let ready_network_namespace = (readiness.network_namespace_device != 0
+            && readiness.network_namespace_inode != 0)
+            .then_some(FileIdentity {
+                device: readiness.network_namespace_device,
+                inode: readiness.network_namespace_inode,
+            });
+        if readiness.kind != MSG_READY
+            || readiness.pid != pid
+            || ready_network_namespace != reported_network_namespace
+        {
+            let _ = kill_process_group(pid);
+            let _ = wait_for_child(pid);
+            return Err(SandboxError::Io {
+                operation: "validate post-attestation sandbox readiness",
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid readiness message or namespace identity changed after acknowledgment",
+                ),
             });
         }
         Ok(SandboxChild {
@@ -3012,8 +3107,9 @@ mod linux {
         inventory: &PinnedToolInventory,
         placement: &PlacementFds,
         report_fd: RawFd,
+        parent_ack_fd: RawFd,
     ) -> Vec<RawFd> {
-        let mut fds = Vec::with_capacity(inventory.directories.len() + 10);
+        let mut fds = Vec::with_capacity(inventory.directories.len() + 11);
         fds.extend([
             input_fd,
             task_fd,
@@ -3021,6 +3117,7 @@ mod linux {
             tool_fd,
             program_fd,
             report_fd,
+            parent_ack_fd,
         ]);
         fds.extend(
             inventory
@@ -3309,136 +3406,169 @@ mod linux {
             fail_and_exit(spec.report_fd, STAGE_BIND_TASK, errno());
         }
 
-        match (spec.placement.ready, spec.placement.release) {
-            (Some(ready), Some(release)) => {
-                if close_range_except(&spec.policy_fds) != 0 {
-                    fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
-                }
-                let pid = libc::getpid();
-                if let Err(error) = write_all(ready, &pid.to_ne_bytes()) {
-                    fail_and_exit(
-                        spec.report_fd,
-                        STAGE_READY_WRITE,
-                        error.raw_os_error().unwrap_or(libc::EIO),
-                    );
-                }
-                if send_message(
-                    spec.report_fd,
-                    Message {
-                        kind: MSG_READY,
-                        operation: PROBE_OK,
-                        errno: 0,
-                        pid,
-                        network_namespace_device: network_namespace.device,
-                        network_namespace_inode: network_namespace.inode,
-                    },
-                )
-                .is_err()
-                {
-                    libc::close(ready);
-                    libc::close(release);
-                    libc::close(spec.report_fd);
-                    libc::_exit(125);
-                }
-                let mut release_byte = 0_u8;
-                if read_one(release, &mut release_byte) != 1 || release_byte != 1 {
-                    fail_and_exit(spec.report_fd, STAGE_RELEASE_READ, errno());
-                }
-                libc::close(ready);
-                libc::close(release);
-                libc::close(spec.report_fd);
-                if revalidate_policy_before_release(spec) != 0 {
-                    libc::_exit(125);
-                }
-                if close_range_except(&[spec.program_fd]) != 0 {
-                    libc::_exit(125);
-                }
-                let child = libc::fork();
-                if child < 0 {
-                    libc::_exit(127);
-                }
-                if child == 0 {
-                    if install_seccomp(&spec.seccomp) != 0 {
-                        libc::_exit(127);
-                    }
-                    exec_pinned(
-                        spec.program_fd,
-                        spec.argv.as_ptr().cast(),
-                        spec.envp.as_ptr().cast(),
-                    );
-                    libc::_exit(127);
-                }
-                wait_target_or_exit(child);
-            }
-            (None, None) => {
-                let Some(cgroup_fd) = spec.placement.cgroup else {
-                    fail_and_exit(spec.report_fd, STAGE_CLONE3, libc::EINVAL);
-                };
-                if close_range_except(&spec.policy_fds) != 0 {
-                    fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
-                }
-                let flags = libc::fcntl(cgroup_fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(cgroup_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
-                {
-                    fail_and_exit(spec.report_fd, STAGE_CLONE3, errno());
-                }
-                let args = CloneArgs {
-                    flags: CLONE_INTO_CGROUP,
-                    pidfd: 0,
-                    child_tid: 0,
-                    parent_tid: 0,
-                    exit_signal: libc::SIGCHLD as u64,
-                    stack: 0,
-                    stack_size: 0,
-                    tls: 0,
-                    set_tid: 0,
-                    set_tid_size: 0,
-                    cgroup: cgroup_fd as u64,
-                };
-                let child =
-                    libc::syscall(libc::SYS_clone3, &args, size_of::<CloneArgs>()) as libc::pid_t;
-                if child < 0 {
-                    fail_and_exit(spec.report_fd, STAGE_CLONE3, errno());
-                }
-                if child == 0 {
-                    if revalidate_policy_before_release(spec) != 0
-                        || close_range_except(&[spec.program_fd]) != 0
-                    {
-                        libc::_exit(125);
-                    }
-                    if install_seccomp(&spec.seccomp) != 0 {
-                        libc::_exit(127);
-                    }
-                    exec_pinned(
-                        spec.program_fd,
-                        spec.argv.as_ptr().cast(),
-                        spec.envp.as_ptr().cast(),
-                    );
-                    libc::_exit(127);
-                }
-                if send_message(
-                    spec.report_fd,
-                    Message {
-                        kind: MSG_READY,
-                        operation: PROBE_OK,
-                        errno: 0,
-                        pid: libc::getpid(),
-                        network_namespace_device: network_namespace.device,
-                        network_namespace_inode: network_namespace.inode,
-                    },
-                )
-                .is_err()
-                {
-                    libc::close(cgroup_fd);
-                    libc::close(spec.report_fd);
-                    libc::_exit(125);
-                }
-                libc::close(cgroup_fd);
-                libc::close(spec.report_fd);
-                wait_target_or_exit(child);
-            }
-            _ => fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, libc::EINVAL),
+        if send_message(
+            spec.report_fd,
+            Message {
+                kind: MSG_NAMESPACE_ATTESTATION,
+                operation: PROBE_OK,
+                errno: 0,
+                pid: libc::getpid(),
+                network_namespace_device: network_namespace.device,
+                network_namespace_inode: network_namespace.inode,
+            },
+        )
+        .is_err()
+        {
+            libc::close(spec.parent_ack_fd);
+            libc::close(spec.report_fd);
+            libc::_exit(125);
         }
+
+        let acknowledgment = super::after_parent_ack(
+            || read_parent_ack(spec.parent_ack_fd),
+            || {
+                libc::close(spec.parent_ack_fd);
+                match (spec.placement.ready, spec.placement.release) {
+                    (Some(ready), Some(release)) => {
+                        if close_range_except(&spec.policy_fds) != 0 {
+                            fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
+                        }
+                        let pid = libc::getpid();
+                        if let Err(error) = write_all(ready, &pid.to_ne_bytes()) {
+                            fail_and_exit(
+                                spec.report_fd,
+                                STAGE_READY_WRITE,
+                                error.raw_os_error().unwrap_or(libc::EIO),
+                            );
+                        }
+                        if send_message(
+                            spec.report_fd,
+                            Message {
+                                kind: MSG_READY,
+                                operation: PROBE_OK,
+                                errno: 0,
+                                pid,
+                                network_namespace_device: network_namespace.device,
+                                network_namespace_inode: network_namespace.inode,
+                            },
+                        )
+                        .is_err()
+                        {
+                            libc::close(ready);
+                            libc::close(release);
+                            libc::close(spec.report_fd);
+                            libc::_exit(125);
+                        }
+                        let mut release_byte = 0_u8;
+                        if read_one(release, &mut release_byte) != 1 || release_byte != 1 {
+                            fail_and_exit(spec.report_fd, STAGE_RELEASE_READ, errno());
+                        }
+                        libc::close(ready);
+                        libc::close(release);
+                        libc::close(spec.report_fd);
+                        if revalidate_policy_before_release(spec) != 0 {
+                            libc::_exit(125);
+                        }
+                        if close_range_except(&[spec.program_fd]) != 0 {
+                            libc::_exit(125);
+                        }
+                        let child = libc::fork();
+                        if child < 0 {
+                            libc::_exit(127);
+                        }
+                        if child == 0 {
+                            if install_seccomp(&spec.seccomp) != 0 {
+                                libc::_exit(127);
+                            }
+                            exec_pinned(
+                                spec.program_fd,
+                                spec.argv.as_ptr().cast(),
+                                spec.envp.as_ptr().cast(),
+                            );
+                            libc::_exit(127);
+                        }
+                        wait_target_or_exit(child);
+                    }
+                    (None, None) => {
+                        let Some(cgroup_fd) = spec.placement.cgroup else {
+                            fail_and_exit(spec.report_fd, STAGE_CLONE3, libc::EINVAL);
+                        };
+                        if close_range_except(&spec.policy_fds) != 0 {
+                            fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
+                        }
+                        let flags = libc::fcntl(cgroup_fd, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(cgroup_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
+                        {
+                            fail_and_exit(spec.report_fd, STAGE_CLONE3, errno());
+                        }
+                        let args = CloneArgs {
+                            flags: CLONE_INTO_CGROUP,
+                            pidfd: 0,
+                            child_tid: 0,
+                            parent_tid: 0,
+                            exit_signal: libc::SIGCHLD as u64,
+                            stack: 0,
+                            stack_size: 0,
+                            tls: 0,
+                            set_tid: 0,
+                            set_tid_size: 0,
+                            cgroup: cgroup_fd as u64,
+                        };
+                        let child = libc::syscall(libc::SYS_clone3, &args, size_of::<CloneArgs>())
+                            as libc::pid_t;
+                        if child < 0 {
+                            fail_and_exit(spec.report_fd, STAGE_CLONE3, errno());
+                        }
+                        if child == 0 {
+                            if revalidate_policy_before_release(spec) != 0
+                                || close_range_except(&[spec.program_fd]) != 0
+                            {
+                                libc::_exit(125);
+                            }
+                            if install_seccomp(&spec.seccomp) != 0 {
+                                libc::_exit(127);
+                            }
+                            exec_pinned(
+                                spec.program_fd,
+                                spec.argv.as_ptr().cast(),
+                                spec.envp.as_ptr().cast(),
+                            );
+                            libc::_exit(127);
+                        }
+                        if send_message(
+                            spec.report_fd,
+                            Message {
+                                kind: MSG_READY,
+                                operation: PROBE_OK,
+                                errno: 0,
+                                pid: libc::getpid(),
+                                network_namespace_device: network_namespace.device,
+                                network_namespace_inode: network_namespace.inode,
+                            },
+                        )
+                        .is_err()
+                        {
+                            libc::close(cgroup_fd);
+                            libc::close(spec.report_fd);
+                            libc::_exit(125);
+                        }
+                        libc::close(cgroup_fd);
+                        libc::close(spec.report_fd);
+                        wait_target_or_exit(child);
+                    }
+                    _ => fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, libc::EINVAL),
+                }
+            },
+        );
+        if let Err(error) = acknowledgment {
+            fail_and_exit(
+                spec.report_fd,
+                STAGE_PARENT_ACK,
+                error.raw_os_error().unwrap_or(libc::EPROTO),
+            );
+        }
+        libc::_exit(125)
     }
 
     unsafe fn make_root_layout(root: &RootPaths) -> i32 {
@@ -3934,6 +4064,29 @@ mod linux {
         }
     }
 
+    fn create_pipe_above_stdio() -> io::Result<[RawFd; 2]> {
+        let mut pipe = [0; 2];
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for index in 0..pipe.len() {
+            if pipe[index] < 3 {
+                let duplicate = unsafe { libc::fcntl(pipe[index], libc::F_DUPFD_CLOEXEC, 3) };
+                if duplicate < 0 {
+                    let error = io::Error::last_os_error();
+                    unsafe {
+                        libc::close(pipe[0]);
+                        libc::close(pipe[1]);
+                    }
+                    return Err(error);
+                }
+                unsafe { libc::close(pipe[index]) };
+                pipe[index] = duplicate;
+            }
+        }
+        Ok(pipe)
+    }
+
     unsafe fn send_message(fd: RawFd, message: Message) -> io::Result<()> {
         write_struct(fd, &message)
     }
@@ -3957,6 +4110,19 @@ mod linux {
             }
             return count;
         }
+    }
+
+    fn read_parent_ack(fd: RawFd) -> io::Result<Option<u8>> {
+        let mut value = 0_u8;
+        match unsafe { read_one(fd, &mut value) } {
+            0 => Ok(None),
+            1 => Ok(Some(value)),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    fn write_parent_ack(fd: RawFd) -> io::Result<()> {
+        unsafe { write_all(fd, &[1]) }
     }
 
     unsafe fn wait_target_or_exit(pid: libc::pid_t) -> ! {
@@ -4030,6 +4196,7 @@ mod linux {
             STAGE_NETWORK_NAMESPACE => "private network namespace creation",
             STAGE_NETWORK_SOCKET => "network socket seccomp policy",
             STAGE_NETWORK_SYSCALL => "network escape syscall policy",
+            STAGE_PARENT_ACK => "parent network namespace acknowledgment",
             STAGE_NETWORK_UNIX_SOCKET => "Unix socket host-path isolation",
             STAGE_NETWORK_ESCAPE => "network namespace escape denial",
             STAGE_TASK_CWD => "task-directory working directory",
@@ -4229,6 +4396,27 @@ mod linux {
             abort_probe(pid);
             assert_probe_child_reaped(pid);
             assert!(timed_out, "a probe child which does not exit must time out");
+        }
+
+        #[test]
+        fn quick_active_probe_exit_is_reaped_without_waiting_for_full_deadline() {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork quick-exit probe child");
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+
+            let started = Instant::now();
+            let status = reap_probe_until(pid, started + Duration::from_secs(2))
+                .expect("reap quick-exit probe");
+
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "quick child reap consumed the remaining probe deadline: {:?}",
+                started.elapsed()
+            );
         }
 
         fn assert_probe_child_reaped(pid: libc::pid_t) {
@@ -4588,6 +4776,63 @@ mod review_regression_tests {
         assert!(validate_policy_path_identities(&graph).is_ok());
     }
 
+    #[test]
+    fn parent_ack_orders_release_before_each_placement_action() {
+        let parent_attach_events = std::cell::RefCell::new(Vec::new());
+        after_parent_ack(
+            || {
+                parent_attach_events.borrow_mut().push("read-parent-ack");
+                Ok(Some(1))
+            },
+            || {
+                parent_attach_events
+                    .borrow_mut()
+                    .push("expose-parent-attach-ready")
+            },
+        )
+        .expect("positive parent ack allows parent-attach readiness");
+        assert_eq!(
+            *parent_attach_events.borrow(),
+            ["read-parent-ack", "expose-parent-attach-ready"]
+        );
+
+        let cgroup_events = std::cell::RefCell::new(Vec::new());
+        after_parent_ack(
+            || {
+                cgroup_events.borrow_mut().push("read-parent-ack");
+                Ok(Some(1))
+            },
+            || cgroup_events.borrow_mut().push("clone-into-cgroup-target"),
+        )
+        .expect("positive parent ack allows cgroup target creation");
+        assert_eq!(
+            *cgroup_events.borrow(),
+            ["read-parent-ack", "clone-into-cgroup-target"]
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_parent_ack_never_runs_placement_action() {
+        for ack in [Ok(None), Ok(Some(0))] {
+            let mut action_ran = false;
+            assert!(after_parent_ack(|| ack, || action_ran = true).is_err());
+            assert!(!action_ran, "placement action ran without a positive ack");
+        }
+
+        let mut action_ran = false;
+        assert!(
+            after_parent_ack(
+                || Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                || action_ran = true
+            )
+            .is_err()
+        );
+        assert!(
+            !action_ran,
+            "placement action ran after an ack read failure"
+        );
+    }
+
     fn inventory(entries: &[(&str, u64, u64)]) -> ToolInventory {
         ToolInventory {
             entries: entries
@@ -4771,6 +5016,42 @@ mod review_regression_tests {
                 "userfaultfd_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
                 "namespace_creation_denied": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" }
             })
+        );
+    }
+
+    #[test]
+    fn network_evidence_serializes_unix_visibility_and_connect_denial_separately() {
+        let item = ProbeEvidence {
+            status: ProbeStatus::Passed,
+            detail: "synthetic record; no OS probe executed".into(),
+        };
+        let mut evidence = NetworkEvidence {
+            private_namespace_created: item.clone(),
+            ipv4_socket_denial: item.clone(),
+            ipv6_socket_denial: item.clone(),
+            packet_socket_denial: item.clone(),
+            ipv4_listener_isolated: item.clone(),
+            ipv6_listener_isolated: item.clone(),
+            unix_socket_escape: item.clone(),
+            connect_denial: item.clone(),
+            socketpair_denial: item.clone(),
+            bpf_denial: item.clone(),
+            userfaultfd_denial: item.clone(),
+            namespace_creation_denied: item,
+        };
+        evidence.unix_socket_escape.detail =
+            "synthetic pre-seccomp path probe observed ENOENT".into();
+        evidence.connect_denial.detail =
+            "synthetic post-seccomp connect probe observed EACCES".into();
+
+        let serialized = serde_json::to_value(evidence).expect("serialize network evidence");
+        assert_eq!(
+            serialized["unix_socket_escape"]["detail"],
+            "synthetic pre-seccomp path probe observed ENOENT"
+        );
+        assert_eq!(
+            serialized["connect_denial"]["detail"],
+            "synthetic post-seccomp connect probe observed EACCES"
         );
     }
 

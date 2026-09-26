@@ -13,9 +13,8 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -116,18 +115,12 @@ fn barrier() -> (SpawnPlacement, File, File) {
     )
 }
 
-fn run_network_probe(
-    fixture: &Fixture,
-    ipv4_port: u16,
-    ipv6_port: u16,
-    unix_socket_path: &Path,
-) -> i32 {
+fn run_network_probe(fixture: &Fixture, ipv4_port: u16, ipv6_port: u16) -> i32 {
     let (placement, mut ready, mut release) = barrier();
     let arguments = [
         OsString::from("probe-network"),
         OsString::from(ipv4_port.to_string()),
         OsString::from(ipv6_port.to_string()),
-        unix_socket_path.as_os_str().to_owned(),
     ];
     let mut child =
         Sandbox::spawn_blocked(&fixture.child, &arguments, &fixture.policy(), placement)
@@ -167,9 +160,27 @@ fn network_prerequisites_collect_active_controlled_probe_evidence() {
 
     assert!(evidence.all_passed(), "network evidence: {evidence:#?}");
     assert_eq!(
+        evidence.unix_socket_escape.status,
+        ProbeStatus::Passed,
+        "pre-seccomp Unix path-visibility evidence: {:#?}",
+        evidence.unix_socket_escape
+    );
+    assert!(
+        evidence.unix_socket_escape.detail.contains("pre-seccomp")
+            && evidence.unix_socket_escape.detail.contains("ENOENT"),
+        "Unix path visibility must be established by a pre-seccomp ENOENT probe: {:#?}",
+        evidence.unix_socket_escape
+    );
+    assert_eq!(
         evidence.connect_denial.status,
         ProbeStatus::Passed,
         "connect denial evidence: {:#?}",
+        evidence.connect_denial
+    );
+    assert!(
+        evidence.connect_denial.detail.contains("post-seccomp")
+            && evidence.connect_denial.detail.contains("EACCES"),
+        "connect denial must be separate post-seccomp EACCES evidence: {:#?}",
         evidence.connect_denial
     );
     assert_eq!(
@@ -211,7 +222,7 @@ fn network_prerequisites_collect_active_controlled_probe_evidence() {
 }
 
 #[test]
-fn sandbox_denies_inet_packet_and_namespace_escape_and_hides_host_unix_socket() {
+fn sandbox_denies_inet_packet_and_namespace_escape() {
     let ipv4_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind IPv4 listener");
     let ipv6_listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).expect("bind IPv6 listener");
     ipv4_listener
@@ -222,18 +233,14 @@ fn sandbox_denies_inet_packet_and_namespace_escape_and_hides_host_unix_socket() 
         .expect("make IPv6 listener nonblocking");
 
     let fixture = Fixture::new();
-    let host_socket_path = fixture._root.path().join("host-control.sock");
-    let _unix_listener = UnixListener::bind(&host_socket_path).expect("bind host Unix listener");
-
     assert_eq!(
         run_network_probe(
             &fixture,
             ipv4_listener.local_addr().expect("IPv4 address").port(),
             ipv6_listener.local_addr().expect("IPv6 address").port(),
-            &host_socket_path,
         ),
         0,
-        "probe child must observe configured seccomp denials and no Unix escape"
+        "post-seccomp child must observe configured network and namespace syscall denials"
     );
 
     assert_no_connection(&ipv4_listener);

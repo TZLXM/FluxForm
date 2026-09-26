@@ -142,46 +142,6 @@ fn probe_userfaultfd_denial() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_unix_socket_escape(path: &std::ffi::OsStr) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(path) = std::ffi::CString::new(path.as_bytes()) else {
-        return false;
-    };
-    let socket = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if socket < 0 {
-        return false;
-    }
-
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let path_bytes = path.as_bytes_with_nul();
-    if path_bytes.len() > address.sun_path.len() {
-        unsafe { libc::close(socket) };
-        return false;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            path_bytes.as_ptr(),
-            address.sun_path.as_mut_ptr().cast(),
-            path_bytes.len(),
-        );
-    }
-    let address_len =
-        (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len()) as libc::socklen_t;
-    let connected = unsafe {
-        libc::connect(
-            socket,
-            (&address as *const libc::sockaddr_un).cast(),
-            address_len,
-        )
-    };
-    let error = std::io::Error::last_os_error().raw_os_error();
-    unsafe { libc::close(socket) };
-    connected < 0 && error == Some(libc::ENOENT)
-}
-
-#[cfg(target_os = "linux")]
 #[repr(C)]
 struct ProbeCloneArgs {
     flags: u64,
@@ -366,9 +326,8 @@ fn main() {
             let ipv6_port = arguments
                 .next()
                 .and_then(|raw| raw.to_string_lossy().parse::<u16>().ok());
-            let unix_socket_path = arguments.next();
-            match (ipv4_port, ipv6_port, unix_socket_path) {
-                (Some(ipv4_port), Some(ipv6_port), Some(unix_socket_path))
+            match (ipv4_port, ipv6_port) {
+                (Some(ipv4_port), Some(ipv6_port))
                     if probe_ipv4_socket_denial(ipv4_port)
                         && probe_ipv6_socket_denial(ipv6_port)
                         && probe_packet_socket_denial()
@@ -376,7 +335,6 @@ fn main() {
                         && probe_socketpair_denial()
                         && probe_bpf_denial()
                         && probe_userfaultfd_denial()
-                        && probe_unix_socket_escape(&unix_socket_path)
                         && probe_namespace_creation_denial() =>
                 {
                     0
