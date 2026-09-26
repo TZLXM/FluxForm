@@ -828,6 +828,40 @@ impl UploadLedger {
         UploadState::from_str(&row.0)
     }
 
+    pub(crate) fn max_file_bytes(&self) -> u64 {
+        self.limits.max_file_bytes
+    }
+
+    pub(crate) fn ensure_disk_safety_margin(&self) -> Result<(), LimitError> {
+        self.check_disk_safety_margin()
+    }
+
+    pub(crate) fn open_receiving_upload_file(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+    ) -> Result<(fs::File, u64), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, reserved_bytes, _, relative_path) =
+            load_session(&transaction, session_id, capability)?;
+        if state != UploadState::Receiving {
+            return Err(LimitError::InvalidTransition);
+        }
+        let relative_path = relative_path.ok_or(LimitError::AccountingInvariant)?;
+        let file_name = reservation_leaf(Path::new(&relative_path))
+            .map_err(|_| LimitError::InvalidUploadPath)?;
+        let file = self
+            .reservation_directory
+            .open_file(&file_name, false)
+            .map_err(LimitError::Filesystem)?;
+        if file.metadata().map_err(LimitError::Filesystem)?.len() != reserved_bytes {
+            return Err(LimitError::AccountingInvariant);
+        }
+        transaction.commit()?;
+        Ok((file, reserved_bytes))
+    }
+
     fn reservation_path(&self, relative: Option<&str>) -> Result<PathBuf, LimitError> {
         let relative = relative.ok_or(LimitError::AccountingInvariant)?;
         let normalized = normalize_relative_path(Path::new(relative))?;

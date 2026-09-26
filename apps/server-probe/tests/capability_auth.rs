@@ -213,6 +213,7 @@ impl Harness {
 
 struct PollCountingBody {
     polls: Arc<AtomicUsize>,
+    yielded: bool,
 }
 
 impl Body for PollCountingBody {
@@ -223,8 +224,14 @@ impl Body for PollCountingBody {
         self: Pin<&mut Self>,
         _context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.polls.fetch_add(1, Ordering::SeqCst);
-        Poll::Ready(Some(Err(std::io::Error::other("request body was polled"))))
+        let this = self.get_mut();
+        this.polls.fetch_add(1, Ordering::SeqCst);
+        if this.yielded {
+            Poll::Ready(None)
+        } else {
+            this.yielded = true;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"data")))))
+        }
     }
 }
 
@@ -301,7 +308,7 @@ impl Endpoint {
 
     fn allowed_status(self) -> StatusCode {
         match self {
-            Self::Upload => StatusCode::NOT_IMPLEMENTED,
+            Self::Upload => StatusCode::NO_CONTENT,
             Self::Status | Self::Events | Self::Download => StatusCode::OK,
             Self::Cancel => StatusCode::ACCEPTED,
         }
@@ -405,9 +412,6 @@ async fn every_protected_route_enforces_scope_subject_and_expiration() {
                 CredentialCase::Valid => {
                     assert_eq!(status, endpoint.allowed_status(), "{endpoint:?}");
                     assert!(headers.get("referrer-policy").is_some(), "{endpoint:?}");
-                    if matches!(endpoint, Endpoint::Upload) {
-                        assert_error_code(&body, "upload_stream_not_implemented");
-                    }
                     if matches!(endpoint, Endpoint::Events) {
                         assert!(String::from_utf8_lossy(&body).contains("event:"));
                     }
@@ -487,6 +491,7 @@ async fn bootstrap_returns_one_hashed_capability_and_upload_content_uses_it() {
     let body_polls = Arc::new(AtomicUsize::new(0));
     let request_body = PollCountingBody {
         polls: Arc::clone(&body_polls),
+        yielded: false,
     }
     .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })
     .boxed_unsync();
@@ -509,15 +514,15 @@ async fn bootstrap_returns_one_hashed_capability_and_upload_content_uses_it() {
         .await
         .unwrap();
     let (status, _, response_body) = response_parts(upload).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_error_code(&response_body, "upload_stream_not_implemented");
-    assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(response_body.is_empty());
+    assert_eq!(body_polls.load(Ordering::SeqCst), 2);
     let token = SessionToken::parse(token).unwrap();
     assert_eq!(
         harness.ledger.state(session_id, &token).unwrap(),
-        UploadState::Reserved
+        UploadState::Uploaded
     );
-    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 4);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -791,8 +796,7 @@ async fn state_changing_routes_require_an_exact_origin() {
             if allowed {
                 assert_ne!(status, StatusCode::FORBIDDEN, "{method} {label}");
                 if method == Method::PUT {
-                    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{label}");
-                    assert_error_code(&response_body, "upload_stream_not_implemented");
+                    assert_eq!(status, StatusCode::NO_CONTENT, "{label}");
                 }
             } else {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{method} {label}");
@@ -810,7 +814,15 @@ async fn state_changing_routes_require_an_exact_origin() {
                             &SessionToken::parse(token.as_deref().unwrap()).unwrap(),
                         )
                         .unwrap();
-                    assert_eq!(current, initial_state, "{label}");
+                    assert_eq!(
+                        current,
+                        if allowed {
+                            UploadState::Uploaded
+                        } else {
+                            initial_state
+                        },
+                        "{label}"
+                    );
                 }
                 Method::DELETE => {
                     assert_eq!(

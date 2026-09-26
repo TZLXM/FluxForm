@@ -1,30 +1,42 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
+use futures_util::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Incoming};
 use hyper::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-    FORWARDED, HeaderMap, HeaderValue, ORIGIN, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, FORWARDED, HeaderMap, HeaderValue, ORIGIN, REFERRER_POLICY,
+    X_CONTENT_TYPE_OPTIONS,
 };
+use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
+use hyper::server::conn::http1;
+use hyper::service::service_fn as hyper_service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf as TokioReadBuf};
+use tokio::net::TcpListener;
 use tower::Service;
 use tower::service_fn;
 use uuid::Uuid;
 
 use crate::auth::{Capability, CapabilityError, CapabilityStore, Scope};
-use crate::ledger::{LimitError, UploadLedger};
+use crate::ledger::{LimitError, SessionToken, UploadLedger, UploadState};
 
 const MAX_BOOTSTRAP_BODY_BYTES: usize = 16 * 1024;
+const DEFAULT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_FORWARDED_HOPS: usize = 8;
 const MAX_FORWARDED_HEADER_BYTES: usize = 4 * 1024;
 const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
@@ -35,10 +47,15 @@ const PUBLIC_ORIGIN_ERROR: HttpError = HttpError {
     code: "origin_denied",
     message: "The request origin is not allowed.",
 };
-const UPLOAD_STREAM_NOT_IMPLEMENTED: HttpError = HttpError {
-    status: StatusCode::NOT_IMPLEMENTED,
-    code: "upload_stream_not_implemented",
-    message: "Upload streaming is not available yet.",
+const UPLOAD_INTERRUPTED_ERROR: HttpError = HttpError {
+    status: StatusCode::BAD_REQUEST,
+    code: "upload_interrupted",
+    message: "The upload stream ended unexpectedly.",
+};
+const UPLOAD_TIMEOUT_ERROR: HttpError = HttpError {
+    status: StatusCode::REQUEST_TIMEOUT,
+    code: "upload_timeout",
+    message: "The upload exceeded its time limit.",
 };
 const INVALID_FORWARDED_ERROR: HttpError = HttpError {
     status: StatusCode::BAD_REQUEST,
@@ -70,6 +87,8 @@ pub struct ServerState {
     public_origin: String,
     trusted_proxies: Vec<IpCidr>,
     capability_ttl: Duration,
+    upload_idle_timeout: Duration,
+    upload_total_timeout: Duration,
     resources: Arc<Mutex<ResourceCatalog>>,
 }
 
@@ -102,8 +121,23 @@ impl ServerState {
             public_origin,
             trusted_proxies,
             capability_ttl,
+            upload_idle_timeout: DEFAULT_UPLOAD_IDLE_TIMEOUT,
+            upload_total_timeout: DEFAULT_UPLOAD_TOTAL_TIMEOUT,
             resources: Arc::new(Mutex::new(ResourceCatalog::default())),
         })
+    }
+
+    pub fn with_upload_timeouts(
+        mut self,
+        idle_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<Self, RouteConfigurationError> {
+        if idle_timeout.is_zero() || total_timeout.is_zero() {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
+        self.upload_idle_timeout = idle_timeout;
+        self.upload_total_timeout = total_timeout;
+        Ok(self)
     }
 
     pub fn register_job(
@@ -190,8 +224,7 @@ struct ArtifactRecord {
     content_type: HeaderValue,
 }
 
-/// Builds the production HTTP service used by the server and in-process route tests.
-/// The network adapter must insert [`TransportPeer`] from the accepted socket.
+/// Builds the same HTTP handler as [`serve`] for in-process route tests.
 pub fn router(
     state: ServerState,
 ) -> impl Clone
@@ -204,9 +237,93 @@ pub fn router(
     })
 }
 
+/// Accepts HTTP/1 connections and attaches each accepted socket's peer address
+/// to its requests. Forwarding headers are never used as the transport identity.
+pub async fn serve(listener: TcpListener, state: ServerState) -> io::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let connection_state = state.clone();
+        tokio::spawn(async move {
+            let service = hyper_service_fn(move |request: Request<Incoming>| {
+                let state = connection_state.clone();
+                async move {
+                    let mut request = request.map(|body| {
+                        body.map_err(|error| Box::new(error) as BoxError)
+                            .boxed_unsync()
+                    });
+                    request.extensions_mut().insert(TransportPeer(peer));
+                    Ok::<_, Infallible>(handle_request(request, state).await)
+                }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo(stream), service)
+                .await;
+        });
+    }
+}
+
+struct TokioIo<T>(T);
+
+impl<T> HyperRead for TokioIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        mut buffer: ReadBufCursor<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        let filled = {
+            let mut tokio_buffer = TokioReadBuf::uninit(unsafe { buffer.as_mut() });
+            match Pin::new(&mut this.0).poll_read(context, &mut tokio_buffer) {
+                Poll::Ready(Ok(())) => tokio_buffer.filled().len(),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        // SAFETY: Tokio's ReadBuf reports only bytes initialized by `poll_read`.
+        unsafe { buffer.advance(filled) };
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T> HyperWrite for TokioIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(context)
+    }
+}
+
 async fn handle_request(request: Request<HttpBody>, state: ServerState) -> Response<HttpBody> {
+    let close_on_error = request.method() == Method::PUT;
     let result = dispatch(request, &state).await;
     let mut response = result.unwrap_or_else(error_response);
+    if close_on_error && !response.status().is_success() {
+        // A rejected upload body may still have unread frames. Closing the
+        // HTTP/1 connection prevents Hyper from draining attacker-controlled
+        // bytes before the error response can complete.
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
     add_common_headers(&mut response);
     response
 }
@@ -236,7 +353,7 @@ async fn dispatch(
     match (method.as_str(), segments.as_slice()) {
         ("POST", ["v1", "upload-sessions"]) => create_upload_session(request, state).await,
         ("PUT", ["v1", "upload-sessions", session_id, "content"]) => {
-            upload_content(request, state, session_id)
+            upload_content(request, state, session_id).await
         }
         ("GET", ["v1", "jobs", job_id, "events"]) => job_events(request, state, job_id),
         ("GET", ["v1", "jobs", job_id]) => job_status(request, state, job_id),
@@ -284,15 +401,117 @@ async fn create_upload_session(
     ))
 }
 
-fn upload_content(
+async fn upload_content(
     request: Request<HttpBody>,
     state: &ServerState,
     session_id: &str,
 ) -> Result<Response<HttpBody>, HttpError> {
     let session_id = parse_session_id(session_id)?;
     let subject = format!("upload-session:{session_id}");
-    authorize(request.headers(), state, &subject, Scope::Upload)?;
-    Err(UPLOAD_STREAM_NOT_IMPLEMENTED)
+    let token = authorize(request.headers(), state, &subject, Scope::Upload)?;
+    let session_token = SessionToken::parse(&token).map_err(map_limit_error)?;
+    let max_file_bytes = state.ledger.max_file_bytes();
+
+    state
+        .ledger
+        .transition(session_id, &session_token, UploadState::Receiving)
+        .map_err(map_limit_error)?;
+
+    let body = request.into_body();
+    let received = async {
+        let (mut file, mut reserved_bytes) = state
+            .ledger
+            .open_receiving_upload_file(session_id, &session_token)
+            .map_err(map_limit_error)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| HttpError::storage_unavailable())?;
+        let mut stream = body.into_data_stream();
+        let started = tokio::time::Instant::now();
+        let total_deadline = started
+            .checked_add(state.upload_total_timeout)
+            .ok_or_else(HttpError::storage_unavailable)?;
+        let mut actual_bytes = 0_u64;
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= total_deadline {
+                return Err(UPLOAD_TIMEOUT_ERROR);
+            }
+            let idle_deadline = now
+                .checked_add(state.upload_idle_timeout)
+                .unwrap_or(total_deadline)
+                .min(total_deadline);
+            let next = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(idle_deadline) => return Err(UPLOAD_TIMEOUT_ERROR),
+                next = stream.next() => next,
+            };
+            let Some(frame) = next else {
+                break;
+            };
+            let chunk = match frame {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                    {
+                        return Err(UPLOAD_TIMEOUT_ERROR);
+                    }
+                    return Err(UPLOAD_INTERRUPTED_ERROR);
+                }
+            };
+            if tokio::time::Instant::now() >= total_deadline {
+                return Err(UPLOAD_TIMEOUT_ERROR);
+            }
+
+            let chunk_bytes = u64::try_from(chunk.len())
+                .map_err(|_| map_limit_error(LimitError::FileTooLarge))?;
+            let next_total = actual_bytes
+                .checked_add(chunk_bytes)
+                .ok_or_else(|| map_limit_error(LimitError::FileTooLarge))?;
+            if next_total > max_file_bytes {
+                return Err(map_limit_error(LimitError::FileTooLarge));
+            }
+            if next_total > reserved_bytes {
+                let reservation = state
+                    .ledger
+                    .expand(session_id, &session_token, next_total)
+                    .map_err(map_limit_error)?;
+                reserved_bytes = reservation.reserved_bytes;
+            }
+            state
+                .ledger
+                .ensure_disk_safety_margin()
+                .map_err(map_limit_error)?;
+            file.write_all(&chunk)
+                .map_err(|_| HttpError::storage_unavailable())?;
+            actual_bytes = next_total;
+        }
+
+        file.set_len(actual_bytes)
+            .map_err(|_| HttpError::storage_unavailable())?;
+        file.flush().map_err(|_| HttpError::storage_unavailable())?;
+        Ok::<_, HttpError>(actual_bytes)
+    }
+    .await;
+
+    let actual_bytes = match received {
+        Ok(actual_bytes) => actual_bytes,
+        Err(error) => return Err(abort_upload(state, session_id, &session_token, error)),
+    };
+    if let Err(error) = state
+        .ledger
+        .settle(session_id, &session_token, actual_bytes)
+    {
+        return Err(abort_upload(
+            state,
+            session_id,
+            &session_token,
+            map_limit_error(error),
+        ));
+    }
+    Ok(empty_response(StatusCode::NO_CONTENT))
 }
 
 fn job_status(
@@ -412,6 +631,22 @@ fn authorize(
     Capability::verify(&state.capabilities, &token, subject, scope)
         .map_err(map_capability_error)?;
     Ok(token)
+}
+
+fn abort_upload(
+    state: &ServerState,
+    session_id: i64,
+    token: &SessionToken,
+    original_error: HttpError,
+) -> HttpError {
+    if let Err(error) = state.ledger.expire(session_id, token) {
+        return map_limit_error(error);
+    }
+    match state.ledger.reconcile_cleanup_jobs() {
+        Ok(report) if report.retryable == 0 => original_error,
+        Ok(_) => HttpError::storage_unavailable(),
+        Err(error) => map_limit_error(error),
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<String, HttpError> {
