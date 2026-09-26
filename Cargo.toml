@@ -3,6 +3,7 @@ members = [
     "crates/fluxform-protocol",
     "crates/fluxform-ffmpeg-profile",
     "crates/fluxform-capabilities",
+    "crates/fluxform-atomic-output",
 ]
 resolver = "3"
 

@@ -185,6 +185,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxform-atomic-output"
+version = "0.1.0"
+dependencies = [
+ "fluxform-capabilities",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "fluxform-capabilities"
 version = "0.1.0"
 dependencies = [

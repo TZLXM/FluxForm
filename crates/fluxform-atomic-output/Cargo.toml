@@ -1,0 +1,18 @@
+[package]
+name = "fluxform-atomic-output"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+fluxform-capabilities = { path = "../fluxform-capabilities" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.23"
