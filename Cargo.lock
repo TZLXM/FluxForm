@@ -282,10 +282,12 @@ dependencies = [
 name = "fluxform-server-probe"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "sha2",
  "tempfile",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

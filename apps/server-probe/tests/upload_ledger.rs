@@ -1,15 +1,32 @@
 use std::fs;
+use std::io;
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fluxform_server_probe::{LedgerLimits, LimitError, UploadLedger, UploadState};
+use fluxform_server_probe::{
+    DiskSpaceProvider, LedgerLimits, LimitError, UploadLedger, UploadState,
+};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 const SECRET_A: [u8; 32] = [0xA1; 32];
 const SECRET_B: [u8; 32] = [0xB2; 32];
+
+struct SequencedDiskSpace(Mutex<Vec<u64>>);
+
+impl DiskSpaceProvider for SequencedDiskSpace {
+    fn available_bytes(&self, _path: &Path) -> io::Result<u64> {
+        let mut values = self.0.lock().unwrap();
+        let value = if values.len() > 1 {
+            values.remove(0)
+        } else {
+            *values.first().unwrap_or(&0)
+        };
+        Ok(value)
+    }
+}
 
 fn limits() -> LedgerLimits {
     LedgerLimits {
@@ -17,7 +34,6 @@ fn limits() -> LedgerLimits {
         daily_quota_bytes: 100,
         max_active_sessions_per_ip: 3,
         max_global_reserved_bytes: 100,
-        disk_available_bytes: 1_000,
         disk_safety_margin_bytes: 100,
     }
 }
@@ -100,9 +116,15 @@ fn daily_quota_matches_hashed_ip_across_secret_rotation() {
 
     let first = old_ledger.reserve("2001:0db8::1", Some(4)).unwrap();
     old_ledger
-        .transition(first.session_id, UploadState::Receiving)
+        .transition(
+            first.session_id,
+            &first.session_token,
+            UploadState::Receiving,
+        )
         .unwrap();
-    old_ledger.settle(first.session_id, 4).unwrap();
+    old_ledger
+        .settle(first.session_id, &first.session_token, 4)
+        .unwrap();
 
     let rotated_ledger = open(&temp_dir, configured, vec![SECRET_B, SECRET_A]);
     rotated_ledger.reserve("2001:db8::1", Some(4)).unwrap();
@@ -121,9 +143,15 @@ fn daily_quota_counts_reserved_and_settled_bytes() {
 
     let session = ledger.reserve("192.0.2.10", Some(5)).unwrap();
     ledger
-        .transition(session.session_id, UploadState::Receiving)
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving,
+        )
         .unwrap();
-    ledger.settle(session.session_id, 3).unwrap();
+    ledger
+        .settle(session.session_id, &session.session_token, 3)
+        .unwrap();
     ledger.reserve("192.0.2.10", Some(4)).unwrap();
     assert!(matches!(
         ledger.reserve("192.0.2.10", Some(1)),
@@ -149,9 +177,16 @@ fn enforces_the_global_reservation_limit() {
 fn preserves_the_configured_disk_safety_margin() {
     let temp_dir = TempDir::new().unwrap();
     let mut configured = limits();
-    configured.disk_available_bytes = 12;
     configured.disk_safety_margin_bytes = 5;
-    let ledger = open(&temp_dir, configured, vec![SECRET_A]);
+    let disk = Arc::new(SequencedDiskSpace(Mutex::new(vec![12, 12, 7])));
+    let ledger = UploadLedger::open_with_disk_space(
+        temp_dir.path().join("ledger.sqlite3"),
+        temp_dir.path(),
+        configured,
+        vec![SECRET_A],
+        disk,
+    )
+    .unwrap();
 
     ledger.reserve("192.0.2.10", Some(5)).unwrap();
     assert!(matches!(
@@ -166,14 +201,22 @@ fn settle_releases_the_reservation_and_records_only_actual_bytes() {
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(8)).unwrap();
     ledger
-        .transition(session.session_id, UploadState::Receiving)
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving,
+        )
         .unwrap();
 
-    ledger.settle(session.session_id, 5).unwrap();
+    ledger
+        .settle(session.session_id, &session.session_token, 5)
+        .unwrap();
 
     assert_eq!(ledger.reserved_bytes().unwrap(), 0);
     assert_eq!(
-        ledger.state(session.session_id).unwrap(),
+        ledger
+            .state(session.session_id, &session.session_token)
+            .unwrap(),
         UploadState::Uploaded
     );
     let day = current_day_bucket();
@@ -193,11 +236,15 @@ fn rejects_settlement_larger_than_the_current_reservation() {
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(4)).unwrap();
     ledger
-        .transition(session.session_id, UploadState::Receiving)
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving,
+        )
         .unwrap();
 
     assert!(matches!(
-        ledger.settle(session.session_id, 5),
+        ledger.settle(session.session_id, &session.session_token, 5),
         Err(LimitError::SettlementExceedsReservation)
     ));
     assert_eq!(ledger.reserved_bytes().unwrap(), 4);
@@ -214,12 +261,16 @@ fn expands_are_serialized_so_only_one_over_capacity_race_commits() {
     let second = ledger.reserve("192.0.2.11", Some(2)).unwrap();
 
     let barrier = Arc::new(Barrier::new(3));
-    let handles = [first.session_id, second.session_id].map(|session_id| {
+    let handles = [
+        (first.session_id, first.session_token),
+        (second.session_id, second.session_token),
+    ]
+    .map(|(session_id, token)| {
         let ledger = ledger.clone();
         let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
             barrier.wait();
-            ledger.expand(session_id, 8)
+            ledger.expand(session_id, &token, 8)
         })
     });
     barrier.wait();
@@ -248,21 +299,43 @@ fn rejects_illegal_transitions_and_keeps_terminal_states_terminal() {
     let session = ledger.reserve("192.0.2.10", Some(2)).unwrap();
 
     assert!(matches!(
-        ledger.transition(session.session_id, UploadState::Queued),
+        ledger.transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Queued
+        ),
         Err(LimitError::InvalidTransition)
     ));
     ledger
-        .transition(session.session_id, UploadState::Receiving)
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving,
+        )
         .unwrap();
-    ledger.settle(session.session_id, 2).unwrap();
     ledger
-        .transition(session.session_id, UploadState::Probing)
+        .settle(session.session_id, &session.session_token, 2)
         .unwrap();
     ledger
-        .transition(session.session_id, UploadState::Queued)
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Probing,
+        )
+        .unwrap();
+    ledger
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Queued,
+        )
         .unwrap();
     assert!(matches!(
-        ledger.transition(session.session_id, UploadState::Receiving),
+        ledger.transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving
+        ),
         Err(LimitError::InvalidTransition)
     ));
     assert_eq!(
@@ -284,22 +357,22 @@ fn expiration_releases_once_and_deletion_runs_only_through_the_reconciler() {
     let temp_dir = TempDir::new().unwrap();
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(4)).unwrap();
-    fs::create_dir(temp_dir.path().join("uploads")).unwrap();
-    let relative = Path::new("uploads/payload.bin");
-    let file_path = temp_dir.path().join(relative);
-    fs::write(&file_path, b"body").unwrap();
-    ledger
-        .set_upload_path(session.session_id, relative)
-        .unwrap();
+    let file_path = session.upload_path.clone();
 
-    ledger.expire(session.session_id).unwrap();
+    ledger
+        .expire(session.session_id, &session.session_token)
+        .unwrap();
     assert_eq!(ledger.reserved_bytes().unwrap(), 0);
     assert_eq!(
-        ledger.state(session.session_id).unwrap(),
+        ledger
+            .state(session.session_id, &session.session_token)
+            .unwrap(),
         UploadState::Expired
     );
     assert!(file_path.exists(), "expiry must enqueue, not delete inline");
-    ledger.expire(session.session_id).unwrap();
+    ledger
+        .expire(session.session_id, &session.session_token)
+        .unwrap();
     assert_eq!(ledger.reserved_bytes().unwrap(), 0);
     assert_eq!(cleanup_job_count(&temp_dir), 1);
 
@@ -315,14 +388,13 @@ fn failed_cleanup_remains_pending_and_succeeds_on_a_later_retry() {
     let temp_dir = TempDir::new().unwrap();
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
-    let relative = Path::new("uploads/blocked");
-    let blocked_path = temp_dir.path().join(relative);
+    let blocked_path = session.upload_path.clone();
+    fs::remove_file(&blocked_path).unwrap();
     fs::create_dir_all(blocked_path.join("child")).unwrap();
     fs::write(blocked_path.join("child/file"), b"x").unwrap();
     ledger
-        .set_upload_path(session.session_id, relative)
+        .expire(session.session_id, &session.session_token)
         .unwrap();
-    ledger.expire(session.session_id).unwrap();
 
     let first = ledger.reconcile_cleanup_jobs().unwrap();
     assert_eq!(first.completed, 0);
@@ -332,7 +404,6 @@ fn failed_cleanup_remains_pending_and_succeeds_on_a_later_retry() {
     fs::remove_file(blocked_path.join("child/file")).unwrap();
     fs::remove_dir(blocked_path.join("child")).unwrap();
     fs::remove_dir(&blocked_path).unwrap();
-    fs::write(&blocked_path, b"now removable").unwrap();
     let second = ledger.reconcile_cleanup_jobs().unwrap();
     assert_eq!(second.completed, 1);
     assert_eq!(second.retryable, 0);
@@ -345,10 +416,21 @@ fn rejects_cleanup_paths_that_escape_the_upload_root() {
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
 
-    assert!(matches!(
-        ledger.set_upload_path(session.session_id, Path::new("../outside")),
-        Err(LimitError::InvalidUploadPath)
-    ));
+    let outside = temp_dir.path().join("outside");
+    fs::write(&outside, b"keep").unwrap();
+    ledger
+        .expire(session.session_id, &session.session_token)
+        .unwrap();
+    raw_connection(&temp_dir)
+        .execute(
+            "UPDATE cleanup_outbox SET relative_path = '../outside' WHERE session_id = ?1",
+            [session.session_id],
+        )
+        .unwrap();
+
+    let report = ledger.reconcile_cleanup_jobs().unwrap();
+    assert_eq!(report.retryable, 1);
+    assert_eq!(fs::read(outside).unwrap(), b"keep");
 }
 
 #[test]
@@ -406,9 +488,284 @@ fn rejects_values_that_cannot_be_represented_safely_by_sqlite_integers() {
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
     assert!(matches!(
-        ledger.expand(session.session_id, u64::MAX),
+        ledger.expand(session.session_id, &session.session_token, u64::MAX),
         Err(LimitError::FileTooLarge)
     ));
+}
+
+#[test]
+fn reserve_rechecks_live_free_space_after_physical_preallocation_before_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut configured = limits();
+    configured.disk_safety_margin_bytes = 100;
+    let disk = Arc::new(SequencedDiskSpace(Mutex::new(vec![1_000, 99])));
+    let ledger = UploadLedger::open_with_disk_space(
+        temp_dir.path().join("ledger.sqlite3"),
+        temp_dir.path(),
+        configured,
+        vec![SECRET_A],
+        disk,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        ledger.reserve("192.0.2.10", Some(4)),
+        Err(LimitError::DiskSafetyMargin)
+    ));
+    assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+    let rows: i64 = raw_connection(&temp_dir)
+        .query_row("SELECT COUNT(*) FROM uploads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn reserve_observes_external_disk_consumption_since_startup() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut configured = limits();
+    configured.disk_safety_margin_bytes = 100;
+    let disk = Arc::new(SequencedDiskSpace(Mutex::new(vec![1_000, 1_000, 99])));
+    let ledger = UploadLedger::open_with_disk_space(
+        temp_dir.path().join("ledger.sqlite3"),
+        temp_dir.path(),
+        configured,
+        vec![SECRET_A],
+        disk,
+    )
+    .unwrap();
+
+    ledger.reserve("192.0.2.10", Some(4)).unwrap();
+    assert!(matches!(
+        ledger.reserve("192.0.2.11", Some(4)),
+        Err(LimitError::DiskSafetyMargin)
+    ));
+    assert_eq!(ledger.reserved_bytes().unwrap(), 4);
+}
+
+#[test]
+fn expand_rolls_back_when_post_allocation_space_would_violate_the_margin() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut configured = limits();
+    configured.disk_safety_margin_bytes = 5;
+    let disk = Arc::new(SequencedDiskSpace(Mutex::new(vec![1_000, 1_000, 10, 4])));
+    let ledger = UploadLedger::open_with_disk_space(
+        temp_dir.path().join("ledger.sqlite3"),
+        temp_dir.path(),
+        configured,
+        vec![SECRET_A],
+        disk,
+    )
+    .unwrap();
+    let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+
+    assert!(matches!(
+        ledger.expand(session.session_id, &session.session_token, 4),
+        Err(LimitError::DiskSafetyMargin)
+    ));
+    assert_eq!(ledger.reserved_bytes().unwrap(), 1);
+    assert_eq!(fs::metadata(session.upload_path).unwrap().len(), 1);
+}
+
+#[test]
+fn guessed_session_ids_cannot_mutate_another_clients_session() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    let victim = ledger.reserve("192.0.2.10", Some(4)).unwrap();
+    let attacker = ledger.reserve("192.0.2.11", Some(2)).unwrap();
+
+    assert_ne!(
+        victim.session_token.as_str(),
+        attacker.session_token.as_str()
+    );
+    assert!(matches!(
+        ledger.expand(victim.session_id, &attacker.session_token, 8),
+        Err(LimitError::Unauthorized)
+    ));
+    assert!(matches!(
+        ledger.transition(
+            victim.session_id,
+            &attacker.session_token,
+            UploadState::Receiving
+        ),
+        Err(LimitError::Unauthorized)
+    ));
+    assert!(matches!(
+        ledger.settle(victim.session_id, &attacker.session_token, 1),
+        Err(LimitError::Unauthorized)
+    ));
+    assert!(matches!(
+        ledger.expire(victim.session_id, &attacker.session_token),
+        Err(LimitError::Unauthorized)
+    ));
+    assert_eq!(
+        ledger
+            .state(victim.session_id, &victim.session_token)
+            .unwrap(),
+        UploadState::Reserved
+    );
+    assert_eq!(ledger.reserved_bytes().unwrap(), 6);
+}
+
+#[test]
+fn session_capability_is_hashed_before_it_is_persisted() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+    let capability = session.session_token.as_str().as_bytes().to_vec();
+    drop(ledger);
+
+    let stored_hash: Vec<u8> = raw_connection(&temp_dir)
+        .query_row(
+            "SELECT capability_hash FROM uploads WHERE id = ?1",
+            [session.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_hash.len(), 32);
+    assert_ne!(stored_hash, capability);
+    let database = fs::read(temp_dir.path().join("ledger.sqlite3")).unwrap();
+    assert!(!contains_bytes(&database, &capability));
+}
+
+#[test]
+fn opening_a_legacy_database_applies_a_schema_versioned_migration() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("ledger.sqlite3");
+    let legacy = Connection::open(&db_path).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE global_budget(singleton INTEGER PRIMARY KEY, reserved_bytes INTEGER NOT NULL);
+             CREATE TABLE ip_identities(id INTEGER PRIMARY KEY AUTOINCREMENT);
+             CREATE TABLE ip_hashes(identity_id INTEGER NOT NULL, ip_hash TEXT NOT NULL UNIQUE,
+                 PRIMARY KEY(identity_id, ip_hash));
+             CREATE TABLE daily_usage(identity_id INTEGER NOT NULL, day INTEGER NOT NULL,
+                 used_bytes INTEGER NOT NULL, PRIMARY KEY(identity_id, day));
+             CREATE TABLE uploads(id INTEGER PRIMARY KEY AUTOINCREMENT, identity_id INTEGER NOT NULL,
+                 state TEXT NOT NULL, reserved_bytes INTEGER NOT NULL, actual_bytes INTEGER,
+                 created_day INTEGER NOT NULL, upload_path TEXT);
+             CREATE TABLE cleanup_outbox(session_id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0);
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    drop(legacy);
+
+    open(&temp_dir, limits(), vec![SECRET_A]);
+
+    let version: i64 = raw_connection(&temp_dir)
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 2,
+        "the database needs the current committed schema version"
+    );
+}
+
+#[test]
+fn startup_rejects_existing_reservations_above_reduced_global_limit() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    let session = ledger.reserve("192.0.2.10", Some(8)).unwrap();
+    drop(ledger);
+
+    let mut reduced = limits();
+    reduced.max_global_reserved_bytes = 7;
+    assert!(
+        UploadLedger::open(
+            temp_dir.path().join("ledger.sqlite3"),
+            temp_dir.path(),
+            reduced,
+            vec![SECRET_A]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        raw_connection(&temp_dir)
+            .query_row(
+                "SELECT reserved_bytes FROM global_budget WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        8
+    );
+    assert_eq!(
+        raw_connection(&temp_dir)
+            .query_row(
+                "SELECT reserved_bytes FROM uploads WHERE id = ?1",
+                [session.session_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        8
+    );
+}
+
+#[test]
+fn startup_reconciles_the_global_counter_from_active_upload_rows() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    ledger.reserve("192.0.2.10", Some(8)).unwrap();
+    drop(ledger);
+    raw_connection(&temp_dir)
+        .execute(
+            "UPDATE global_budget SET reserved_bytes = 3 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+
+    let reopened = open(&temp_dir, limits(), vec![SECRET_A]);
+
+    assert_eq!(reopened.reserved_bytes().unwrap(), 8);
+}
+
+#[test]
+fn secret_rotation_refuses_to_drop_keys_needed_by_active_or_daily_identities() {
+    let temp_dir = TempDir::new().unwrap();
+    let old = open(&temp_dir, limits(), vec![SECRET_A]);
+    let active = old.reserve("192.0.2.10", Some(2)).unwrap();
+
+    assert!(
+        UploadLedger::open(
+            temp_dir.path().join("ledger.sqlite3"),
+            temp_dir.path(),
+            limits(),
+            vec![SECRET_B]
+        )
+        .is_err()
+    );
+
+    old.transition(
+        active.session_id,
+        &active.session_token,
+        UploadState::Receiving,
+    )
+    .unwrap();
+    old.settle(active.session_id, &active.session_token, 1)
+        .unwrap();
+    drop(old);
+    assert!(
+        UploadLedger::open(
+            temp_dir.path().join("ledger.sqlite3"),
+            temp_dir.path(),
+            limits(),
+            vec![SECRET_B]
+        )
+        .is_err()
+    );
+
+    let overlapping = open(&temp_dir, limits(), vec![SECRET_B, SECRET_A]);
+    overlapping.reserve("192.0.2.10", Some(1)).unwrap();
+    drop(overlapping);
+    assert!(
+        UploadLedger::open(
+            temp_dir.path().join("ledger.sqlite3"),
+            temp_dir.path(),
+            limits(),
+            vec![SECRET_B]
+        )
+        .is_ok()
+    );
 }
 
 fn current_day_bucket() -> i64 {

@@ -1,5 +1,6 @@
 mod ledger;
 
 pub use ledger::{
-    CleanupReport, LedgerLimits, LimitError, UploadLedger, UploadReservation, UploadState,
+    CleanupReport, DiskSpaceProvider, LedgerLimits, LimitError, SessionToken, SystemDiskSpace,
+    UploadLedger, UploadReservation, UploadState,
 };

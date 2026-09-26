@@ -2,15 +2,18 @@ use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS global_budget (
@@ -23,6 +26,7 @@ CREATE TABLE IF NOT EXISTS ip_identities (
 CREATE TABLE IF NOT EXISTS ip_hashes (
     identity_id INTEGER NOT NULL REFERENCES ip_identities(id),
     ip_hash TEXT NOT NULL UNIQUE CHECK (length(ip_hash) = 64),
+    key_id BLOB NOT NULL CHECK (length(key_id) = 32),
     PRIMARY KEY (identity_id, ip_hash)
 );
 CREATE TABLE IF NOT EXISTS daily_usage (
@@ -34,6 +38,7 @@ CREATE TABLE IF NOT EXISTS daily_usage (
 CREATE TABLE IF NOT EXISTS uploads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     identity_id INTEGER NOT NULL REFERENCES ip_identities(id),
+    capability_hash BLOB NOT NULL CHECK (length(capability_hash) = 32),
     state TEXT NOT NULL CHECK (state IN ('reserved', 'receiving', 'uploaded', 'probing', 'queued', 'expired', 'rejected')),
     reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
     actual_bytes INTEGER CHECK (actual_bytes IS NULL OR actual_bytes >= 0),
@@ -72,6 +77,8 @@ pub enum LimitError {
     InvalidTransition,
     #[error("upload session does not exist")]
     UnknownSession,
+    #[error("upload session capability is invalid")]
+    Unauthorized,
     #[error("invalid upload path")]
     InvalidUploadPath,
     #[error("upload accounting invariant failed")]
@@ -80,6 +87,12 @@ pub enum LimitError {
     DatabaseBusy,
     #[error("database operation failed")]
     Database(#[source] rusqlite::Error),
+    #[error("database schema version is newer than this server supports")]
+    UnsupportedSchemaVersion,
+    #[error("existing upload commitments exceed current limits")]
+    ExistingCommitmentsExceedLimits,
+    #[error("server secret rotation would lose an active or current-day quota identity")]
+    SecretRetentionRequired,
     #[error("filesystem operation failed")]
     Filesystem(#[source] io::Error),
 }
@@ -154,11 +167,47 @@ impl UploadState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadReservation {
     pub session_id: i64,
     pub reserved_bytes: u64,
     pub state: UploadState,
+    /// Keep secret and send only to the client that created this reservation.
+    pub session_token: SessionToken,
+    /// Existing physically preallocated file; writers must not replace or truncate it.
+    pub upload_path: PathBuf,
+}
+
+/// An opaque bearer credential. Debug output is intentionally redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionToken(String);
+
+impl SessionToken {
+    /// Returns the canonical bearer token returned with an upload reservation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parses a canonical bearer token received from a client.
+    pub fn parse(value: &str) -> Result<Self, LimitError> {
+        Uuid::parse_str(value)
+            .map(|uuid| Self(uuid.to_string()))
+            .map_err(|_| LimitError::Unauthorized)
+    }
+
+    fn generate() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.0.as_bytes()).into()
+    }
+}
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionToken([REDACTED])")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -173,25 +222,65 @@ pub struct LedgerLimits {
     pub daily_quota_bytes: u64,
     pub max_active_sessions_per_ip: u32,
     pub max_global_reserved_bytes: u64,
-    pub disk_available_bytes: u64,
     pub disk_safety_margin_bytes: u64,
+}
+
+struct SecureReservationDirectory {
+    handle: fs::File,
+}
+
+/// Reports currently available bytes on the filesystem containing `path`.
+pub trait DiskSpaceProvider: Send + Sync {
+    fn available_bytes(&self, path: &Path) -> io::Result<u64>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemDiskSpace;
+
+impl DiskSpaceProvider for SystemDiskSpace {
+    fn available_bytes(&self, path: &Path) -> io::Result<u64> {
+        system_available_bytes(path)
+    }
 }
 
 #[derive(Clone)]
 pub struct UploadLedger {
     database_path: PathBuf,
     upload_root: PathBuf,
+    reservation_directory: Arc<SecureReservationDirectory>,
     limits: LedgerLimits,
+    disk_space: Arc<dyn DiskSpaceProvider>,
     // Secrets stay process-local. Only domain-separated HMAC values enter SQLite.
     secrets: Vec<[u8; 32]>,
 }
 
 impl UploadLedger {
+    /// Opens or migrates the ledger using the platform's live disk-space provider.
+    ///
+    /// Keep every secret needed by an active upload or by a current UTC-day
+    /// quota identity in `secrets`. Startup rejects a rotation that would lose
+    /// the identity alias until those sessions and quota windows have ended.
     pub fn open(
         database_path: impl AsRef<Path>,
         upload_root: impl AsRef<Path>,
         limits: LedgerLimits,
         secrets: Vec<[u8; 32]>,
+    ) -> Result<Self, LimitError> {
+        Self::open_with_disk_space(
+            database_path,
+            upload_root,
+            limits,
+            secrets,
+            Arc::new(SystemDiskSpace),
+        )
+    }
+
+    pub fn open_with_disk_space(
+        database_path: impl AsRef<Path>,
+        upload_root: impl AsRef<Path>,
+        limits: LedgerLimits,
+        secrets: Vec<[u8; 32]>,
+        disk_space: Arc<dyn DiskSpaceProvider>,
     ) -> Result<Self, LimitError> {
         validate_limits(limits)?;
         if secrets.is_empty() || secrets.len() > MAX_SECRET_ROTATION_KEYS {
@@ -202,20 +291,69 @@ impl UploadLedger {
         if !upload_root.is_dir() {
             return Err(LimitError::InvalidConfiguration);
         }
+        let reservations_dir = upload_root.join(".fluxform-reservations");
+        match fs::create_dir(&reservations_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(LimitError::Filesystem(error)),
+        }
+        let reservation_directory = Arc::new(
+            SecureReservationDirectory::open(&reservations_dir).map_err(LimitError::Filesystem)?,
+        );
 
         let ledger = Self {
             database_path: database_path.as_ref().to_path_buf(),
             upload_root,
+            reservation_directory,
             limits,
+            disk_space,
             secrets,
         };
         let mut connection = ledger.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let schema_version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if !(0..=CURRENT_SCHEMA_VERSION).contains(&schema_version) {
+            return Err(LimitError::UnsupportedSchemaVersion);
+        }
+        let had_uploads = table_exists(&transaction, "uploads")?;
+        let had_capability_hash =
+            had_uploads && table_has_column(&transaction, "uploads", "capability_hash")?;
+        let had_ip_hashes = table_exists(&transaction, "ip_hashes")?;
+        let had_key_id = had_ip_hashes && table_has_column(&transaction, "ip_hashes", "key_id")?;
         transaction.execute_batch(SCHEMA)?;
+        if had_uploads && !had_capability_hash {
+            transaction.execute(
+                "ALTER TABLE uploads ADD COLUMN capability_hash BLOB CHECK (capability_hash IS NULL OR length(capability_hash) = 32)",
+                [],
+            )?;
+        }
+        if had_ip_hashes && !had_key_id {
+            transaction.execute(
+                "ALTER TABLE ip_hashes ADD COLUMN key_id BLOB CHECK (key_id IS NULL OR length(key_id) = 32)",
+                [],
+            )?;
+        }
         transaction.execute(
             "INSERT OR IGNORE INTO global_budget(singleton, reserved_bytes) VALUES (1, 0)",
             [],
         )?;
+        if had_uploads && !had_capability_hash {
+            // Legacy sessions had no capability proof, so they cannot remain mutable.
+            transaction.execute(
+                "INSERT OR IGNORE INTO cleanup_outbox(session_id, relative_path, attempts) \
+                 SELECT id, upload_path, 0 FROM uploads \
+                 WHERE state IN ('reserved', 'receiving') AND upload_path IS NOT NULL",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE uploads SET state = 'expired', reserved_bytes = 0, capability_hash = NULL \
+                 WHERE state IN ('reserved', 'receiving')",
+                [],
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        ledger.validate_startup_invariants(&transaction)?;
         transaction.commit()?;
         Ok(ledger)
     }
@@ -234,6 +372,8 @@ impl UploadLedger {
         }
         let canonical_ip = normalize_ip(ip_key)?;
         let day = current_day_bucket();
+        let session_token = SessionToken::generate();
+        let capability_hash = session_token.hash();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let identity_id = self.resolve_identity(&transaction, &canonical_ip)?;
@@ -252,28 +392,44 @@ impl UploadLedger {
         if next_reserved > self.limits.max_global_reserved_bytes {
             return Err(LimitError::GlobalCapacityExceeded);
         }
-        if next_reserved > disk_reservation_limit(self.limits) {
-            return Err(LimitError::DiskSafetyMargin);
-        }
+        self.check_disk_capacity(requested)?;
+
+        let relative_path = format!(".fluxform-reservations/{}.upload", Uuid::new_v4());
+        let file_name = Path::new(&relative_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(LimitError::InvalidUploadPath)?
+            .to_owned();
+        let upload_path = self.upload_root.join(&relative_path);
+        let mut file_reservation = create_reserved_file(
+            Arc::clone(&self.reservation_directory),
+            &file_name,
+            requested,
+        )?;
+        self.check_disk_safety_margin()?;
 
         transaction.execute(
-            "INSERT INTO uploads(identity_id, state, reserved_bytes, actual_bytes, created_day) \
-             VALUES (?1, 'reserved', ?2, NULL, ?3)",
-            params![identity_id, to_sql_integer(requested)?, day],
+            "INSERT INTO uploads(identity_id, capability_hash, state, reserved_bytes, actual_bytes, created_day, upload_path) \
+             VALUES (?1, ?2, 'reserved', ?3, NULL, ?4, ?5)",
+            params![identity_id, capability_hash.as_slice(), to_sql_integer(requested)?, day, relative_path],
         )?;
         let session_id = transaction.last_insert_rowid();
         write_global_reserved(&transaction, next_reserved)?;
         transaction.commit()?;
+        file_reservation.commit();
         Ok(UploadReservation {
             session_id,
             reserved_bytes: requested,
             state: UploadState::Reserved,
+            session_token,
+            upload_path,
         })
     }
 
     pub fn expand(
         &self,
         session_id: i64,
+        capability: &SessionToken,
         required_total: u64,
     ) -> Result<UploadReservation, LimitError> {
         if required_total == 0 {
@@ -285,7 +441,9 @@ impl UploadLedger {
         let day = current_day_bucket();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, reserved, identity_id) = load_session(&transaction, session_id)?;
+        let (state, reserved, identity_id, relative_path) =
+            load_session(&transaction, session_id, capability)?;
+        let upload_path = self.reservation_path(relative_path.as_deref())?;
         if !state.is_reserved() {
             return Err(LimitError::InvalidTransition);
         }
@@ -295,6 +453,8 @@ impl UploadLedger {
                 session_id,
                 reserved_bytes: reserved,
                 state,
+                session_token: capability.clone(),
+                upload_path,
             });
         }
 
@@ -308,9 +468,19 @@ impl UploadLedger {
         if next_reserved > self.limits.max_global_reserved_bytes {
             return Err(LimitError::GlobalCapacityExceeded);
         }
-        if next_reserved > disk_reservation_limit(self.limits) {
-            return Err(LimitError::DiskSafetyMargin);
-        }
+        self.check_disk_capacity(delta)?;
+        let file_name = reservation_leaf(Path::new(
+            relative_path
+                .as_deref()
+                .ok_or(LimitError::AccountingInvariant)?,
+        ))
+        .map_err(|_| LimitError::InvalidUploadPath)?;
+        let mut file_reservation = resize_reserved_file(
+            Arc::clone(&self.reservation_directory),
+            &file_name,
+            required_total,
+        )?;
+        self.check_disk_safety_margin()?;
 
         let changed = transaction.execute(
             "UPDATE uploads SET reserved_bytes = ?1 WHERE id = ?2 AND state IN ('reserved', 'receiving')",
@@ -321,17 +491,25 @@ impl UploadLedger {
         }
         write_global_reserved(&transaction, next_reserved)?;
         transaction.commit()?;
+        file_reservation.commit();
         Ok(UploadReservation {
             session_id,
             reserved_bytes: required_total,
             state,
+            session_token: capability.clone(),
+            upload_path,
         })
     }
 
-    pub fn transition(&self, session_id: i64, target: UploadState) -> Result<(), LimitError> {
+    pub fn transition(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        target: UploadState,
+    ) -> Result<(), LimitError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, reserved, _) = load_session(&transaction, session_id)?;
+        let (state, reserved, _, _) = load_session(&transaction, session_id, capability)?;
         if !transition_is_legal(state, target) {
             return Err(LimitError::InvalidTransition);
         }
@@ -354,14 +532,19 @@ impl UploadLedger {
         Ok(())
     }
 
-    pub fn settle(&self, session_id: i64, actual_bytes: u64) -> Result<(), LimitError> {
+    pub fn settle(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        actual_bytes: u64,
+    ) -> Result<(), LimitError> {
         if actual_bytes > self.limits.max_file_bytes {
             return Err(LimitError::FileTooLarge);
         }
         let day = current_day_bucket();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, reserved, identity_id) = load_session(&transaction, session_id)?;
+        let (state, reserved, identity_id, _) = load_session(&transaction, session_id, capability)?;
         if state != UploadState::Receiving {
             return Err(LimitError::InvalidTransition);
         }
@@ -403,10 +586,10 @@ impl UploadLedger {
         Ok(())
     }
 
-    pub fn expire(&self, session_id: i64) -> Result<(), LimitError> {
+    pub fn expire(&self, session_id: i64, capability: &SessionToken) -> Result<(), LimitError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, reserved, _) = load_session(&transaction, session_id)?;
+        let (state, reserved, _, _) = load_session(&transaction, session_id, capability)?;
         if state == UploadState::Expired {
             transaction.commit()?;
             return Ok(());
@@ -425,25 +608,6 @@ impl UploadLedger {
             return Err(LimitError::AccountingInvariant);
         }
         enqueue_cleanup(&transaction, session_id)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn set_upload_path(&self, session_id: i64, relative_path: &Path) -> Result<(), LimitError> {
-        let relative_path = normalize_relative_path(relative_path)?;
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, _, _) = load_session(&transaction, session_id)?;
-        if state.is_terminal() || state == UploadState::Queued {
-            return Err(LimitError::InvalidTransition);
-        }
-        let changed = transaction.execute(
-            "UPDATE uploads SET upload_path = ?1 WHERE id = ?2 AND upload_path IS NULL",
-            params![relative_path, session_id],
-        )?;
-        if changed != 1 {
-            return Err(LimitError::InvalidTransition);
-        }
         transaction.commit()?;
         Ok(())
     }
@@ -499,17 +663,164 @@ impl UploadLedger {
         read_global_reserved(&self.connect()?)
     }
 
-    pub fn state(&self, session_id: i64) -> Result<UploadState, LimitError> {
+    pub fn state(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+    ) -> Result<UploadState, LimitError> {
         let connection = self.connect()?;
-        let state = connection
+        let row = connection
             .query_row(
-                "SELECT state FROM uploads WHERE id = ?1",
+                "SELECT state, capability_hash FROM uploads WHERE id = ?1",
                 [session_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
             )
             .optional()?
             .ok_or(LimitError::UnknownSession)?;
-        UploadState::from_str(&state)
+        if !row
+            .1
+            .as_ref()
+            .is_some_and(|stored| constant_time_equal(stored, &capability.hash()))
+        {
+            return Err(LimitError::Unauthorized);
+        }
+        UploadState::from_str(&row.0)
+    }
+
+    fn reservation_path(&self, relative: Option<&str>) -> Result<PathBuf, LimitError> {
+        let relative = relative.ok_or(LimitError::AccountingInvariant)?;
+        let normalized = normalize_relative_path(Path::new(relative))?;
+        if !normalized.starts_with(".fluxform-reservations/") {
+            return Err(LimitError::InvalidUploadPath);
+        }
+        Ok(self.upload_root.join(normalized))
+    }
+
+    fn check_disk_capacity(&self, additional: u64) -> Result<(), LimitError> {
+        let required = checked_add(additional, self.limits.disk_safety_margin_bytes)?;
+        let available = self
+            .disk_space
+            .available_bytes(&self.upload_root)
+            .map_err(LimitError::Filesystem)?;
+        if available < required {
+            return Err(LimitError::DiskSafetyMargin);
+        }
+        Ok(())
+    }
+
+    fn check_disk_safety_margin(&self) -> Result<(), LimitError> {
+        let available = self
+            .disk_space
+            .available_bytes(&self.upload_root)
+            .map_err(LimitError::Filesystem)?;
+        if available < self.limits.disk_safety_margin_bytes {
+            return Err(LimitError::DiskSafetyMargin);
+        }
+        Ok(())
+    }
+
+    fn validate_startup_invariants(&self, transaction: &Transaction<'_>) -> Result<(), LimitError> {
+        let active_reserved_sql: i64 = transaction.query_row(
+            "SELECT COALESCE(SUM(reserved_bytes), 0) FROM uploads \
+             WHERE state IN ('reserved', 'receiving')",
+            [],
+            |row| row.get(0),
+        )?;
+        let active_reserved = from_sql_integer(active_reserved_sql)?;
+        if active_reserved > self.limits.max_global_reserved_bytes {
+            return Err(LimitError::ExistingCommitmentsExceedLimits);
+        }
+
+        let active_files = {
+            let mut statement = transaction.prepare(
+                "SELECT reserved_bytes, upload_path FROM uploads \
+                 WHERE state IN ('reserved', 'receiving') ORDER BY id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (reserved_sql, relative) in active_files {
+            let reserved = from_sql_integer(reserved_sql)?;
+            if reserved > self.limits.max_file_bytes {
+                return Err(LimitError::ExistingCommitmentsExceedLimits);
+            }
+            let relative = relative.ok_or(LimitError::AccountingInvariant)?;
+            let file_name = reservation_leaf(Path::new(&relative))
+                .map_err(|_| LimitError::InvalidUploadPath)?;
+            let file = self
+                .reservation_directory
+                .open_file(&file_name, false)
+                .map_err(LimitError::Filesystem)?;
+            let file_size = file.metadata().map_err(LimitError::Filesystem)?.len();
+            if file_size < reserved || allocated_file_bytes(&file)? < reserved {
+                return Err(LimitError::AccountingInvariant);
+            }
+        }
+
+        let day = current_day_bucket();
+        let identity_commitments = {
+            let mut statement = transaction.prepare(
+                "SELECT identity_id, COALESCE(SUM(reserved_bytes), 0), COUNT(*) \
+                 FROM uploads WHERE state IN ('reserved', 'receiving') \
+                 GROUP BY identity_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (identity_id, reserved_sql, sessions_sql) in identity_commitments {
+            let reserved = from_sql_integer(reserved_sql)?;
+            let sessions = from_sql_integer(sessions_sql)?;
+            let used_sql = transaction
+                .query_row(
+                    "SELECT used_bytes FROM daily_usage WHERE identity_id = ?1 AND day = ?2",
+                    params![identity_id, day],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let used = from_sql_integer(used_sql)?;
+            if sessions > u64::from(self.limits.max_active_sessions_per_ip)
+                || checked_add(used, reserved)? > self.limits.daily_quota_bytes
+            {
+                return Err(LimitError::ExistingCommitmentsExceedLimits);
+            }
+        }
+
+        let over_quota_identities = {
+            let mut statement = transaction.prepare(
+                "SELECT identity_id, used_bytes FROM daily_usage WHERE day = ?1 AND used_bytes > ?2",
+            )?;
+            statement
+                .query_map(
+                    params![day, to_sql_integer(self.limits.daily_quota_bytes)?],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !over_quota_identities.is_empty() {
+            return Err(LimitError::ExistingCommitmentsExceedLimits);
+        }
+
+        validate_secret_retention(transaction, &self.secrets, day)?;
+
+        let current_reserved = read_global_reserved(transaction)?;
+        if current_reserved != active_reserved {
+            write_global_reserved(transaction, active_reserved)?;
+        }
+        if active_reserved > 0 {
+            self.check_disk_safety_margin()?;
+        }
+        Ok(())
     }
 
     fn connect(&self) -> Result<Connection, LimitError> {
@@ -555,32 +866,24 @@ impl UploadLedger {
         for secret in &self.secrets {
             let hash = hmac_ip(secret, canonical_ip);
             transaction.execute(
-                "INSERT OR IGNORE INTO ip_hashes(identity_id, ip_hash) VALUES (?1, ?2)",
-                params![identity_id, hash],
+                "INSERT OR IGNORE INTO ip_hashes(identity_id, ip_hash, key_id) VALUES (?1, ?2, ?3)",
+                params![identity_id, hash, secret_key_id(secret).as_slice()],
             )?;
         }
         Ok(identity_id)
     }
 
     fn remove_upload_file(&self, relative: &Path) -> io::Result<()> {
-        let target = self.upload_root.join(relative);
-        let parent = target.parent().unwrap_or(&self.upload_root);
-        let canonical_parent = match fs::canonicalize(parent) {
-            Ok(path) => path,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        if !canonical_parent.starts_with(&self.upload_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path escaped root",
-            ));
-        }
-        match fs::remove_file(target) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.remove_upload_file_with_hook(relative, || {})
+    }
+
+    fn remove_upload_file_with_hook<F>(&self, relative: &Path, before_remove: F) -> io::Result<()>
+    where
+        F: FnOnce(),
+    {
+        let leaf = reservation_leaf(relative)?;
+        before_remove();
+        self.reservation_directory.remove_file(&leaf)
     }
 }
 
@@ -592,7 +895,6 @@ fn validate_limits(limits: LedgerLimits) -> Result<(), LimitError> {
         limits.max_file_bytes,
         limits.daily_quota_bytes,
         limits.max_global_reserved_bytes,
-        limits.disk_available_bytes,
         limits.disk_safety_margin_bytes,
     ] {
         to_sql_integer(value).map_err(|_| LimitError::InvalidConfiguration)?;
@@ -636,26 +938,578 @@ fn transition_is_legal(from: UploadState, to: UploadState) -> bool {
 fn load_session(
     transaction: &Transaction<'_>,
     session_id: i64,
-) -> Result<(UploadState, u64, i64), LimitError> {
+    capability: &SessionToken,
+) -> Result<(UploadState, u64, i64, Option<String>), LimitError> {
     let row = transaction
         .query_row(
-            "SELECT state, reserved_bytes, identity_id FROM uploads WHERE id = ?1",
+            "SELECT state, reserved_bytes, identity_id, capability_hash, upload_path FROM uploads WHERE id = ?1",
             [session_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?
         .ok_or(LimitError::UnknownSession)?;
+    if !row
+        .3
+        .as_ref()
+        .is_some_and(|stored| constant_time_equal(stored, &capability.hash()))
+    {
+        return Err(LimitError::Unauthorized);
+    }
     Ok((
         UploadState::from_str(&row.0)?,
         from_sql_integer(row.1)?,
         row.2,
+        row.4,
     ))
+}
+
+fn reservation_leaf(relative: &Path) -> io::Result<String> {
+    let mut components = relative.components();
+    let Some(Component::Normal(directory)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid reservation path",
+        ));
+    };
+    if directory != ".fluxform-reservations" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid reservation directory",
+        ));
+    }
+    let Some(Component::Normal(leaf)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid reservation filename",
+        ));
+    };
+    if components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nested reservation path",
+        ));
+    }
+    let leaf = leaf
+        .to_str()
+        .filter(|leaf| !leaf.is_empty() && !leaf.contains('\0'))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid reservation filename")
+        })?;
+    Ok(leaf.to_owned())
+}
+
+impl SecureReservationDirectory {
+    #[cfg(unix)]
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(Self { handle })
+    }
+
+    #[cfg(unix)]
+    fn open_file(&self, leaf: &str, create_new: bool) -> io::Result<fs::File> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let leaf = CString::new(leaf)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"))?;
+        let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if create_new {
+            flags |= libc::O_CREAT | libc::O_EXCL;
+        }
+        let fd = unsafe { libc::openat(self.handle.as_raw_fd(), leaf.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    #[cfg(windows)]
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+
+        #[repr(C)]
+        struct FileAttributeTagInfo {
+            attributes: u32,
+            reparse_tag: u32,
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                filename: *const u16,
+                desired_access: u32,
+                share_mode: u32,
+                security_attributes: *mut std::ffi::c_void,
+                creation_disposition: u32,
+                flags_and_attributes: u32,
+                template_file: *mut std::ffi::c_void,
+            ) -> *mut std::ffi::c_void;
+            fn GetFileInformationByHandleEx(
+                file: *mut std::ffi::c_void,
+                info_class: i32,
+                info: *mut std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0x0001 | 0x0002 | 0x0020 | 0x0040 | 0x0080 | 0x0010_0000,
+                0x0001 | 0x0002 | 0x0004,
+                std::ptr::null_mut(),
+                3,
+                0x0200_0000 | 0x0020_0000,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut tag_info = FileAttributeTagInfo {
+            attributes: 0,
+            reparse_tag: 0,
+        };
+        let valid = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                9,
+                (&mut tag_info as *mut FileAttributeTagInfo).cast(),
+                std::mem::size_of::<FileAttributeTagInfo>() as u32,
+            )
+        } != 0;
+        if !valid {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+        if tag_info.attributes & 0x10 == 0 || tag_info.attributes & 0x400 != 0 {
+            unsafe { CloseHandle(handle) };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reservation path is not a non-reparse directory",
+            ));
+        }
+        let handle = unsafe { fs::File::from_raw_handle(handle) };
+        Ok(Self { handle })
+    }
+
+    #[cfg(windows)]
+    fn open_file(&self, leaf: &str, create_new: bool) -> io::Result<fs::File> {
+        windows_open_relative_file(&self.handle, leaf, create_new, false)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure reservation directory handles are unsupported",
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open_file(&self, _leaf: &str, _create_new: bool) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure relative file access is unsupported",
+        ))
+    }
+
+    fn remove_file(&self, leaf: &str) -> io::Result<()> {
+        secure_unlink(&self.handle, leaf)
+    }
+}
+
+#[cfg(unix)]
+fn secure_unlink(directory: &fs::File, leaf: &str) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let leaf = CString::new(leaf)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"))?;
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn windows_open_relative_file(
+    directory: &fs::File,
+    leaf: &str,
+    create_new: bool,
+    delete_access: bool,
+) -> io::Result<fs::File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: *mut std::ffi::c_void,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: *mut std::ffi::c_void,
+        information: usize,
+    }
+    #[repr(C)]
+    struct FileAttributeTagInfo {
+        attributes: u32,
+        reparse_tag: u32,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut *mut std::ffi::c_void,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            info_class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    if leaf.is_empty() || leaf.contains(['\\', '/']) || leaf.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid filename",
+        ));
+    }
+    let mut name: Vec<u16> = leaf.encode_utf16().collect();
+    let byte_len = u16::try_from(name.len().saturating_mul(2))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filename too long"))?;
+    let mut unicode_name = UnicodeString {
+        length: byte_len,
+        maximum_length: byte_len,
+        buffer: name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.as_raw_handle().cast(),
+        object_name: &mut unicode_name,
+        attributes: 0x40 | 0x1000,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status_block = IoStatusBlock {
+        status: std::ptr::null_mut(),
+        information: 0,
+    };
+    let mut raw_file = std::ptr::null_mut();
+    let desired_access = if delete_access {
+        0x0001_0000 | 0x0080 | 0x0010_0000
+    } else {
+        0x0002 | 0x0080 | 0x0100 | 0x0010_0000
+    };
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw_file,
+            desired_access,
+            &mut attributes,
+            &mut status_block,
+            std::ptr::null_mut(),
+            0x80,
+            0x0001 | 0x0002 | 0x0004,
+            if create_new { 2 } else { 1 },
+            0x40 | 0x20 | 0x0020_0000,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let file = unsafe { fs::File::from_raw_handle(raw_file) };
+    let mut tag_info = FileAttributeTagInfo {
+        attributes: 0,
+        reparse_tag: 0,
+    };
+    let valid = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            9,
+            (&mut tag_info as *mut FileAttributeTagInfo).cast(),
+            std::mem::size_of::<FileAttributeTagInfo>() as u32,
+        )
+    } != 0;
+    if !valid {
+        return Err(io::Error::last_os_error());
+    }
+    if tag_info.attributes & (0x10 | 0x400) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to open a directory or reparse point as a reservation file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn secure_unlink(directory: &fs::File, leaf: &str) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: *mut std::ffi::c_void,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: *mut std::ffi::c_void,
+        information: usize,
+    }
+    #[repr(C)]
+    struct FileAttributeTagInfo {
+        attributes: u32,
+        reparse_tag: u32,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut *mut std::ffi::c_void,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            info_class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+        fn SetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            class: i32,
+            info: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut name: Vec<u16> = leaf.encode_utf16().collect();
+    let byte_len = u16::try_from(name.len().saturating_mul(2))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filename too long"))?;
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid filename",
+        ));
+    }
+    let mut unicode_name = UnicodeString {
+        length: byte_len,
+        maximum_length: byte_len,
+        buffer: name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.as_raw_handle().cast(),
+        object_name: &mut unicode_name,
+        attributes: 0x40 | 0x1000,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status_block = IoStatusBlock {
+        status: std::ptr::null_mut(),
+        information: 0,
+    };
+    let mut raw_file = std::ptr::null_mut();
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw_file,
+            0x0001_0000 | 0x0080 | 0x0010_0000,
+            &mut attributes,
+            &mut status_block,
+            std::ptr::null_mut(),
+            0x80,
+            0x0001 | 0x0002 | 0x0004,
+            1,
+            0x40 | 0x20 | 0x0020_0000,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status == 0xC000_0034u32 as i32 || status == 0xC000_003Au32 as i32 {
+        return Ok(());
+    }
+    if status < 0 {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let file = unsafe { fs::File::from_raw_handle(raw_file) };
+    let mut tag_info = FileAttributeTagInfo {
+        attributes: 0,
+        reparse_tag: 0,
+    };
+    let valid = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            9,
+            (&mut tag_info as *mut FileAttributeTagInfo).cast(),
+            std::mem::size_of::<FileAttributeTagInfo>() as u32,
+        )
+    } != 0;
+    if !valid {
+        return Err(io::Error::last_os_error());
+    }
+    if tag_info.attributes & (0x10 | 0x400) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to remove a directory or reparse point",
+        ));
+    }
+    let delete_file = 1u8;
+    let deleted = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            4,
+            (&delete_file as *const u8).cast(),
+            std::mem::size_of::<u8>() as u32,
+        )
+    } != 0;
+    if deleted {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn secure_unlink(_directory: &fs::File, _leaf: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure relative deletion is unsupported on this platform",
+    ))
+}
+
+fn table_exists(transaction: &Transaction<'_>, name: &str) -> Result<bool, LimitError> {
+    let exists: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn table_has_column(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> Result<bool, LimitError> {
+    if !matches!(table, "uploads" | "ip_hashes") {
+        return Err(LimitError::AccountingInvariant);
+    }
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|name| name == column))
+}
+
+fn validate_secret_retention(
+    transaction: &Transaction<'_>,
+    secrets: &[[u8; 32]],
+    day: i64,
+) -> Result<(), LimitError> {
+    let active_key_ids: std::collections::HashSet<[u8; 32]> =
+        secrets.iter().map(secret_key_id).collect();
+    let required_identities = {
+        let mut statement = transaction.prepare(
+            "SELECT identity_id FROM uploads WHERE state IN ('reserved', 'receiving') \
+             UNION SELECT identity_id FROM daily_usage WHERE day = ?1 AND used_bytes > 0",
+        )?;
+        statement
+            .query_map([day], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for identity_id in required_identities {
+        let stored_key_ids = {
+            let mut statement =
+                transaction.prepare("SELECT key_id FROM ip_hashes WHERE identity_id = ?1")?;
+            statement
+                .query_map([identity_id], |row| row.get::<_, Option<Vec<u8>>>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let has_active_key = stored_key_ids.iter().flatten().any(|key_id| {
+            <[u8; 32]>::try_from(key_id.as_slice())
+                .map(|key_id| active_key_ids.contains(&key_id))
+                .unwrap_or(false)
+        });
+        if !has_active_key {
+            return Err(LimitError::SecretRetentionRequired);
+        }
+    }
+    Ok(())
 }
 
 fn identity_usage(
@@ -773,12 +1627,6 @@ fn current_day_bucket() -> i64 {
     i64::try_from(seconds / 86_400).unwrap_or(i64::MAX)
 }
 
-fn disk_reservation_limit(limits: LedgerLimits) -> u64 {
-    limits
-        .disk_available_bytes
-        .saturating_sub(limits.disk_safety_margin_bytes)
-}
-
 fn checked_add(left: u64, right: u64) -> Result<u64, LimitError> {
     left.checked_add(right)
         .ok_or(LimitError::AccountingInvariant)
@@ -816,4 +1664,322 @@ fn hmac_ip(secret: &[u8; 32], canonical_ip: &str) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+struct ReservationFileGuard {
+    directory: Arc<SecureReservationDirectory>,
+    file_name: String,
+    previous_size: Option<u64>,
+    committed: bool,
+}
+
+impl ReservationFileGuard {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ReservationFileGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(previous_size) = self.previous_size {
+            if let Ok(file) = self.directory.open_file(&self.file_name, false) {
+                let _ = set_file_allocation(&file, previous_size);
+            }
+        } else {
+            let _ = self.directory.remove_file(&self.file_name);
+        }
+    }
+}
+
+fn create_reserved_file(
+    directory: Arc<SecureReservationDirectory>,
+    file_name: &str,
+    size: u64,
+) -> Result<ReservationFileGuard, LimitError> {
+    let file = directory
+        .open_file(file_name, true)
+        .map_err(LimitError::Filesystem)?;
+    let guard = ReservationFileGuard {
+        directory,
+        file_name: file_name.to_owned(),
+        previous_size: None,
+        committed: false,
+    };
+    set_file_allocation(&file, size).map_err(LimitError::Filesystem)?;
+    Ok(guard)
+}
+
+fn resize_reserved_file(
+    directory: Arc<SecureReservationDirectory>,
+    file_name: &str,
+    size: u64,
+) -> Result<ReservationFileGuard, LimitError> {
+    let file = directory
+        .open_file(file_name, false)
+        .map_err(LimitError::Filesystem)?;
+    let previous_size = file.metadata().map_err(LimitError::Filesystem)?.len();
+    let guard = ReservationFileGuard {
+        directory,
+        file_name: file_name.to_owned(),
+        previous_size: Some(previous_size),
+        committed: false,
+    };
+    set_file_allocation(&file, size).map_err(LimitError::Filesystem)?;
+    Ok(guard)
+}
+
+#[cfg(unix)]
+fn allocated_file_bytes(file: &fs::File) -> Result<u64, LimitError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let blocks = file.metadata().map_err(LimitError::Filesystem)?.blocks();
+    Ok(blocks.saturating_mul(512))
+}
+
+#[cfg(windows)]
+fn allocated_file_bytes(file: &fs::File) -> Result<u64, LimitError> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileStandardInfo {
+        allocation_size: i64,
+        end_of_file: i64,
+        number_of_links: u32,
+        delete_pending: u8,
+        directory: u8,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            info_class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut info = FileStandardInfo {
+        allocation_size: 0,
+        end_of_file: 0,
+        number_of_links: 0,
+        delete_pending: 0,
+        directory: 0,
+    };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            1,
+            (&mut info as *mut FileStandardInfo).cast(),
+            std::mem::size_of::<FileStandardInfo>() as u32,
+        )
+    };
+    if ok == 0 || info.allocation_size < 0 {
+        return Err(LimitError::Filesystem(io::Error::last_os_error()));
+    }
+    Ok(info.allocation_size as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_file_bytes(file: &fs::File) -> Result<u64, LimitError> {
+    Ok(file.metadata().map_err(LimitError::Filesystem)?.len())
+}
+
+#[cfg(windows)]
+fn set_file_allocation(file: &fs::File, size: u64) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileAllocationInfo {
+        allocation_size: i64,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            class: i32,
+            info: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    let allocation_size = i64::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "allocation too large"))?;
+    file.set_len(size)?;
+    let info = FileAllocationInfo { allocation_size };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            5,
+            (&info as *const FileAllocationInfo).cast(),
+            std::mem::size_of::<FileAllocationInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_allocation(file: &fs::File, size: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let length = i64::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "allocation too large"))?;
+    file.set_len(size)?;
+    let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_file_allocation(_file: &fs::File, _size: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "physical file allocation is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn system_available_bytes(path: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            available_to_caller: *mut u64,
+            total_bytes: *mut u64,
+            free_bytes: *mut u64,
+        ) -> i32;
+    }
+
+    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    path.push(0);
+    let mut available = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available)
+    }
+}
+
+#[cfg(unix)]
+fn system_available_bytes(path: &Path) -> io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    let bytes = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn system_available_bytes(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "free-space queries are unsupported on this platform",
+    ))
+}
+
+fn secret_key_id(secret: &[u8; 32]) -> [u8; 32] {
+    Sha256::digest(secret).into()
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8; 32]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+#[cfg(test)]
+mod cleanup_security_tests {
+    use super::*;
+
+    fn test_limits() -> LedgerLimits {
+        LedgerLimits {
+            max_file_bytes: 4,
+            daily_quota_bytes: 20,
+            max_active_sessions_per_ip: 2,
+            max_global_reserved_bytes: 20,
+            disk_safety_margin_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn cleanup_does_not_follow_a_directory_link_swapped_after_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let attacker_dir = temp.path().join("attacker");
+        fs::create_dir(&upload_root).unwrap();
+        fs::create_dir(&attacker_dir).unwrap();
+        let ledger = UploadLedger::open(
+            temp.path().join("ledger.sqlite3"),
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let reservation = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+        let leaf = reservation.upload_path.file_name().unwrap();
+        let relative = Path::new(".fluxform-reservations").join(leaf);
+        let attacker_file = attacker_dir.join(leaf);
+        fs::write(&attacker_file, b"must survive").unwrap();
+        let reservations_dir = upload_root.join(".fluxform-reservations");
+        let moved_dir = upload_root.join(".fluxform-reservations-pinned");
+
+        ledger
+            .remove_upload_file_with_hook(&relative, || {
+                fs::rename(&reservations_dir, &moved_dir).unwrap();
+                create_directory_link(&attacker_dir, &reservations_dir);
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(attacker_file).unwrap(), b"must survive");
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction creation failed: {output:?}"
+        );
+    }
 }
