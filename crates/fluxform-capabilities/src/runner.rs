@@ -128,13 +128,12 @@ pub fn build_ffmpeg_arguments(edge: &ConversionEdgeV1, input: &str, output: &str
         "-y".to_owned(),
     ];
     if edge.category != ConversionCategory::Audio {
-        arguments.extend([
-            "-autorotate".to_owned(),
-            match edge.orientation_policy {
-                OrientationPolicy::ApplyToPixels => "1".to_owned(),
-                OrientationPolicy::PreserveTag | OrientationPolicy::Ignore => "0".to_owned(),
-            },
-        ]);
+        arguments.push(match edge.orientation_policy {
+            OrientationPolicy::ApplyToPixels => "-autorotate".to_owned(),
+            OrientationPolicy::PreserveTag | OrientationPolicy::Ignore => {
+                "-noautorotate".to_owned()
+            }
+        });
     }
     arguments.extend(["-i".to_owned(), input.to_owned()]);
     for mapping in &edge.stream_map {
@@ -1584,7 +1583,7 @@ mod tests {
         observed_media, tiff_page_count, validate_output, validate_sample_input,
         webp_animation_properties,
     };
-    use crate::{CapabilityManifestV1, samples::SampleCatalogV1};
+    use crate::{CapabilityManifestV1, OrientationPolicy, samples::SampleCatalogV1};
     use serde_json::Value;
     use std::path::Path;
 
@@ -1663,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_orientation_boolean_is_passed_as_an_explicit_input_option_value() {
+    fn ffmpeg_orientation_policy_uses_switch_form_before_input() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifest = CapabilityManifestV1::load(root.join("config/capabilities-v1.toml"))
             .expect("approved product-scope manifest");
@@ -1677,8 +1676,16 @@ mod tests {
             .iter()
             .position(|argument| argument == "-autorotate")
             .expect("FFmpeg autorotate option");
-        assert_eq!(arguments[flag + 1], "1");
-        assert_eq!(arguments[flag + 2], "-i");
+        assert_eq!(arguments[flag + 1], "-i");
+
+        let mut preserve_tag_edge = edge.clone();
+        preserve_tag_edge.orientation_policy = OrientationPolicy::PreserveTag;
+        let arguments = build_ffmpeg_arguments(&preserve_tag_edge, "input.mov", "output.mp4");
+        let flag = arguments
+            .iter()
+            .position(|argument| argument == "-noautorotate")
+            .expect("FFmpeg noautorotate option");
+        assert_eq!(arguments[flag + 1], "-i");
     }
 
     #[test]
