@@ -299,6 +299,35 @@ mod linux {
     }
 
     #[test]
+    fn task_permission_change_while_waiting_for_placement_fails_closed_before_tool_fork() {
+        let fixture = Fixture::new();
+        let (placement, mut ready, mut release) = barrier();
+        let mut child = Sandbox::spawn_blocked(
+            &fixture.child,
+            &["write-task".into()],
+            &fixture.policy(),
+            placement,
+        )
+        .expect("spawn blocked supervisor");
+
+        let mut pid_bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        ready.read_exact(&mut pid_bytes).expect("receive ready pid");
+        assert_eq!(libc::pid_t::from_ne_bytes(pid_bytes) as u32, child.id());
+        fs::set_permissions(&fixture.job_dir, fs::Permissions::from_mode(0o770))
+            .expect("loosen task permissions while supervisor waits");
+        release.write_all(&[1]).expect("confirm resource placement");
+
+        assert_eq!(
+            child
+                .wait()
+                .expect("wait for fail-closed supervisor")
+                .code(),
+            Some(125)
+        );
+        assert!(!fixture.job_dir.join("result.bin").exists());
+    }
+
+    #[test]
     fn tool_name_replacement_while_waiting_for_placement_fails_closed() {
         let fixture = Fixture::new();
         let (placement, mut ready, mut release) = barrier();

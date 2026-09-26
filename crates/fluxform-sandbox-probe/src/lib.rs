@@ -132,6 +132,11 @@ impl Default for SandboxLimits {
 }
 
 /// Paths and resource limits declared by the trusted server for one job.
+///
+/// On Linux, `job_dir` must be a private empty directory owned by the
+/// effective UID/GID, with mode exactly `0700`, link count `2`, and no nested
+/// mount. The probe pins and revalidates those properties, but the current
+/// interface cannot attest who created the directory or prove its provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxPolicy {
     pub input: PathBuf,
@@ -197,6 +202,23 @@ pub enum SandboxError {
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaskDirectorySnapshot {
+    identity: FileIdentity,
+    owner_uid: u32,
+    owner_gid: u32,
+    mode: u32,
+    link_count: u64,
+    mount_id: u64,
 }
 
 #[cfg(any(
@@ -291,6 +313,35 @@ fn validate_empty_task_snapshot(
 ) -> Result<(), &'static str> {
     if expected_identity != actual_identity || entry_count != 0 {
         return Err("task directory changed or was not empty");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_private_task_snapshot(
+    snapshot: &TaskDirectorySnapshot,
+    expected_identity: FileIdentity,
+    expected_mount_id: u64,
+    expected_owner_uid: u32,
+    expected_owner_gid: u32,
+    entry_count: usize,
+) -> Result<(), &'static str> {
+    if snapshot.identity != expected_identity
+        || snapshot.mount_id != expected_mount_id
+        || snapshot.owner_uid != expected_owner_uid
+        || snapshot.owner_gid != expected_owner_gid
+        || snapshot.mode & 0o170000 != 0o040000
+        || snapshot.mode & 0o7777 != 0o700
+        || snapshot.link_count != 2
+        || entry_count != 0
+    {
+        return Err("task directory must remain private, owned, empty, and on its pinned mount");
     }
     Ok(())
 }
@@ -774,6 +825,8 @@ mod linux {
         directory_chain: Vec<FileIdentity>,
         link_count: u64,
         mode: libc::mode_t,
+        owner_uid: u32,
+        owner_gid: u32,
         mount_id: u64,
         signature: LinuxFileSignature,
     }
@@ -819,8 +872,8 @@ mod linux {
             Err(error) => ProbeEvidence::failed(format!("temporary root creation failed: {error}")),
         };
         let probe_root = TempRoot::create().ok();
-        let host_uid = unsafe { libc::getuid() };
-        let host_gid = unsafe { libc::getgid() };
+        let host_uid = unsafe { libc::geteuid() };
+        let host_gid = unsafe { libc::getegid() };
 
         let user_namespace = probe_result(
             run_probe(ProbeKind::UserNamespace, None, host_uid, host_gid),
@@ -1286,9 +1339,14 @@ mod linux {
             .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
 
         let task_read_fd = open_task_reader(&task)?;
-        if !task_directory_is_empty(task_read_fd.as_raw_fd(), task.identity)? {
+        if !task_directory_is_empty(
+            task_read_fd.as_raw_fd(),
+            &task,
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )? {
             return Err(SandboxError::InvalidPolicy(
-                "task directory must be empty when a sandbox is prepared".into(),
+                "task directory must be empty, mode 0700, and owned by the current effective user and group when a sandbox is prepared".into(),
             ));
         }
         let tool_inventory = collect_tool_inventory(&tool, input.identity)?;
@@ -1358,8 +1416,8 @@ mod linux {
         let input_source = proc_fd_path(input.fd.as_raw_fd())?;
         let task_source = proc_fd_path(task.fd.as_raw_fd())?;
         let tool_source = proc_fd_path(tool.fd.as_raw_fd())?;
-        let host_uid = unsafe { libc::getuid() };
-        let host_gid = unsafe { libc::getgid() };
+        let host_uid = unsafe { libc::geteuid() };
+        let host_gid = unsafe { libc::getegid() };
         let uid_map = map_line(host_uid);
         let gid_map = map_line(host_gid);
         let uid_map = CString::new(uid_map).expect("generated uid map contains no NUL");
@@ -1692,6 +1750,8 @@ mod linux {
             directory_chain,
             link_count,
             mode: final_stat.st_mode,
+            owner_uid: final_stat.st_uid,
+            owner_gid: final_stat.st_gid,
             mount_id,
             signature: signature_from_stat(&final_stat),
         })
@@ -1923,11 +1983,19 @@ mod linux {
         }
     }
 
-    fn task_directory_is_empty(fd: RawFd, expected: FileIdentity) -> Result<bool, SandboxError> {
-        let result = unsafe { task_directory_is_empty_raw(fd, expected) };
+    fn task_directory_is_empty(
+        fd: RawFd,
+        task: &PinnedPath,
+        expected_owner_uid: u32,
+        expected_owner_gid: u32,
+    ) -> Result<bool, SandboxError> {
+        let result = unsafe {
+            task_directory_is_empty_raw(fd, task, expected_owner_uid, expected_owner_gid)
+        };
         match result {
             1 => Ok(true),
             0 => Ok(false),
+            _ if io::Error::last_os_error().raw_os_error() == Some(libc::ESTALE) => Ok(false),
             _ => Err(SandboxError::Io {
                 operation: "verify task directory is empty",
                 source: io::Error::last_os_error(),
@@ -1935,13 +2003,45 @@ mod linux {
         }
     }
 
-    unsafe fn task_directory_is_empty_raw(fd: RawFd, expected: FileIdentity) -> i32 {
+    unsafe fn task_directory_is_empty_raw(
+        fd: RawFd,
+        task: &PinnedPath,
+        expected_owner_uid: u32,
+        expected_owner_gid: u32,
+    ) -> i32 {
         let mut metadata: libc::stat = zeroed();
         if libc::fstat(fd, &mut metadata) != 0 {
             return -1;
         }
-        if identity_from_stat(&metadata) != expected
-            || metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        let actual = signature_from_stat(&metadata);
+        let actual_snapshot = TaskDirectorySnapshot {
+            identity: actual.identity,
+            owner_uid: metadata.st_uid,
+            owner_gid: metadata.st_gid,
+            mode: metadata.st_mode,
+            link_count: metadata.st_nlink as u64,
+            mount_id: task.mount_id,
+        };
+        if actual.identity != task.signature.identity
+            || actual.link_count != task.signature.link_count
+            || actual.mode != task.signature.mode
+            || actual.size != task.signature.size
+            || actual.mtime_sec != task.signature.mtime_sec
+            || actual.mtime_nsec != task.signature.mtime_nsec
+            || actual.ctime_sec != task.signature.ctime_sec
+            || actual.ctime_nsec != task.signature.ctime_nsec
+            || (expected_owner_uid != task.owner_uid && expected_owner_uid != 0)
+            || (expected_owner_gid != task.owner_gid && expected_owner_gid != 0)
+            || validate_private_task_snapshot(
+                &actual_snapshot,
+                task.identity,
+                task.mount_id,
+                expected_owner_uid,
+                expected_owner_gid,
+                0,
+            )
+            .is_err()
+            || mount_id_matches(fd, task.mount_id) != 0
         {
             *libc::__errno_location() = libc::ESTALE;
             return -1;
@@ -2185,7 +2285,7 @@ mod linux {
         if revalidate_pinned_path(spec.task, libc::S_IFDIR) != 0 {
             return -1;
         }
-        match task_directory_is_empty_raw(spec.task_read_fd, spec.task.identity) {
+        match task_directory_is_empty_raw(spec.task_read_fd, spec.task, 0, 0) {
             1 => {}
             0 => {
                 *libc::__errno_location() = libc::ESTALE;
@@ -2267,7 +2367,7 @@ mod linux {
             fail_and_exit(spec.report_fd, STAGE_BIND_RO, errno());
         }
         if revalidate_pinned_path(spec.task, libc::S_IFDIR) != 0
-            || task_directory_is_empty_raw(spec.task_read_fd, spec.task.identity) != 1
+            || task_directory_is_empty_raw(spec.task_read_fd, spec.task, 0, 0) != 1
             || mount_bind(&spec.task_source, &spec.root.task) != 0
         {
             fail_and_exit(spec.report_fd, STAGE_BIND_TASK, errno());
@@ -3031,14 +3131,147 @@ mod linux {
             let root = tempfile::tempdir().expect("fixture root");
             let task_path = root.path().join("task");
             fs::create_dir(&task_path).expect("task directory");
+            fs::set_permissions(&task_path, fs::Permissions::from_mode(0o700))
+                .expect("make task directory private");
             let task = open_pinned_path(&task_path, true, "task directory").expect("pin task");
             let reader = open_task_reader(&task).expect("open task reader");
             assert!(
-                task_directory_is_empty(reader.as_raw_fd(), task.identity).expect("empty check")
+                task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("empty check")
             );
 
             fs::write(task_path.join("raced-file"), b"untrusted").expect("mutate task directory");
-            assert!(!task_directory_is_empty(reader.as_raw_fd(), task.identity).expect("recheck"));
+            assert!(
+                !task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("recheck")
+            );
+        }
+
+        #[test]
+        fn task_directory_rejects_group_or_world_access_modes() {
+            for mode in [0o777, 0o770] {
+                let root = tempfile::tempdir().expect("fixture root");
+                let task_path = root.path().join("task");
+                fs::create_dir(&task_path).expect("task directory");
+                fs::set_permissions(&task_path, fs::Permissions::from_mode(mode))
+                    .expect("set insecure task mode");
+                let task = open_pinned_path(&task_path, true, "task directory").expect("pin task");
+                let reader = open_task_reader(&task).expect("open task reader");
+
+                assert!(
+                    !task_directory_is_empty(
+                        reader.as_raw_fd(),
+                        &task,
+                        unsafe { libc::geteuid() },
+                        unsafe { libc::getegid() },
+                    )
+                    .expect("inspect insecure directory"),
+                    "mode {mode:o} must fail the private task-directory precondition"
+                );
+            }
+        }
+
+        #[test]
+        fn task_directory_mode_change_after_readiness_fails_revalidation() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let task_path = root.path().join("task");
+            fs::create_dir(&task_path).expect("task directory");
+            fs::set_permissions(&task_path, fs::Permissions::from_mode(0o700))
+                .expect("make task directory private");
+            let task = open_pinned_path(&task_path, true, "task directory").expect("pin task");
+            let reader = open_task_reader(&task).expect("open task reader");
+            assert!(
+                task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("initial check")
+            );
+
+            fs::set_permissions(&task_path, fs::Permissions::from_mode(0o770))
+                .expect("loosen task mode after readiness");
+            assert!(
+                !task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("revalidate changed task directory"),
+                "chmod after readiness must fail closed"
+            );
+        }
+
+        #[test]
+        fn task_directory_subdirectory_insertion_changes_link_count_and_fails_revalidation() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let task_path = root.path().join("task");
+            fs::create_dir(&task_path).expect("task directory");
+            fs::set_permissions(&task_path, fs::Permissions::from_mode(0o700))
+                .expect("make task directory private");
+            let task = open_pinned_path(&task_path, true, "task directory").expect("pin task");
+            let reader = open_task_reader(&task).expect("open task reader");
+            assert!(
+                task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("initial check")
+            );
+
+            fs::create_dir(task_path.join("nested")).expect("insert task subdirectory");
+            assert!(
+                !task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("revalidate task directory"),
+                "a nested directory must fail the nlink=2 private snapshot"
+            );
+        }
+
+        #[test]
+        fn task_directory_rejects_foreign_owner_when_chown_is_permitted() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let task_path = root.path().join("task");
+            fs::create_dir(&task_path).expect("task directory");
+            fs::set_permissions(&task_path, fs::Permissions::from_mode(0o700))
+                .expect("make task directory private");
+            let foreign_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+            if unsafe { libc::chown(c_path(&task_path).unwrap().as_ptr(), foreign_uid, u32::MAX) }
+                != 0
+            {
+                return;
+            }
+            let task = open_pinned_path(&task_path, true, "task directory").expect("pin task");
+            let reader = open_task_reader(&task).expect("open task reader");
+
+            assert!(
+                !task_directory_is_empty(
+                    reader.as_raw_fd(),
+                    &task,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+                .expect("inspect foreign-owned directory"),
+                "a directory not owned by the current effective UID must fail closed"
+            );
         }
 
         #[test]
@@ -3208,6 +3441,49 @@ mod review_regression_tests {
         assert!(validate_empty_task_snapshot(identity(20), identity(20), 0).is_ok());
         assert!(validate_empty_task_snapshot(identity(20), identity(20), 1).is_err());
         assert!(validate_empty_task_snapshot(identity(20), identity(21), 0).is_err());
+    }
+
+    #[test]
+    fn private_task_snapshot_requires_current_owner_private_mode_two_links_and_same_mount() {
+        let valid = TaskDirectorySnapshot {
+            identity: identity(20),
+            owner_uid: 1000,
+            owner_gid: 1000,
+            mode: 0o40700,
+            link_count: 2,
+            mount_id: 55,
+        };
+        assert!(validate_private_task_snapshot(&valid, identity(20), 55, 1000, 1000, 0).is_ok());
+
+        for mode in [0o40777, 0o40770] {
+            let mut changed = valid;
+            changed.mode = mode;
+            assert!(
+                validate_private_task_snapshot(&changed, identity(20), 55, 1000, 1000, 0).is_err(),
+                "mode {mode:o} must not satisfy the private-directory contract"
+            );
+        }
+
+        for link_count in [1, 3] {
+            let mut changed = valid;
+            changed.link_count = link_count;
+            assert!(
+                validate_private_task_snapshot(&changed, identity(20), 55, 1000, 1000, 0).is_err(),
+                "link count {link_count} must not satisfy the empty-directory contract"
+            );
+        }
+
+        for (uid, gid, mount, entries) in [
+            (1001, 1000, 55, 0),
+            (1000, 1001, 55, 0),
+            (1000, 1000, 56, 0),
+            (1000, 1000, 55, 1),
+        ] {
+            assert!(
+                validate_private_task_snapshot(&valid, identity(20), mount, uid, gid, entries,)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
