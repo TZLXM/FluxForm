@@ -18,6 +18,14 @@ use thiserror::Error;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+use std::collections::BTreeMap;
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 use std::collections::HashSet;
 #[cfg(any(
     test,
@@ -207,7 +215,109 @@ struct PolicyPathIdentityGraph {
     tool_ancestors: Vec<FileIdentity>,
     task_files: HashSet<FileIdentity>,
     tool_files: HashSet<FileIdentity>,
-    has_hard_links: bool,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolEntryEvidence {
+    identity: FileIdentity,
+    link_count: u64,
+    mount_id: u64,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolInventory {
+    entries: BTreeMap<PathBuf, ToolEntryEvidence>,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+const MAX_TOOL_INVENTORY_DIRECTORIES: usize = 32;
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+// 32 inventory directory FDs + 8 fixed policy/control FDs + one transient
+// entry FD must fit above stdio, whose descriptors occupy 0..=2.
+const MINIMUM_OPEN_FILES_FOR_SANDBOX: u64 = MAX_TOOL_INVENTORY_DIRECTORIES as u64 + 12;
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_open_files_limit(open_files_max: u64) -> Result<(), &'static str> {
+    if open_files_max < MINIMUM_OPEN_FILES_FOR_SANDBOX {
+        return Err("open-file limit is too small for the pinned sandbox policy descriptors");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_empty_task_snapshot(
+    expected_identity: FileIdentity,
+    actual_identity: FileIdentity,
+    entry_count: usize,
+) -> Result<(), &'static str> {
+    if expected_identity != actual_identity || entry_count != 0 {
+        return Err("task directory changed or was not empty");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_tool_inventory(
+    input: FileIdentity,
+    prepared: &ToolInventory,
+    current: &ToolInventory,
+) -> Result<(), &'static str> {
+    if prepared != current {
+        return Err("trusted tool inventory changed after preparation");
+    }
+    if prepared
+        .entries
+        .values()
+        .any(|entry| entry.identity == input)
+    {
+        return Err("input aliases an entry in the trusted tool inventory");
+    }
+    Ok(())
 }
 
 #[cfg(any(
@@ -235,9 +345,6 @@ fn validate_policy_path_identities(graph: &PolicyPathIdentityGraph) -> Result<()
             .any(|identity| graph.tool_files.contains(identity))
     {
         return Err("input, task, and tool files must not alias by filesystem identity");
-    }
-    if graph.has_hard_links {
-        return Err("policy files must not have hard-link aliases");
     }
     Ok(())
 }
@@ -441,11 +548,12 @@ impl Drop for SandboxChild {
 #[allow(unsafe_op_in_unsafe_fn)]
 mod linux {
     use super::{
-        FileIdentity, FilesystemEvidence, FilesystemPrerequisites, PolicyPathIdentityGraph,
-        ProbeEvidence, SandboxChild, SandboxError, SandboxLimits, SandboxPolicy, SpawnPlacement,
-        validate_policy_path_identities,
+        FileIdentity, FilesystemEvidence, FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES,
+        PolicyPathIdentityGraph, ProbeEvidence, SandboxChild, SandboxError, SandboxLimits,
+        SandboxPolicy, SpawnPlacement, ToolEntryEvidence, ToolInventory, validate_open_files_limit,
+        validate_policy_path_identities, validate_tool_inventory,
     };
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::ffi::CString;
     use std::fs;
     use std::io;
@@ -461,6 +569,12 @@ mod linux {
     const MSG_READY: u32 = 1;
     const MSG_ERROR: u32 = 2;
     const PROBE_OK: i32 = 0;
+    const MAX_TOOL_INVENTORY_ENTRIES: usize = 256;
+    const MAX_TOOL_INVENTORY_DEPTH: usize = 8;
+    const STATX_MNT_ID: u32 = 0x1000;
+    const STATX_BASIC_STATS: u32 = 0x07ff;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x0100;
     const STAGE_FORK: i32 = 1;
     const STAGE_USERNS: i32 = 2;
     const STAGE_UID_MAP: i32 = 3;
@@ -628,17 +742,18 @@ mod linux {
         release: Option<RawFd>,
     }
 
-    struct PreparedSpawn {
+    struct PreparedSpawn<'a> {
         root: RootPaths,
         input_source: CString,
         task_source: CString,
         tool_source: CString,
-        input_fd: RawFd,
-        input_identity: FileIdentity,
-        task_fd: RawFd,
-        task_identity: FileIdentity,
-        tool_fd: RawFd,
-        tool_identity: FileIdentity,
+        input: &'a PinnedPath,
+        task: &'a PinnedPath,
+        task_read_fd: RawFd,
+        tool: &'a PinnedPath,
+        tool_inventory: &'a PinnedToolInventory,
+        program_fd: RawFd,
+        policy_fds: Vec<RawFd>,
         uid_map: CString,
         gid_map: CString,
         tmpfs_data: CString,
@@ -647,7 +762,6 @@ mod linux {
         _placement_owners: Vec<OwnedFd>,
         report_fd: RawFd,
         null_fd: RawFd,
-        program: CString,
         _exec_strings: Vec<CString>,
         argv: Vec<usize>,
         envp: [usize; 1],
@@ -660,6 +774,40 @@ mod linux {
         directory_chain: Vec<FileIdentity>,
         link_count: u64,
         mode: libc::mode_t,
+        mount_id: u64,
+        signature: LinuxFileSignature,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LinuxFileSignature {
+        identity: FileIdentity,
+        link_count: u64,
+        mode: libc::mode_t,
+        size: i64,
+        mtime_sec: i64,
+        mtime_nsec: i64,
+        ctime_sec: i64,
+        ctime_nsec: i64,
+    }
+
+    struct PinnedToolDirectory {
+        fd: OwnedFd,
+        relative_path: PathBuf,
+        evidence: ToolEntryEvidence,
+        signature: LinuxFileSignature,
+    }
+
+    struct PinnedToolEntry {
+        parent: usize,
+        name: CString,
+        evidence: ToolEntryEvidence,
+        signature: LinuxFileSignature,
+    }
+
+    struct PinnedToolInventory {
+        snapshot: ToolInventory,
+        directories: Vec<PinnedToolDirectory>,
+        entries: Vec<PinnedToolEntry>,
     }
 
     pub(super) fn inspect_prerequisites() -> Result<FilesystemEvidence, SandboxError> {
@@ -1133,17 +1281,25 @@ mod linux {
             tool_ancestors: tool.directory_chain.clone(),
             task_files: HashSet::new(),
             tool_files: HashSet::new(),
-            has_hard_links: input.link_count != 1,
         };
         validate_policy_path_identities(&root_graph)
             .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
 
-        let (task_files, task_has_hard_links) = collect_policy_tree(&task, "task directory")?;
-        let (tool_files, tool_has_hard_links) = collect_policy_tree(&tool, "tool directory")?;
+        let task_read_fd = open_task_reader(&task)?;
+        if !task_directory_is_empty(task_read_fd.as_raw_fd(), task.identity)? {
+            return Err(SandboxError::InvalidPolicy(
+                "task directory must be empty when a sandbox is prepared".into(),
+            ));
+        }
+        let tool_inventory = collect_tool_inventory(&tool, input.identity)?;
+        let tool_files = tool_inventory
+            .snapshot
+            .entries
+            .values()
+            .map(|entry| entry.identity)
+            .collect::<HashSet<_>>();
         let policy_graph = PolicyPathIdentityGraph {
-            task_files,
             tool_files,
-            has_hard_links: input.link_count != 1 || task_has_hard_links || tool_has_hard_links,
             ..root_graph
         };
         validate_policy_path_identities(&policy_graph)
@@ -1165,6 +1321,26 @@ mod linux {
                 "tool executable escaped the declared tool directory".into(),
             )
         })?;
+        let program_evidence = tool_inventory
+            .snapshot
+            .entries
+            .get(relative_program)
+            .ok_or_else(|| {
+                SandboxError::InvalidPolicy(
+                    "tool executable is not present in the pinned tool inventory".into(),
+                )
+            })?;
+        if program_evidence.identity != program_pin.identity {
+            return Err(SandboxError::InvalidPolicy(
+                "tool executable changed while its inventory was prepared".into(),
+            ));
+        }
+        validate_tool_inventory(
+            input.identity,
+            &tool_inventory.snapshot,
+            &tool_inventory.snapshot,
+        )
+        .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
         FilesystemPrerequisites::inspect()?;
         let virtual_program = Path::new("/tool").join(relative_program);
         let program_c = c_path(&virtual_program)?;
@@ -1220,18 +1396,48 @@ mod linux {
                 source: io::Error::last_os_error(),
             });
         }
+        for index in 0..pipe.len() {
+            if pipe[index] < 3 {
+                let duplicate = unsafe { libc::fcntl(pipe[index], libc::F_DUPFD_CLOEXEC, 3) };
+                if duplicate < 0 {
+                    let source = io::Error::last_os_error();
+                    unsafe {
+                        libc::close(pipe[0]);
+                        libc::close(pipe[1]);
+                        libc::close(null_fd);
+                    }
+                    return Err(SandboxError::Io {
+                        operation: "reserve setup report descriptors above stdio",
+                        source,
+                    });
+                }
+                unsafe { libc::close(pipe[index]) };
+                pipe[index] = duplicate;
+            }
+        }
         let seccomp = build_filesystem_filter();
+        let policy_fds = build_policy_fd_list(
+            input.fd.as_raw_fd(),
+            task.fd.as_raw_fd(),
+            task_read_fd.as_raw_fd(),
+            tool.fd.as_raw_fd(),
+            program_pin.fd.as_raw_fd(),
+            &tool_inventory,
+            &placement_fds,
+            pipe[1],
+        );
         let spec = PreparedSpawn {
             root,
             input_source,
             task_source,
             tool_source,
-            input_fd: input.fd.as_raw_fd(),
-            input_identity: input.identity,
-            task_fd: task.fd.as_raw_fd(),
-            task_identity: task.identity,
-            tool_fd: tool.fd.as_raw_fd(),
-            tool_identity: tool.identity,
+            input: &input,
+            task: &task,
+            task_read_fd: task_read_fd.as_raw_fd(),
+            tool: &tool,
+            tool_inventory: &tool_inventory,
+            program_fd: program_pin.fd.as_raw_fd(),
+            policy_fds,
             uid_map,
             gid_map,
             tmpfs_data,
@@ -1240,7 +1446,6 @@ mod linux {
             _placement_owners: placement_owners,
             report_fd: pipe[1],
             null_fd,
-            program: program_c,
             _exec_strings: exec_strings,
             argv,
             envp: [0],
@@ -1271,9 +1476,6 @@ mod linux {
             libc::close(null_fd);
         }
         drop(placement);
-        drop(input);
-        drop(task);
-        drop(tool);
         let mut report = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
         let mut message = Message {
             kind: MSG_ERROR,
@@ -1364,14 +1566,14 @@ mod linux {
             || limits.cpu_quota_micros == 0
             || limits.cpu_period_micros == 0
             || limits.file_size_max_bytes == 0
-            || limits.open_files_max < 4
             || limits.tmpfs_max_bytes == 0
         {
             return Err(SandboxError::InvalidPolicy(
-                "all resource limits must be positive and open_files_max must be at least four"
-                    .into(),
+                "all resource limits must be positive".into(),
             ));
         }
+        validate_open_files_limit(limits.open_files_max)
+            .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
         Ok(())
     }
 
@@ -1473,6 +1675,7 @@ mod linux {
         }
         let identity = identity_from_stat(&final_stat);
         let link_count = final_stat.st_nlink as u64;
+        let mount_id = mount_id_for_fd(current.as_raw_fd())?;
         if current.as_raw_fd() < 3 {
             let duplicate = unsafe { libc::fcntl(current.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
             if duplicate < 0 {
@@ -1489,7 +1692,50 @@ mod linux {
             directory_chain,
             link_count,
             mode: final_stat.st_mode,
+            mount_id,
+            signature: signature_from_stat(&final_stat),
         })
+    }
+
+    fn signature_from_stat(metadata: &libc::stat) -> LinuxFileSignature {
+        LinuxFileSignature {
+            identity: identity_from_stat(metadata),
+            link_count: metadata.st_nlink as u64,
+            mode: metadata.st_mode,
+            size: metadata.st_size,
+            mtime_sec: metadata.st_mtime,
+            mtime_nsec: metadata.st_mtime_nsec,
+            ctime_sec: metadata.st_ctime,
+            ctime_nsec: metadata.st_ctime_nsec,
+        }
+    }
+
+    fn mount_id_for_fd(fd: RawFd) -> Result<u64, SandboxError> {
+        let mut buffer = [0_u64; 32];
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                fd,
+                c"".as_ptr(),
+                AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                STATX_BASIC_STATS | STATX_MNT_ID,
+                buffer.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(SandboxError::Io {
+                operation: "inspect pinned sandbox mount identity",
+                source: io::Error::last_os_error(),
+            });
+        }
+        let bytes = buffer.as_ptr().cast::<u8>();
+        let mask = unsafe { std::ptr::read_unaligned(bytes.cast::<u32>()) };
+        if mask & STATX_MNT_ID == 0 {
+            return Err(SandboxError::InvalidPolicy(
+                "kernel does not report mount identities for sandbox paths".into(),
+            ));
+        }
+        Ok(unsafe { std::ptr::read_unaligned(bytes.add(144).cast::<u64>()) })
     }
 
     fn stat_fd(fd: RawFd) -> Result<libc::stat, SandboxError> {
@@ -1515,94 +1761,230 @@ mod linux {
         Ok(identity_from_stat(&stat_fd(fd)?))
     }
 
-    fn collect_policy_tree(
+    fn collect_tool_inventory(
         root: &PinnedPath,
-        label: &'static str,
-    ) -> Result<(HashSet<FileIdentity>, bool), SandboxError> {
-        const MAX_ENTRIES: usize = 200_000;
-        const MAX_DEPTH: usize = 256;
-
-        let duplicate = unsafe { libc::fcntl(root.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        if duplicate < 0 {
-            return Err(SandboxError::Io {
-                operation: "duplicate pinned sandbox directory",
-                source: io::Error::last_os_error(),
-            });
-        }
-        let root_fd = unsafe { OwnedFd::from_raw_fd(duplicate) };
-        let mut directories = vec![(root_fd, 0_usize)];
-        let mut seen_directories = HashSet::from([root.identity]);
-        let mut files = HashSet::new();
-        let mut has_hard_links = false;
+        input: FileIdentity,
+    ) -> Result<PinnedToolInventory, SandboxError> {
+        let mut directories = vec![PinnedToolDirectory {
+            fd: duplicate_fd(root.fd.as_raw_fd())?,
+            relative_path: PathBuf::new(),
+            evidence: ToolEntryEvidence {
+                identity: root.identity,
+                link_count: root.link_count,
+                mount_id: root.mount_id,
+            },
+            signature: root.signature,
+        }];
+        let mut entries = Vec::new();
+        let mut snapshot = BTreeMap::new();
+        let mut visited_directories = HashSet::from([root.identity]);
         let mut entry_count = 0_usize;
+        let mut cursor = 0_usize;
 
-        while let Some((directory, depth)) = directories.pop() {
-            if depth > MAX_DEPTH {
-                return Err(SandboxError::InvalidPolicy(format!(
-                    "declared {label} tree is nested too deeply"
-                )));
-            }
-            let directory_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
-            let entries = fs::read_dir(directory_path).map_err(|source| SandboxError::Io {
-                operation: "inspect pinned sandbox directory contents",
+        while cursor < directories.len() {
+            let directory_fd = directories[cursor].fd.as_raw_fd();
+            let relative_directory = directories[cursor].relative_path.clone();
+            let depth = relative_directory.components().count();
+            let directory_path = format!("/proc/self/fd/{directory_fd}");
+            let listed = fs::read_dir(directory_path).map_err(|source| SandboxError::Io {
+                operation: "inspect pinned trusted tool directory",
                 source,
             })?;
-            for entry in entries {
-                let entry = entry.map_err(|source| SandboxError::Io {
-                    operation: "read pinned sandbox directory entry",
+            for item in listed {
+                let item = item.map_err(|source| SandboxError::Io {
+                    operation: "read trusted tool inventory entry",
                     source,
                 })?;
                 entry_count += 1;
-                if entry_count > MAX_ENTRIES {
+                if entry_count > MAX_TOOL_INVENTORY_ENTRIES {
                     return Err(SandboxError::InvalidPolicy(format!(
-                        "declared {label} tree exceeds the inspection limit"
+                        "trusted tool inventory exceeds {MAX_TOOL_INVENTORY_ENTRIES} entries"
                     )));
                 }
-                let name = CString::new(entry.file_name().as_bytes()).map_err(|_| {
-                    SandboxError::InvalidPolicy(format!(
-                        "declared {label} contains an invalid directory entry"
-                    ))
+                let entry_name = item.file_name();
+                let name = CString::new(entry_name.as_bytes()).map_err(|_| {
+                    SandboxError::InvalidPolicy(
+                        "trusted tool inventory contains an invalid name".into(),
+                    )
                 })?;
-                let fd = unsafe {
+                let raw = unsafe {
                     libc::openat(
-                        directory.as_raw_fd(),
+                        directory_fd,
                         name.as_ptr(),
                         libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                     )
                 };
-                if fd < 0 {
+                if raw < 0 {
                     return Err(SandboxError::Io {
-                        operation: "open pinned sandbox directory entry",
+                        operation: "pin trusted tool inventory entry",
                         source: io::Error::last_os_error(),
                     });
                 }
-                let child = unsafe { OwnedFd::from_raw_fd(fd) };
-                let metadata = stat_fd(child.as_raw_fd())?;
-                match metadata.st_mode & libc::S_IFMT {
-                    libc::S_IFREG => {
-                        let identity = identity_from_stat(&metadata);
-                        files.insert(identity);
-                        has_hard_links |= metadata.st_nlink > 1;
+                let pinned = unsafe { OwnedFd::from_raw_fd(raw) };
+                let metadata = stat_fd(pinned.as_raw_fd())?;
+                let signature = signature_from_stat(&metadata);
+                let identity = signature.identity;
+                let mode = metadata.st_mode & libc::S_IFMT;
+                let mount_id = mount_id_for_fd(pinned.as_raw_fd())?;
+                if mount_id != root.mount_id {
+                    return Err(SandboxError::InvalidPolicy(
+                        "trusted tool inventory must not cross nested mounts".into(),
+                    ));
+                }
+                let evidence = ToolEntryEvidence {
+                    identity,
+                    link_count: signature.link_count,
+                    mount_id,
+                };
+                let relative_path = relative_directory.join(&entry_name);
+                if snapshot
+                    .insert(relative_path.clone(), evidence.clone())
+                    .is_some()
+                {
+                    return Err(SandboxError::InvalidPolicy(
+                        "trusted tool inventory contains a duplicate path".into(),
+                    ));
+                }
+                entries.push(PinnedToolEntry {
+                    parent: cursor,
+                    name,
+                    evidence: evidence.clone(),
+                    signature,
+                });
+                match mode {
+                    libc::S_IFREG | libc::S_IFLNK => {
+                        if mode == libc::S_IFREG && identity == input {
+                            return Err(SandboxError::InvalidPolicy(
+                                "input aliases a file in the trusted tool inventory".into(),
+                            ));
+                        }
                     }
                     libc::S_IFDIR => {
-                        let identity = identity_from_stat(&metadata);
-                        if !seen_directories.insert(identity) {
+                        if depth + 1 > MAX_TOOL_INVENTORY_DEPTH {
                             return Err(SandboxError::InvalidPolicy(format!(
-                                "declared {label} contains an aliased directory"
+                                "trusted tool inventory exceeds depth {MAX_TOOL_INVENTORY_DEPTH}"
                             )));
                         }
-                        directories.push((child, depth + 1));
+                        if directories.len() >= MAX_TOOL_INVENTORY_DIRECTORIES {
+                            return Err(SandboxError::InvalidPolicy(format!(
+                                "trusted tool inventory exceeds {MAX_TOOL_INVENTORY_DIRECTORIES} directories"
+                            )));
+                        }
+                        if !visited_directories.insert(identity) {
+                            return Err(SandboxError::InvalidPolicy(
+                                "trusted tool inventory contains an aliased directory".into(),
+                            ));
+                        }
+                        directories.push(PinnedToolDirectory {
+                            fd: pinned,
+                            relative_path,
+                            evidence,
+                            signature,
+                        });
                     }
-                    libc::S_IFLNK => {}
                     _ => {
-                        return Err(SandboxError::InvalidPolicy(format!(
-                            "declared {label} contains an unsupported special file"
-                        )));
+                        return Err(SandboxError::InvalidPolicy(
+                            "trusted tool inventory contains a special file".into(),
+                        ));
                     }
                 }
             }
+            cursor += 1;
         }
-        Ok((files, has_hard_links))
+        let snapshot = ToolInventory { entries: snapshot };
+        validate_tool_inventory(input, &snapshot, &snapshot)
+            .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
+        Ok(PinnedToolInventory {
+            snapshot,
+            directories,
+            entries,
+        })
+    }
+
+    fn open_task_reader(task: &PinnedPath) -> Result<OwnedFd, SandboxError> {
+        let fd = unsafe {
+            libc::openat(
+                task.fd.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(SandboxError::Io {
+                operation: "open task directory for bounded empty check",
+                source: io::Error::last_os_error(),
+            });
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        if owned.as_raw_fd() < 3 {
+            duplicate_fd(owned.as_raw_fd())
+        } else {
+            Ok(owned)
+        }
+    }
+
+    fn task_directory_is_empty(fd: RawFd, expected: FileIdentity) -> Result<bool, SandboxError> {
+        let result = unsafe { task_directory_is_empty_raw(fd, expected) };
+        match result {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(SandboxError::Io {
+                operation: "verify task directory is empty",
+                source: io::Error::last_os_error(),
+            }),
+        }
+    }
+
+    unsafe fn task_directory_is_empty_raw(fd: RawFd, expected: FileIdentity) -> i32 {
+        let mut metadata: libc::stat = zeroed();
+        if libc::fstat(fd, &mut metadata) != 0 {
+            return -1;
+        }
+        if identity_from_stat(&metadata) != expected
+            || metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        {
+            *libc::__errno_location() = libc::ESTALE;
+            return -1;
+        }
+        if libc::lseek(fd, 0, libc::SEEK_SET) < 0 {
+            return -1;
+        }
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len());
+            if count < 0 {
+                if errno() == libc::EINTR {
+                    continue;
+                }
+                return -1;
+            }
+            if count == 0 {
+                return 1;
+            }
+            let count = count as usize;
+            let mut offset = 0_usize;
+            while offset < count {
+                if count - offset < 19 {
+                    *libc::__errno_location() = libc::EIO;
+                    return -1;
+                }
+                let record_size =
+                    std::ptr::read_unaligned(buffer.as_ptr().add(offset + 16).cast::<u16>())
+                        as usize;
+                if record_size < 19 || record_size > count - offset {
+                    *libc::__errno_location() = libc::EIO;
+                    return -1;
+                }
+                let name = std::ffi::CStr::from_ptr(
+                    buffer.as_ptr().add(offset + 19).cast::<libc::c_char>(),
+                )
+                .to_bytes();
+                if name != b"." && name != b".." {
+                    return 0;
+                }
+                offset += record_size;
+            }
+        }
     }
 
     fn prepare_exec_strings(
@@ -1635,19 +2017,74 @@ mod linux {
             .map_err(|_| SandboxError::InvalidPolicy("invalid pinned file descriptor".into()))
     }
 
-    unsafe fn revalidate_pinned_path(
-        fd: RawFd,
-        identity: FileIdentity,
-        expected_type: libc::mode_t,
-        require_single_link: bool,
-    ) -> i32 {
-        let mut metadata: libc::stat = zeroed();
-        if libc::fstat(fd, &mut metadata) != 0 {
+    fn build_policy_fd_list(
+        input_fd: RawFd,
+        task_fd: RawFd,
+        task_read_fd: RawFd,
+        tool_fd: RawFd,
+        program_fd: RawFd,
+        inventory: &PinnedToolInventory,
+        placement: &PlacementFds,
+        report_fd: RawFd,
+    ) -> Vec<RawFd> {
+        let mut fds = Vec::with_capacity(inventory.directories.len() + 10);
+        fds.extend([
+            input_fd,
+            task_fd,
+            task_read_fd,
+            tool_fd,
+            program_fd,
+            report_fd,
+        ]);
+        fds.extend(
+            inventory
+                .directories
+                .iter()
+                .map(|directory| directory.fd.as_raw_fd()),
+        );
+        fds.extend(
+            [placement.cgroup, placement.ready, placement.release]
+                .into_iter()
+                .flatten(),
+        );
+        fds
+    }
+
+    unsafe fn mount_id_matches(fd: RawFd, expected: u64) -> i32 {
+        let mut buffer = [0_u64; 32];
+        if libc::syscall(
+            libc::SYS_statx,
+            fd,
+            c"".as_ptr(),
+            AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+            STATX_BASIC_STATS | STATX_MNT_ID,
+            buffer.as_mut_ptr(),
+        ) != 0
+        {
             return -1;
         }
-        if identity_from_stat(&metadata) != identity
+        let bytes = buffer.as_ptr().cast::<u8>();
+        let mask = std::ptr::read_unaligned(bytes.cast::<u32>());
+        if mask & STATX_MNT_ID == 0 {
+            *libc::__errno_location() = libc::EOPNOTSUPP;
+            return -1;
+        }
+        let actual = std::ptr::read_unaligned(bytes.add(144).cast::<u64>());
+        if actual != expected {
+            *libc::__errno_location() = libc::ESTALE;
+            return -1;
+        }
+        0
+    }
+
+    unsafe fn revalidate_pinned_path(path: &PinnedPath, expected_type: libc::mode_t) -> i32 {
+        let mut metadata: libc::stat = zeroed();
+        if libc::fstat(path.fd.as_raw_fd(), &mut metadata) != 0 {
+            return -1;
+        }
+        if signature_from_stat(&metadata) != path.signature
             || metadata.st_mode & libc::S_IFMT != expected_type
-            || (require_single_link && metadata.st_nlink != 1)
+            || mount_id_matches(path.fd.as_raw_fd(), path.mount_id) != 0
         {
             *libc::__errno_location() = libc::ESTALE;
             return -1;
@@ -1655,7 +2092,123 @@ mod linux {
         0
     }
 
-    unsafe fn sandbox_supervisor(spec: &PreparedSpawn) -> ! {
+    unsafe fn mounted_object_matches(
+        path: &std::ffi::CStr,
+        expected: FileIdentity,
+        expected_type: libc::mode_t,
+    ) -> i32 {
+        let mut metadata: libc::stat = zeroed();
+        if libc::stat(path.as_ptr(), &mut metadata) != 0 {
+            return -1;
+        }
+        if identity_from_stat(&metadata) != expected
+            || metadata.st_mode & libc::S_IFMT != expected_type
+        {
+            *libc::__errno_location() = libc::ESTALE;
+            return -1;
+        }
+        0
+    }
+
+    unsafe fn revalidate_tool_inventory(
+        inventory: &PinnedToolInventory,
+        input: FileIdentity,
+    ) -> i32 {
+        for directory in &inventory.directories {
+            if revalidate_tool_directory(directory) != 0 {
+                return -1;
+            }
+        }
+        for entry in &inventory.entries {
+            let parent = inventory.directories[entry.parent].fd.as_raw_fd();
+            let fd = libc::openat(
+                parent,
+                entry.name.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            );
+            if fd < 0 {
+                return -1;
+            }
+            let mut metadata: libc::stat = zeroed();
+            if libc::fstat(fd, &mut metadata) != 0 {
+                let saved_errno = errno();
+                libc::close(fd);
+                *libc::__errno_location() = saved_errno;
+                return -1;
+            }
+            if signature_from_stat(&metadata) != entry.signature
+                || identity_from_stat(&metadata) != entry.evidence.identity
+                || metadata.st_nlink as u64 != entry.evidence.link_count
+                || (metadata.st_mode & libc::S_IFMT == libc::S_IFREG
+                    && identity_from_stat(&metadata) == input)
+            {
+                libc::close(fd);
+                *libc::__errno_location() = libc::ESTALE;
+                return -1;
+            }
+            if mount_id_matches(fd, entry.evidence.mount_id) != 0 {
+                let saved_errno = errno();
+                libc::close(fd);
+                *libc::__errno_location() = saved_errno;
+                return -1;
+            }
+            libc::close(fd);
+        }
+        for directory in &inventory.directories {
+            if revalidate_tool_directory(directory) != 0 {
+                return -1;
+            }
+        }
+        0
+    }
+
+    unsafe fn revalidate_tool_directory(directory: &PinnedToolDirectory) -> i32 {
+        let mut metadata: libc::stat = zeroed();
+        if libc::fstat(directory.fd.as_raw_fd(), &mut metadata) != 0 {
+            return -1;
+        }
+        if signature_from_stat(&metadata) != directory.signature
+            || identity_from_stat(&metadata) != directory.evidence.identity
+            || metadata.st_nlink as u64 != directory.evidence.link_count
+            || mount_id_matches(directory.fd.as_raw_fd(), directory.evidence.mount_id) != 0
+        {
+            *libc::__errno_location() = libc::ESTALE;
+            return -1;
+        }
+        0
+    }
+
+    unsafe fn revalidate_policy_before_release(spec: &PreparedSpawn<'_>) -> i32 {
+        if revalidate_pinned_path(spec.input, libc::S_IFREG) != 0 {
+            return -1;
+        }
+        if revalidate_pinned_path(spec.task, libc::S_IFDIR) != 0 {
+            return -1;
+        }
+        match task_directory_is_empty_raw(spec.task_read_fd, spec.task.identity) {
+            1 => {}
+            0 => {
+                *libc::__errno_location() = libc::ESTALE;
+                return -1;
+            }
+            _ => return -1,
+        }
+        if revalidate_pinned_path(spec.tool, libc::S_IFDIR) != 0 {
+            return -1;
+        }
+        if revalidate_tool_inventory(spec.tool_inventory, spec.input.identity) != 0 {
+            return -1;
+        }
+        if mounted_object_matches(c"/input", spec.input.identity, libc::S_IFREG) != 0
+            || mounted_object_matches(c"/task", spec.task.identity, libc::S_IFDIR) != 0
+            || mounted_object_matches(c"/tool", spec.tool.identity, libc::S_IFDIR) != 0
+        {
+            return -1;
+        }
+        0
+    }
+
+    unsafe fn sandbox_supervisor(spec: &PreparedSpawn<'_>) -> ! {
         if libc::setpgid(0, 0) != 0 {
             fail_and_exit(spec.report_fd, STAGE_FORK, errno());
         }
@@ -1666,6 +2219,10 @@ mod linux {
             fail_and_exit(spec.report_fd, STAGE_FORK, errno());
         }
         libc::close(spec.null_fd);
+
+        if close_range_except(&spec.policy_fds) != 0 {
+            fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
+        }
 
         if let Err(result) = enter_user_namespace_from_maps(&spec.uid_map, &spec.gid_map) {
             fail_and_exit(spec.report_fd, result.operation, result.errno);
@@ -1692,7 +2249,7 @@ mod linux {
         if make_root_layout(&spec.root) != 0 {
             fail_and_exit(spec.report_fd, STAGE_MKDIR, errno());
         }
-        if revalidate_pinned_path(spec.input_fd, spec.input_identity, libc::S_IFREG, true) != 0
+        if revalidate_pinned_path(spec.input, libc::S_IFREG) != 0
             || mount_bind(&spec.input_source, &spec.root.input) != 0
         {
             fail_and_exit(spec.report_fd, STAGE_BIND_INPUT, errno());
@@ -1700,7 +2257,8 @@ mod linux {
         if remount_read_only(&spec.root.input, true) != 0 {
             fail_and_exit(spec.report_fd, STAGE_BIND_RO, errno());
         }
-        if revalidate_pinned_path(spec.tool_fd, spec.tool_identity, libc::S_IFDIR, false) != 0
+        if revalidate_pinned_path(spec.tool, libc::S_IFDIR) != 0
+            || revalidate_tool_inventory(spec.tool_inventory, spec.input.identity) != 0
             || mount_bind(&spec.tool_source, &spec.root.tool) != 0
         {
             fail_and_exit(spec.report_fd, STAGE_BIND_TOOL, errno());
@@ -1708,7 +2266,8 @@ mod linux {
         if remount_read_only(&spec.root.tool, false) != 0 {
             fail_and_exit(spec.report_fd, STAGE_BIND_RO, errno());
         }
-        if revalidate_pinned_path(spec.task_fd, spec.task_identity, libc::S_IFDIR, false) != 0
+        if revalidate_pinned_path(spec.task, libc::S_IFDIR) != 0
+            || task_directory_is_empty_raw(spec.task_read_fd, spec.task.identity) != 1
             || mount_bind(&spec.task_source, &spec.root.task) != 0
         {
             fail_and_exit(spec.report_fd, STAGE_BIND_TASK, errno());
@@ -1746,10 +2305,13 @@ mod linux {
             fail_and_exit(spec.report_fd, STAGE_CAP_DROP, errno());
         }
 
+        if revalidate_policy_before_release(spec) != 0 {
+            fail_and_exit(spec.report_fd, STAGE_BIND_TASK, errno());
+        }
+
         match (spec.placement.ready, spec.placement.release) {
             (Some(ready), Some(release)) => {
-                let keep = [spec.report_fd, ready, release];
-                if close_range_except(&keep) != 0 {
+                if close_range_except(&spec.policy_fds) != 0 {
                     fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
                 }
                 let pid = libc::getpid();
@@ -1783,6 +2345,12 @@ mod linux {
                 libc::close(ready);
                 libc::close(release);
                 libc::close(spec.report_fd);
+                if revalidate_policy_before_release(spec) != 0 {
+                    libc::_exit(125);
+                }
+                if close_range_except(&[spec.program_fd]) != 0 {
+                    libc::_exit(125);
+                }
                 let child = libc::fork();
                 if child < 0 {
                     libc::_exit(127);
@@ -1791,8 +2359,8 @@ mod linux {
                     if install_seccomp(&spec.seccomp) != 0 {
                         libc::_exit(127);
                     }
-                    libc::execve(
-                        spec.program.as_ptr(),
+                    exec_pinned(
+                        spec.program_fd,
                         spec.argv.as_ptr().cast(),
                         spec.envp.as_ptr().cast(),
                     );
@@ -1804,8 +2372,7 @@ mod linux {
                 let Some(cgroup_fd) = spec.placement.cgroup else {
                     fail_and_exit(spec.report_fd, STAGE_CLONE3, libc::EINVAL);
                 };
-                let keep = [spec.report_fd, cgroup_fd];
-                if close_range_except(&keep) != 0 {
+                if close_range_except(&spec.policy_fds) != 0 {
                     fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
                 }
                 let flags = libc::fcntl(cgroup_fd, libc::F_GETFD);
@@ -1832,11 +2399,16 @@ mod linux {
                     fail_and_exit(spec.report_fd, STAGE_CLONE3, errno());
                 }
                 if child == 0 {
+                    if revalidate_policy_before_release(spec) != 0
+                        || close_range_except(&[spec.program_fd]) != 0
+                    {
+                        libc::_exit(125);
+                    }
                     if install_seccomp(&spec.seccomp) != 0 {
                         libc::_exit(127);
                     }
-                    libc::execve(
-                        spec.program.as_ptr(),
+                    exec_pinned(
+                        spec.program_fd,
                         spec.argv.as_ptr().cast(),
                         spec.envp.as_ptr().cast(),
                     );
@@ -2148,8 +2720,23 @@ mod linux {
         ) as i32
     }
 
+    unsafe fn exec_pinned(
+        fd: RawFd,
+        argv: *const *const libc::c_char,
+        envp: *const *const libc::c_char,
+    ) -> i64 {
+        libc::syscall(
+            libc::SYS_execveat,
+            fd,
+            c"".as_ptr(),
+            argv,
+            envp,
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+
     unsafe fn close_range_except(keep: &[RawFd]) -> i32 {
-        let mut kept = [0_i32; 8];
+        let mut kept = [0_i32; MAX_TOOL_INVENTORY_DIRECTORIES + 16];
         let mut count = 0;
         for fd in keep.iter().copied().filter(|fd| *fd >= 3) {
             if count == kept.len() {
@@ -2376,11 +2963,175 @@ mod linux {
     fn errno() -> i32 {
         unsafe { *libc::__errno_location() }
     }
+
+    #[cfg(test)]
+    mod race_tests {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn tool_entry_replacement_between_prepare_and_bind_fails_closed() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let tool_path = root.path().join("tool");
+            fs::create_dir(&tool_path).expect("tool directory");
+            let executable_path = tool_path.join("tool-bin");
+            fs::write(&executable_path, b"approved executable bytes").expect("tool file");
+            let input_path = root.path().join("input");
+            fs::write(&input_path, b"input").expect("input file");
+
+            let input = open_pinned_path(&input_path, false, "input").expect("pin input");
+            let tool = open_pinned_path(&tool_path, true, "tool directory").expect("pin tool");
+            let inventory = collect_tool_inventory(&tool, input.identity).expect("inventory");
+            assert_eq!(
+                unsafe { revalidate_tool_inventory(&inventory, input.identity) },
+                0
+            );
+
+            fs::rename(&executable_path, tool_path.join("approved-old"))
+                .expect("rename approved executable");
+            fs::write(&executable_path, b"replacement executable bytes")
+                .expect("install replacement executable");
+
+            assert_ne!(
+                unsafe { revalidate_tool_inventory(&inventory, input.identity) },
+                0,
+                "replacement must not pass the pre-bind revalidation"
+            );
+        }
+
+        #[test]
+        fn input_hard_link_insertion_between_prepare_and_bind_fails_closed() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let tool_path = root.path().join("tool");
+            fs::create_dir(&tool_path).expect("tool directory");
+            fs::write(tool_path.join("trusted-tool"), b"tool").expect("tool file");
+            let input_path = root.path().join("input");
+            fs::write(&input_path, b"input").expect("input file");
+
+            let input = open_pinned_path(&input_path, false, "input").expect("pin input");
+            let tool = open_pinned_path(&tool_path, true, "tool directory").expect("pin tool");
+            let inventory = collect_tool_inventory(&tool, input.identity).expect("inventory");
+            fs::hard_link(&input_path, tool_path.join("input-alias")).expect("insert hard link");
+
+            assert_ne!(
+                unsafe { revalidate_pinned_path(&input, libc::S_IFREG) },
+                0,
+                "changed input link count must be noticed"
+            );
+            assert_ne!(
+                unsafe { revalidate_tool_inventory(&inventory, input.identity) },
+                0,
+                "tool inventory mutation must be noticed"
+            );
+        }
+
+        #[test]
+        fn task_directory_must_stay_empty_until_release() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let task_path = root.path().join("task");
+            fs::create_dir(&task_path).expect("task directory");
+            let task = open_pinned_path(&task_path, true, "task directory").expect("pin task");
+            let reader = open_task_reader(&task).expect("open task reader");
+            assert!(
+                task_directory_is_empty(reader.as_raw_fd(), task.identity).expect("empty check")
+            );
+
+            fs::write(task_path.join("raced-file"), b"untrusted").expect("mutate task directory");
+            assert!(!task_directory_is_empty(reader.as_raw_fd(), task.identity).expect("recheck"));
+        }
+
+        #[test]
+        fn trusted_tool_inventory_has_a_small_fixed_limit() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let tool_path = root.path().join("tool");
+            fs::create_dir(&tool_path).expect("tool directory");
+            let input_path = root.path().join("input");
+            fs::write(&input_path, b"input").expect("input file");
+            for index in 0..=MAX_TOOL_INVENTORY_ENTRIES {
+                fs::write(tool_path.join(format!("entry-{index}")), b"tool").expect("tool entry");
+            }
+            let input = open_pinned_path(&input_path, false, "input").expect("pin input");
+            let tool = open_pinned_path(&tool_path, true, "tool directory").expect("pin tool");
+            assert!(matches!(
+                collect_tool_inventory(&tool, input.identity),
+                Err(SandboxError::InvalidPolicy(_))
+            ));
+        }
+
+        #[test]
+        fn execveat_uses_pinned_executable_after_policy_name_is_replaced() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let tool_path = root.path().join("tool");
+            fs::create_dir(&tool_path).expect("tool directory");
+            let executable_path = tool_path.join("pinned-test");
+            fs::copy(
+                std::env::current_exe().expect("current test executable"),
+                &executable_path,
+            )
+            .expect("copy test executable");
+            fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o700))
+                .expect("make test executable runnable");
+            let input_path = root.path().join("input");
+            fs::write(&input_path, b"input").expect("input file");
+
+            let input = open_pinned_path(&input_path, false, "input").expect("pin input");
+            let tool = open_pinned_path(&tool_path, true, "tool directory").expect("pin tool");
+            let inventory = collect_tool_inventory(&tool, input.identity).expect("inventory");
+            let executable = open_pinned_path(&executable_path, false, "tool executable")
+                .expect("pin executable");
+
+            fs::rename(&executable_path, tool_path.join("approved-original"))
+                .expect("rename approved executable");
+            fs::write(&executable_path, b"not an executable").expect("replace policy name");
+            assert_ne!(
+                unsafe { revalidate_tool_inventory(&inventory, input.identity) },
+                0,
+                "the path inventory must fail after the name is replaced"
+            );
+
+            let argv = [
+                CString::new("pinned-test").expect("argv zero"),
+                CString::new("--list").expect("list argument"),
+                CString::new("--format=terse").expect("format argument"),
+            ];
+            let argv_pointers = argv
+                .iter()
+                .map(|argument| argument.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect::<Vec<_>>();
+            let envp = [std::ptr::null::<libc::c_char>()];
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork test process");
+            if child == 0 {
+                unsafe {
+                    exec_pinned(
+                        executable.fd.as_raw_fd(),
+                        argv_pointers.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                    libc::_exit(127);
+                }
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(
+                libc::WIFEXITED(status),
+                "pinned executable did not exit normally"
+            );
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "pinned executable was not run"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod review_regression_tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::collections::HashSet;
     use std::io;
 
@@ -2398,7 +3149,6 @@ mod review_regression_tests {
             tool_ancestors: vec![identity(30), identity(3), identity(1)],
             task_files: HashSet::from([identity(21)]),
             tool_files: HashSet::from([identity(31)]),
-            has_hard_links: false,
         }
     }
 
@@ -2431,9 +3181,62 @@ mod review_regression_tests {
         graph.tool_files = graph.task_files.clone();
         assert!(validate_policy_path_identities(&graph).is_err());
 
-        let mut graph = disjoint_policy_graph();
-        graph.has_hard_links = true;
-        assert!(validate_policy_path_identities(&graph).is_err());
+        let graph = disjoint_policy_graph();
+        assert!(validate_policy_path_identities(&graph).is_ok());
+    }
+
+    fn inventory(entries: &[(&str, u64, u64)]) -> ToolInventory {
+        ToolInventory {
+            entries: entries
+                .iter()
+                .map(|(path, inode, link_count)| {
+                    (
+                        PathBuf::from(path),
+                        ToolEntryEvidence {
+                            identity: identity(*inode),
+                            link_count: *link_count,
+                            mount_id: 55,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn task_directory_mutation_invalidates_its_empty_preparation_snapshot() {
+        assert!(validate_empty_task_snapshot(identity(20), identity(20), 0).is_ok());
+        assert!(validate_empty_task_snapshot(identity(20), identity(20), 1).is_err());
+        assert!(validate_empty_task_snapshot(identity(20), identity(21), 0).is_err());
+    }
+
+    #[test]
+    fn tool_inventory_revalidation_detects_replacement_and_link_mutation() {
+        let prepared = inventory(&[("ffmpeg", 30, 2)]);
+        assert!(validate_tool_inventory(identity(10), &prepared, &prepared).is_ok());
+        assert!(
+            validate_tool_inventory(identity(10), &prepared, &inventory(&[("ffmpeg", 31, 2)]))
+                .is_err()
+        );
+        assert!(
+            validate_tool_inventory(identity(10), &prepared, &inventory(&[("ffmpeg", 30, 3)]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tool_inventory_rejects_input_alias_but_allows_stable_unrelated_hard_links() {
+        let prepared = inventory(&[("ffmpeg", 30, 2)]);
+        assert!(validate_tool_inventory(identity(10), &prepared, &prepared).is_ok());
+
+        let input_alias = inventory(&[("input-copy", 10, 2)]);
+        assert!(validate_tool_inventory(identity(10), &input_alias, &input_alias).is_err());
+    }
+
+    #[test]
+    fn open_file_limit_reserves_capacity_for_pinned_policy_and_revalidation() {
+        assert!(validate_open_files_limit(44).is_ok());
+        assert!(validate_open_files_limit(43).is_err());
     }
 
     #[test]

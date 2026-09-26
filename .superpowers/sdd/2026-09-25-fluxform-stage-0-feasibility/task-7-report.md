@@ -37,8 +37,8 @@ Result: **2 passed**. These are only the portable evidence-serialization test an
 - Uses the cached `libc` crate for a confined set of Linux syscalls; no network dependency or publishing action was used.
 - Creates a rootless user namespace, writes one-entry UID/GID maps, then creates private mount and PID namespaces. Mount propagation is recursively private.
 - Builds a tmpfs-only root, bind-mounts exactly one input file read-only, the declared tool directory read-only, and the task directory writable with `nosuid`, `nodev`, and `noexec`; mounts a fresh empty size-limited tmpfs at `/tmp`; pivots and detaches the old root. No host root, `/proc`, or `/dev` mount is exposed. The tool directory is the only source for the minimal `/lib`, `/lib64`, and `/usr` loader paths.
-- Replaces standard streams with `/dev/null`, reserves internal descriptors above stdio, and uses `close_range` to retain only setup-report and declared placement descriptors. The probe actively checks `close_range` and fails closed if unavailable.
-- Applies `RLIMIT_FSIZE` and `RLIMIT_NOFILE`, sets `no_new_privs`, drops/verifies capability sets, uses a restrictive seccomp filter for mount/namespace operations and process-group escape, and executes the selected program directly with `execve` and an empty environment. No shell is invoked.
+- Replaces standard streams with `/dev/null`, reserves internal descriptors above stdio, and uses `close_range` to close undeclared inherited descriptors before namespace setup while retaining only pinned policy handles plus setup-report/placement descriptors; after release it retains only the pinned executable for the tool fork/exec. The probe actively checks `close_range` and fails closed if unavailable.
+- Applies `RLIMIT_FSIZE` and `RLIMIT_NOFILE`, sets `no_new_privs`, drops/verifies capability sets, uses a restrictive seccomp filter for mount/namespace operations and process-group escape, and executes the selected program directly with `execveat(AT_EMPTY_PATH)` from a pinned executable descriptor and an empty environment. No shell is invoked.
 - `ParentAttachBarrier` notifies the resource controller and waits for release before forking or executing tool code. `CloneIntoCgroup` uses `clone3(CLONE_INTO_CGROUP)` for atomic placement. There is no post-spawn `attach(pid)` API or best-effort placement path.
 - `FilesystemPrerequisites::inspect` independently records structured status/detail for user and PID namespaces, mount isolation, `pivot_root`, capability dropping, descriptor closure, and temporary-root creation; the PID probe verifies a child in the new namespace observes PID 1. Any failed primitive prevents public spawn.
 - Added a fixed-action test binary and Linux-only tests for allowed input/task access, pre-release blocking, `/etc/passwd`, parent traversal, host `/tmp` descriptor writes, symlink traversal, undeclared file descriptors, and read-only input/tool mounts.
@@ -88,6 +88,35 @@ All tests reached before the artifact gate passed, but `fluxform-capabilities/te
 Commit subject required by the task: `feat(server): prove Linux filesystem isolation`.
 
 Report path: `.superpowers/sdd/2026-09-25-fluxform-stage-0-feasibility/task-7-report.md`.
+
+## Review round 2 — required fixes
+
+Both Important findings were verified against the previous implementation: it executed the tool by a mutable `/tool/<relative>` name after preparing the policy, and performed unbounded-in-practice task/tool tree walks (up to 200,000 entries) for every spawn. Round 2 supersedes the corresponding round-1 implementation notes above:
+
+1. **Pinned paths, executable, and mutation revalidation:** input, task, and tool mount sources still use retained O_PATH descriptors. The approved executable descriptor is retained through placement and invoked with `execveat(AT_EMPTY_PATH)`, so replacing its directory name cannot redirect execution. The trusted tool inventory snapshots each entry's device/inode identity, link count, mount ID, mode, size, and modification/change timestamps. It pins directory handles and revalidates directory metadata and each named entry immediately before binding, before readiness, and again after placement release (or inside the atomically placed child before exec). Replacements, inserted hard links to the input, content/metadata changes, and nested mounts fail closed. Stable unrelated hard links are allowed; input/tool identity aliasing is not.
+2. **Bounded inventory and fresh task directory:** task contents are no longer recursively scanned. Preparation requires an empty task directory and a retained read descriptor performs a bounded `getdents64` empty check before binding, before readiness, and after release just before tool fork/exec. Trusted tools are inventoried under fixed limits of 256 entries, 32 directories, and depth 8; exceeding any limit fails closed. The inventory is revalidated via retained directory handles and one transient pinned entry descriptor at a time. Unrelated inherited descriptors are closed before setup checks, and `open_files_max` must be at least 44 to reserve descriptor numbers for the maximum pinned inventory and transient validation. The small limits avoid request-sized task scans but may require policy adjustment for unusually large packaged tool trees.
+3. **Deterministic Linux regression tests:** added Linux-only tests that mutate/replace a tool name between inventory preparation and validation and while the supervisor waits for placement, insert an input hard link after preparation, mutate a task directory after its empty check and while waiting for placement, exceed the fixed inventory bound, and execute the previously pinned ELF after its pathname is replaced. The existing symlink adversarial test now has the sandboxed test tool create the symlink after release, preserving the new empty-task requirement while still testing that `/etc/passwd` stays outside the minimal root. These tests are Linux-only and did not run on this Windows host.
+
+Review-round TDD and verification evidence:
+
+- RED: `cargo test -p fluxform-sandbox-probe --lib --offline` failed to compile because `ToolInventory`, `ToolEntryEvidence`, `validate_empty_task_snapshot`, and `validate_tool_inventory` were missing. Implemented the evidence types/validators and Linux pinned inventory/revalidation after this failure.
+- RED: after a static descriptor-budget review, a new portable regression test failed to compile because `validate_open_files_limit` was not implemented. The helper now enforces the minimum descriptor budget used by the Linux setup.
+- GREEN on Windows: `cargo test -p fluxform-sandbox-probe --offline` passed **10 tests total** (8 library tests, 2 portable integration tests). The Linux race tests are cfg-excluded here; this result verifies portable behavior only.
+- `cargo fmt --all` passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings` passed on the Windows target only.
+- `cargo test --workspace --exclude fluxform-capabilities --offline` passed. The feasible capabilities tests passed separately with `cargo test -p fluxform-capabilities --lib --bins --test runner --test manifest --offline`.
+- `git diff --check` passed.
+- `cargo test --workspace --offline` was run. Crates/tests reached before `fluxform-capabilities/tests/cross_platform_samples.rs::every_approved_native_profile_has_a_current_sample_report` passed; that gate failed with `BLOCKED: collected artifact root is missing or unreadable` (Windows OS error 3), matching the existing missing-artifacts gate. The workspace command therefore exited nonzero.
+- `rustup target list --installed` reports only `x86_64-pc-windows-msvc`. No Linux target was installed, so cross-compilation was not attempted and no target was downloaded.
+
+## Linux gate evidence: BLOCKED (review round 2)
+
+The new pinned-exec, bounded-inventory, mutation, and task-emptiness tests have **not** been type-checked or run for a Linux target in this environment. Do not interpret the Windows tests as Linux evidence. Required follow-up remains a Linux x86_64/aarch64 run of the crate tests and strict Clippy, including the new Linux-only adversarial tests and actual `FilesystemPrerequisites` evidence.
+
+Static review for this round confirms that child-side revalidation is bounded by the fixed inventory limits and uses retained directory descriptors plus stack buffers/raw syscalls (no recursive task walk or heap-built inventory after fork); the tool is not forked or execed until atomic cgroup placement or the parent release barrier succeeds. Actual Linux compiler/type checking and native behavior remain release gates.
+
+The changes and this appendix are included under the required commit subject: `feat(server): prove Linux filesystem isolation`.
 
 ## Review round 1 — required fixes
 

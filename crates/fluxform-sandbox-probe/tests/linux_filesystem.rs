@@ -270,6 +270,69 @@ mod linux {
     }
 
     #[test]
+    fn task_mutation_while_waiting_for_placement_fails_closed_before_tool_fork() {
+        let fixture = Fixture::new();
+        let (placement, mut ready, mut release) = barrier();
+        let mut child = Sandbox::spawn_blocked(
+            &fixture.child,
+            &["write-task".into()],
+            &fixture.policy(),
+            placement,
+        )
+        .expect("spawn blocked supervisor");
+
+        let mut pid_bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        ready.read_exact(&mut pid_bytes).expect("receive ready pid");
+        assert_eq!(libc::pid_t::from_ne_bytes(pid_bytes) as u32, child.id());
+        fs::write(fixture.job_dir.join("raced-file"), b"added before release")
+            .expect("mutate task directory while supervisor waits");
+        release.write_all(&[1]).expect("confirm resource placement");
+
+        assert_eq!(
+            child
+                .wait()
+                .expect("wait for fail-closed supervisor")
+                .code(),
+            Some(125)
+        );
+        assert!(!fixture.job_dir.join("result.bin").exists());
+    }
+
+    #[test]
+    fn tool_name_replacement_while_waiting_for_placement_fails_closed() {
+        let fixture = Fixture::new();
+        let (placement, mut ready, mut release) = barrier();
+        let mut child = Sandbox::spawn_blocked(
+            &fixture.child,
+            &["write-task".into()],
+            &fixture.policy(),
+            placement,
+        )
+        .expect("spawn blocked supervisor");
+
+        let mut pid_bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        ready.read_exact(&mut pid_bytes).expect("receive ready pid");
+        assert_eq!(libc::pid_t::from_ne_bytes(pid_bytes) as u32, child.id());
+        fs::rename(&fixture.child, fixture.tool_dir.join("approved-original"))
+            .expect("rename approved executable while supervisor waits");
+        fs::write(
+            &fixture.child,
+            b"replacement is not the approved executable",
+        )
+        .expect("replace executable policy name");
+        release.write_all(&[1]).expect("confirm resource placement");
+
+        assert_eq!(
+            child
+                .wait()
+                .expect("wait for fail-closed supervisor")
+                .code(),
+            Some(125)
+        );
+        assert!(!fixture.job_dir.join("result.bin").exists());
+    }
+
+    #[test]
     fn assigned_input_is_read_only() {
         let (status, fixture) = run("overwrite-path", &["/input".into()]);
         assert_eq!(status, 43, "the input bind allowed a write");
@@ -308,23 +371,12 @@ mod linux {
 
     #[test]
     fn symlinks_cannot_reach_files_outside_the_minimal_root() {
-        let fixture = Fixture::new();
-        let escape = fixture.job_dir.join("outside-link");
-        std::os::unix::fs::symlink("/etc/passwd", &escape).expect("create escape symlink");
-        let (placement, mut ready, mut release) = barrier();
-        let mut child = Sandbox::spawn_blocked(
-            &fixture.child,
-            &["read-path".into(), "/task/outside-link".into()],
-            &fixture.policy(),
-            placement,
-        )
-        .expect("spawn in the blocked sandbox");
-        let mut pid_bytes = [0; std::mem::size_of::<libc::pid_t>()];
-        ready.read_exact(&mut pid_bytes).expect("receive ready pid");
-        assert_eq!(libc::pid_t::from_ne_bytes(pid_bytes) as u32, child.id());
-        release.write_all(&[1]).expect("confirm test placement");
-        let status = child.wait().expect("wait for sandbox child");
-        assert_eq!(status.code(), Some(31));
+        let (status, fixture) = run("symlink-read-path", &["outside-link".into()]);
+        assert_eq!(
+            status, 31,
+            "task symlink unexpectedly reached host /etc/passwd"
+        );
+        assert!(fixture.job_dir.join("outside-link").is_symlink());
     }
 
     #[test]

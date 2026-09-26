@@ -32,6 +32,14 @@ fn main() {
             Some(_) => 31,
             None => 120,
         },
+        "symlink-read-path" => match arguments.next() {
+            Some(path) => match std::os::unix::fs::symlink("/etc/passwd", &path) {
+                Ok(()) if File::open(path).is_ok() => 30,
+                Ok(()) => 31,
+                Err(_) => 32,
+            },
+            None => 120,
+        },
         "write-path" => match arguments.next() {
             Some(path)
                 if OpenOptions::new()
