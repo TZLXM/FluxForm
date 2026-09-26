@@ -659,13 +659,19 @@ fn validate_basic_string(value: &str) -> Result<(), String> {
             '\\' => match characters.next() {
                 Some('b' | 't' | 'n' | 'f' | 'r' | '"' | '\\') => {}
                 Some('u') => {
+                    let mut code_point = 0_u32;
                     for _ in 0..4 {
-                        if !characters
+                        let digit = characters
                             .next()
-                            .is_some_and(|value| value.is_ascii_hexdigit())
-                        {
-                            return Err("invalid TOML unicode escape".to_owned());
-                        }
+                            .filter(|value| value.is_ascii_hexdigit())
+                            .and_then(|value| value.to_digit(16))
+                            .ok_or_else(|| "invalid TOML unicode escape".to_owned())?;
+                        code_point = (code_point << 4) | digit;
+                    }
+                    if (0xD800..=0xDFFF).contains(&code_point) {
+                        return Err(
+                            "TOML unicode escape must encode a Unicode scalar value".to_owned()
+                        );
                     }
                 }
                 _ => return Err("unsupported TOML basic string escape".to_owned()),

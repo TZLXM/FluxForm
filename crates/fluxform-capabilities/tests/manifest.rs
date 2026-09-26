@@ -291,6 +291,46 @@ fn rejects_json_only_escape_in_toml_string() {
 }
 
 #[test]
+fn rejects_lone_high_surrogate_escape() {
+    assert_manifest_rejected(
+        &VALID_MANIFEST.replace("image.jpeg-to-png", r#"image.\uD83D-to-png"#),
+    );
+}
+
+#[test]
+fn rejects_lone_low_surrogate_escape() {
+    assert_manifest_rejected(
+        &VALID_MANIFEST.replace("image.jpeg-to-png", r#"image.\uDE00-to-png"#),
+    );
+}
+
+#[test]
+fn rejects_surrogate_pair_escapes() {
+    assert_manifest_rejected(
+        &VALID_MANIFEST.replace("image.jpeg-to-png", r#"image.\uD83D\uDE00-to-png"#),
+    );
+}
+
+#[test]
+fn accepts_unicode_scalar_escape() {
+    let manifest_text = VALID_MANIFEST.replace("image.jpeg-to-png", r#"image.\u00E9-to-png"#);
+    let (_temporary, manifest, _) = load_fixture(&manifest_text);
+    let edge = manifest
+        .find_edge(
+            ConversionCategory::Image,
+            &InputProbeV1 {
+                extension: "jpeg".to_owned(),
+                demuxer: "image2".to_owned(),
+                codec: "mjpeg".to_owned(),
+                topology: "single_video_frame".to_owned(),
+            },
+            "png",
+        )
+        .expect("manifest with valid Unicode scalar escape loads");
+    assert_eq!(edge.id, "image.é-to-png");
+}
+
+#[test]
 fn rejects_missing_bounds_stream_mapping_policies_and_sample_ids() {
     for (field, replacement) in [
         ("minimum = 0\n", ""),
