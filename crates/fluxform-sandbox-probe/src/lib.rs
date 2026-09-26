@@ -402,6 +402,341 @@ fn proc_cgroup_matches(contents: &str, expected_path: &str) -> bool {
     unified == Some(expected_path)
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CgroupTopology {
+    root_path: String,
+    service_path: String,
+    job_path: String,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn run_cgroup_cleanup_sequence<E>(
+    mut kill: impl FnMut() -> Result<(), E>,
+    wait_for_placements: impl FnOnce() -> Result<(), E>,
+    wait_empty: impl FnOnce() -> Result<(), E>,
+    reap: impl FnOnce() -> Result<(), E>,
+    remove: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    kill()?;
+    wait_for_placements()?;
+    kill()?;
+    wait_empty()?;
+    reap()?;
+    remove()
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn cgroup_path_components(path: &str) -> Result<Vec<&str>, &'static str> {
+    if !path.starts_with('/') || path.contains('\0') {
+        return Err("cgroup path must be absolute and contain no NUL");
+    }
+    if path == "/" {
+        return Ok(Vec::new());
+    }
+    if path.ends_with('/') || path.contains("//") {
+        return Err("cgroup path is not canonical");
+    }
+    let components = path.split('/').skip(1).collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return Err("cgroup path contains an ambiguous component");
+    }
+    Ok(components)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn cgroup_topology(
+    root_path: &str,
+    service_path: &str,
+    job_id: &str,
+) -> Result<CgroupTopology, &'static str> {
+    validate_cgroup_job_id(job_id)?;
+    let root = cgroup_path_components(root_path)?;
+    let service = cgroup_path_components(service_path)?;
+    if root.is_empty() {
+        return Err("delegated cgroup root must not be the hierarchy root");
+    }
+    if service.len() != root.len() + 1 || service[..root.len()] != root[..] {
+        return Err("service management cgroup must be a direct child of delegated root");
+    }
+
+    let mut job = root.clone();
+    job.push(job_id);
+    if job.len() <= service.len() && service[..job.len()] == job[..] {
+        return Err("job cgroup path would contain the service management leaf");
+    }
+    let join = |components: &[&str]| format!("/{}", components.join("/"));
+    Ok(CgroupTopology {
+        root_path: join(&root),
+        service_path: join(&service),
+        job_path: join(&job),
+    })
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_cgroup_pids(contents: &str) -> Result<Vec<u32>, &'static str> {
+    let mut pids = Vec::new();
+    for line in contents.lines() {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 1 {
+            return Err("cgroup.procs contains a malformed PID record");
+        }
+        let pid = fields[0]
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or("cgroup.procs contains an invalid PID")?;
+        if pids.contains(&pid) {
+            return Err("cgroup.procs contains a duplicate PID");
+        }
+        pids.push(pid);
+    }
+    Ok(pids)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_cgroup_delegation(
+    available: &str,
+    enabled: &str,
+    root_processes: &str,
+    root_owner: u32,
+    service_uid: u32,
+) -> Result<(), &'static str> {
+    if root_owner != service_uid {
+        return Err("delegated cgroup root is not owned by the service UID");
+    }
+    if !parse_cgroup_pids(root_processes)?.is_empty() {
+        return Err("delegated root must have no internal processes");
+    }
+    for controller in ["cpu", "memory", "pids"] {
+        if !available
+            .split_ascii_whitespace()
+            .any(|item| item == controller)
+            || !enabled
+                .split_ascii_whitespace()
+                .any(|item| item == controller)
+        {
+            return Err("delegated root lacks a required available/enabled controller");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_cgroup_management_leaf(
+    processes: &str,
+    service_pid: u32,
+    child_cgroups: &[&str],
+) -> Result<(), &'static str> {
+    let pids = parse_cgroup_pids(processes)?;
+    if service_pid == 0 || pids.as_slice() != [service_pid] {
+        return Err("service cgroup must contain only the service process");
+    }
+    if !child_cgroups.is_empty() {
+        return Err("service management cgroup must be a leaf");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn derive_pinned_cgroup_path(
+    mount_root: &str,
+    mountpoint: &str,
+    pinned_root_path: &str,
+) -> Result<String, &'static str> {
+    let hierarchy_root = cgroup_path_components(mount_root)?;
+    let mountpoint = cgroup_path_components(mountpoint)?;
+    let pinned_root = cgroup_path_components(pinned_root_path)?;
+    if pinned_root.len() < mountpoint.len() || pinned_root[..mountpoint.len()] != mountpoint[..] {
+        return Err("pinned delegated root is outside its cgroup2 mountpoint");
+    }
+    let mut hierarchy_path = hierarchy_root;
+    hierarchy_path.extend_from_slice(&pinned_root[mountpoint.len()..]);
+    if hierarchy_path.is_empty() {
+        Ok("/".into())
+    } else {
+        Ok(format!("/{}", hierarchy_path.join("/")))
+    }
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn derive_cgroup_filesystem_path(
+    mount_root: &str,
+    mountpoint: &str,
+    hierarchy_path: &str,
+) -> Result<String, &'static str> {
+    let mount_root = cgroup_path_components(mount_root)?;
+    let mountpoint = cgroup_path_components(mountpoint)?;
+    let hierarchy_path = cgroup_path_components(hierarchy_path)?;
+    if hierarchy_path.len() < mount_root.len()
+        || hierarchy_path[..mount_root.len()] != mount_root[..]
+    {
+        return Err("hierarchy path is outside the pinned cgroup2 mount root");
+    }
+    let mut filesystem_path = mountpoint;
+    filesystem_path.extend_from_slice(&hierarchy_path[mount_root.len()..]);
+    if filesystem_path.is_empty() {
+        Ok("/".into())
+    } else {
+        Ok(format!("/{}", filesystem_path.join("/")))
+    }
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Cgroup2MountInfo {
+    mount_id: u64,
+    root: String,
+    mountpoint: String,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn decode_mountinfo_path(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_cgroup2_mountinfo(contents: &str) -> Result<Vec<Cgroup2MountInfo>, &'static str> {
+    let mut mounts = Vec::new();
+    for line in contents.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            return Err("mountinfo contains a malformed separator");
+        };
+        let left = before.split_ascii_whitespace().collect::<Vec<_>>();
+        let right = after.split_ascii_whitespace().collect::<Vec<_>>();
+        if right.first() != Some(&"cgroup2") {
+            continue;
+        }
+        if left.len() < 5 || right.len() < 3 {
+            return Err("cgroup2 mountinfo record is incomplete");
+        }
+        let mount_id = left[0]
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or("cgroup2 mountinfo record has an invalid mount ID")?;
+        if mounts
+            .iter()
+            .any(|mount: &Cgroup2MountInfo| mount.mount_id == mount_id)
+        {
+            return Err("mountinfo contains an ambiguous duplicate cgroup2 mount ID");
+        }
+        let root = decode_mountinfo_path(left[3]);
+        let mountpoint = decode_mountinfo_path(left[4]);
+        cgroup_path_components(&root)?;
+        cgroup_path_components(&mountpoint)?;
+        mounts.push(Cgroup2MountInfo {
+            mount_id,
+            root,
+            mountpoint,
+        });
+    }
+    Ok(mounts)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn select_cgroup2_mount(
+    contents: &str,
+    pinned_mount_id: u64,
+) -> Result<Cgroup2MountInfo, &'static str> {
+    let mounts = parse_cgroup2_mountinfo(contents)?;
+    let mut matching = mounts
+        .into_iter()
+        .filter(|mount| mount.mount_id == pinned_mount_id);
+    let mount = matching
+        .next()
+        .ok_or("pinned cgroup root mount ID is not a visible cgroup2 mount")?;
+    if matching.next().is_some() {
+        return Err("pinned cgroup root maps to multiple cgroup2 mount records");
+    }
+    Ok(mount)
+}
+
 /// Paths and resource limits declared by the trusted server for one job.
 ///
 /// On Linux, `job_dir` must be a private empty directory owned by the
@@ -430,10 +765,11 @@ pub trait ResourceBoundary: Send + Sync {
 
 /// Per-job Linux cgroup v2 resource boundary.
 ///
-/// The delegated root must be the current service process's cgroup and must
-/// already expose the `cpu`, `memory`, and `pids` controllers to children.
-/// `create` installs every aggregate limit before `prepare_spawn` can return a
-/// placement. A ready configuration record is not native stress evidence.
+/// The delegated root must be an owned cgroup v2 ancestor of the service's
+/// dedicated management leaf, with `cpu`, `memory`, and `pids` enabled for
+/// child cgroups. Jobs are created as siblings of that leaf. `create` installs
+/// every aggregate limit before `prepare_spawn` can return a placement. A
+/// ready configuration record is not native stress evidence.
 #[derive(Debug)]
 pub struct CgroupV2Job {
     evidence: CgroupEvidence,
@@ -441,7 +777,7 @@ pub struct CgroupV2Job {
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    inner: linux::CgroupV2JobInner,
+    inner: std::sync::Arc<linux::CgroupV2JobInner>,
 }
 
 impl CgroupV2Job {
@@ -464,7 +800,7 @@ impl CgroupV2Job {
                 linux::create_cgroup_job(delegated_root.as_ref(), job_id, limits, controls)?;
             Ok(Self {
                 evidence: CgroupEvidence::ready(job_id, limits).with_detail(detail),
-                inner,
+                inner: std::sync::Arc::new(inner),
             })
         }
 
@@ -505,6 +841,26 @@ impl CgroupV2Job {
         )))]
         {
             Path::new("")
+        }
+    }
+
+    /// Unified cgroup v2 hierarchy path used in `/proc/<pid>/cgroup` for this
+    /// job, derived from the pinned delegated root's mount ID.
+    pub fn membership_path(&self) -> &str {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            &self.inner.expected_cgroup_path
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            ""
         }
     }
 }
@@ -1039,6 +1395,7 @@ pub struct SandboxChild {
     pid: libc::pid_t,
     root: Option<linux::TempRoot>,
     reaper: std::sync::Arc<linux::ChildReaper>,
+    cgroup_cleanup: Option<std::sync::Arc<linux::CgroupV2JobInner>>,
 }
 
 #[cfg(all(
@@ -1058,6 +1415,38 @@ impl SandboxChild {
         Ok(status)
     }
 
+    /// Waits until `timeout`; on expiry, tears down and reaps the managed job
+    /// cgroup (or the unmanaged process group) before returning `TimedOut`.
+    pub fn wait_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "timeout overflow")
+            })?;
+        loop {
+            if let Some(status) = self.reaper.try_wait()? {
+                self.root.take();
+                return Ok(Some(status));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.kill()?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "sandbox child timed out and was terminated",
+                ));
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(std::time::Duration::from_millis(10)),
+            );
+        }
+    }
+
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let Some(status) = self.reaper.try_wait()? else {
             return Ok(None);
@@ -1067,11 +1456,16 @@ impl SandboxChild {
     }
 
     pub fn kill(&mut self) -> std::io::Result<()> {
-        if self.reaper.try_wait()?.is_some() {
-            return Ok(());
+        if let Some(cgroup) = &self.cgroup_cleanup {
+            cgroup
+                .kill_all()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            self.root.take();
+            let _ = self.reaper.wait()?;
+        } else if self.reaper.try_wait()?.is_none() {
+            linux::kill_process_group(self.pid)?;
+            let _ = self.wait()?;
         }
-        linux::kill_process_group(self.pid)?;
-        let _ = self.wait()?;
         Ok(())
     }
 }
@@ -1082,7 +1476,9 @@ impl SandboxChild {
 ))]
 impl Drop for SandboxChild {
     fn drop(&mut self) {
-        if self.reaper.try_wait().ok().flatten().is_none() {
+        if let Some(cgroup) = &self.cgroup_cleanup {
+            let _ = cgroup.kill_all();
+        } else if self.reaper.try_wait().ok().flatten().is_none() {
             let _ = linux::kill_process_group(self.pid);
             let _ = self.reaper.wait();
         }
@@ -1099,7 +1495,7 @@ impl Drop for SandboxChild {
 #[allow(unsafe_op_in_unsafe_fn)]
 mod linux {
     use super::{
-        CgroupEvidence, CgroupLimitControls, FileIdentity, FilesystemEvidence,
+        Cgroup2MountInfo, CgroupEvidence, CgroupLimitControls, FileIdentity, FilesystemEvidence,
         FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES, NetworkEvidence, NetworkPolicy,
         NetworkPrerequisites, NetworkSocketDomain, NetworkSyscall, PolicyPathIdentityGraph,
         ProbeEvidence, SandboxChild, SandboxError, SandboxLimits, SandboxPolicy, SpawnPlacement,
@@ -1319,7 +1715,7 @@ mod linux {
         job_fd: OwnedFd,
         job_name: CString,
         pub(super) path: PathBuf,
-        expected_cgroup_path: String,
+        pub(super) expected_cgroup_path: String,
         placement: CgroupPlacementKind,
         state: Arc<CgroupJobStateShared>,
         cleanup: Mutex<()>,
@@ -1329,6 +1725,7 @@ mod linux {
     pub(super) struct CgroupPlacement {
         kind: CgroupPlacementMode,
         reaper: Arc<ChildReaper>,
+        cleanup: Arc<CgroupV2JobInner>,
         _lease: CgroupLease,
     }
 
@@ -1462,7 +1859,7 @@ mod linux {
     }
 
     impl CgroupV2JobInner {
-        pub(super) fn prepare_spawn(&self) -> Result<CgroupPlacement, SandboxError> {
+        pub(super) fn prepare_spawn(self: &Arc<Self>) -> Result<CgroupPlacement, SandboxError> {
             let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
                 operation: "lock job cgroup lifecycle",
                 source: io::Error::other("job cgroup lifecycle lock was poisoned"),
@@ -1502,6 +1899,7 @@ mod linux {
             Ok(CgroupPlacement {
                 kind,
                 reaper,
+                cleanup: Arc::clone(self),
                 _lease: lease,
             })
         }
@@ -1543,92 +1941,108 @@ mod linux {
                 return Ok(());
             }
             state.closing = true;
-            let lease_deadline = Instant::now() + Duration::from_secs(5);
-            while state.active_spawns != 0 {
-                let now = Instant::now();
-                if now >= lease_deadline {
-                    return Err(SandboxError::Io {
-                        operation: "wait for active cgroup placements",
-                        source: io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "an in-flight spawn still owns a cgroup placement",
-                        ),
-                    });
-                }
-                let (next, timeout) = self
-                    .state
-                    .changed
-                    .wait_timeout(state, lease_deadline.saturating_duration_since(now))
-                    .map_err(|_| SandboxError::Io {
+            let reapers = state.reapers.clone();
+            drop(state);
+
+            super::run_cgroup_cleanup_sequence(
+                || {
+                    write_cgroup_file(self.job_fd.as_raw_fd(), "cgroup.kill", b"1\n").map_err(
+                        |source| SandboxError::Io {
+                            operation: "write job cgroup.kill",
+                            source,
+                        },
+                    )
+                },
+                || {
+                    let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
                         operation: "wait for active cgroup placements",
                         source: io::Error::other("job cgroup lifecycle lock was poisoned"),
                     })?;
-                state = next;
-                if timeout.timed_out() && state.active_spawns != 0 {
-                    return Err(SandboxError::Io {
-                        operation: "wait for active cgroup placements",
-                        source: io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "an in-flight spawn still owns a cgroup placement",
-                        ),
-                    });
-                }
-            }
-            let reapers = state.reapers.clone();
-            drop(state);
-            write_cgroup_file(self.job_fd.as_raw_fd(), "cgroup.kill", b"1\n").map_err(
-                |source| SandboxError::Io {
-                    operation: "write job cgroup.kill",
-                    source,
+                    let lease_deadline = Instant::now() + Duration::from_secs(5);
+                    while state.active_spawns != 0 {
+                        let now = Instant::now();
+                        if now >= lease_deadline {
+                            return Err(SandboxError::Io {
+                                operation: "wait for active cgroup placements",
+                                source: io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "an in-flight spawn still owns a cgroup placement",
+                                ),
+                            });
+                        }
+                        let (next, timeout) = self
+                            .state
+                            .changed
+                            .wait_timeout(state, lease_deadline.saturating_duration_since(now))
+                            .map_err(|_| SandboxError::Io {
+                                operation: "wait for active cgroup placements",
+                                source: io::Error::other("job cgroup lifecycle lock was poisoned"),
+                            })?;
+                        state = next;
+                        if timeout.timed_out() && state.active_spawns != 0 {
+                            return Err(SandboxError::Io {
+                                operation: "wait for active cgroup placements",
+                                source: io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "an in-flight spawn still owns a cgroup placement",
+                                ),
+                            });
+                        }
+                    }
+                    Ok(())
                 },
-            )?;
-
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if self.is_empty()? {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    return Err(SandboxError::Io {
-                        operation: "wait for empty job cgroup",
-                        source: io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "cgroup.events did not report populated 0 within five seconds",
-                        ),
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-
-            let reap_deadline = Instant::now() + Duration::from_secs(5);
-            for reaper in reapers {
-                reaper
-                    .wait_bounded(reap_deadline)
-                    .map_err(|source| SandboxError::Io {
-                        operation: "reap cgroup sandbox supervisor",
-                        source,
+                || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if self.is_empty()? {
+                            return Ok(());
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(SandboxError::Io {
+                                operation: "wait for empty job cgroup",
+                                source: io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "cgroup.events did not report populated 0 within five seconds",
+                                ),
+                            });
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                },
+                || {
+                    let reap_deadline = Instant::now() + Duration::from_secs(5);
+                    for reaper in reapers {
+                        reaper
+                            .wait_bounded(reap_deadline)
+                            .map_err(|source| SandboxError::Io {
+                                operation: "reap cgroup sandbox supervisor",
+                                source,
+                            })?;
+                    }
+                    Ok(())
+                },
+                || {
+                    let result = unsafe {
+                        libc::unlinkat(
+                            self.root_fd.as_raw_fd(),
+                            self.job_name.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        )
+                    };
+                    if result != 0 {
+                        return Err(SandboxError::Io {
+                            operation: "remove empty job cgroup",
+                            source: io::Error::last_os_error(),
+                        });
+                    }
+                    let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
+                        operation: "lock job cgroup lifecycle",
+                        source: io::Error::other("job cgroup lifecycle lock was poisoned"),
                     })?;
-            }
-
-            let result = unsafe {
-                libc::unlinkat(
-                    self.root_fd.as_raw_fd(),
-                    self.job_name.as_ptr(),
-                    libc::AT_REMOVEDIR,
-                )
-            };
-            if result != 0 {
-                return Err(SandboxError::Io {
-                    operation: "remove empty job cgroup",
-                    source: io::Error::last_os_error(),
-                });
-            }
-            let mut state = self.state.state.lock().map_err(|_| SandboxError::Io {
-                operation: "lock job cgroup lifecycle",
-                source: io::Error::other("job cgroup lifecycle lock was poisoned"),
-            })?;
-            state.removed = true;
-            Ok(())
+                    state.removed = true;
+                    Ok(())
+                },
+            )
         }
     }
 
@@ -1646,7 +2060,7 @@ mod linux {
                     cgroup_kill.write_all(b"1\n")
                 }
             };
-            let supervisor_result = kill_process_group(supervisor_pid);
+            let supervisor_result = kill_supervisor(supervisor_pid);
             cgroup_result.and(supervisor_result)
         }
 
@@ -1697,7 +2111,7 @@ mod linux {
 
             if let Err(source) = attach {
                 let _ = cgroup_kill.write_all(b"1\n");
-                let _ = kill_process_group(supervisor_pid);
+                let _ = kill_supervisor(supervisor_pid);
                 return Err(SandboxError::Io {
                     operation: "attach blocked supervisor to job cgroup",
                     source,
@@ -1738,28 +2152,97 @@ mod linux {
 
         let current_path = process_cgroup_path()
             .map_err(|error| blocked(format!("cannot read current process cgroup: {error}")))?;
-        verify_delegated_root_is_current_cgroup(root_fd.as_raw_fd(), delegated_root, &current_path)
-            .map_err(|error| {
-                blocked(format!("delegated root is not the service cgroup: {error}"))
+        let (mount, mount_id, root_cgroup_path) = cgroup_mount_for_fd(root_fd.as_raw_fd())
+            .map_err(|error| blocked(format!("cannot pin delegated root mount: {error}")))?;
+        let topology =
+            super::cgroup_topology(&root_cgroup_path, &current_path, job_id).map_err(|reason| {
+                blocked(format!("invalid delegated root/service topology: {reason}"))
             })?;
+
+        let root_components = super::cgroup_path_components(&topology.root_path)
+            .map_err(|reason| blocked(format!("invalid delegated root path: {reason}")))?;
+        let service_components = super::cgroup_path_components(&topology.service_path)
+            .map_err(|reason| blocked(format!("invalid service management path: {reason}")))?;
+        let service_fd = open_cgroup_child_chain(
+            root_fd.as_raw_fd(),
+            &service_components[root_components.len()..],
+        )
+        .map_err(|error| blocked(format!("cannot pin service management leaf: {error}")))?;
+        verify_cgroup2_fs(service_fd.as_raw_fd()).map_err(|error| {
+            blocked(format!("service management path is not cgroup v2: {error}"))
+        })?;
+        if cgroup_mount_id_for_fd(service_fd.as_raw_fd())
+            .map_err(|error| blocked(format!("cannot verify management leaf mount: {error}")))?
+            != mount_id
+        {
+            return Err(blocked(
+                "service management leaf is outside the pinned delegated cgroup2 mount".into(),
+            ));
+        }
+        let expected_service_fs_path =
+            super::derive_cgroup_filesystem_path(&mount.root, &mount.mountpoint, &current_path)
+                .map_err(|reason| blocked(format!("cannot map service cgroup path: {reason}")))?;
+        let actual_service_fs_path = cgroup_fd_path(service_fd.as_raw_fd())
+            .map_err(|error| blocked(format!("cannot resolve service management leaf: {error}")))?;
+        if Path::new(&actual_service_fs_path) != Path::new(&expected_service_fs_path) {
+            return Err(blocked(format!(
+                "service cgroup membership {current_path} does not map to pinned management leaf {actual_service_fs_path}"
+            )));
+        }
+
+        verify_domain_cgroup(root_fd.as_raw_fd())
+            .map_err(|error| blocked(format!("delegated root is not a domain cgroup: {error}")))?;
+        verify_domain_cgroup(service_fd.as_raw_fd()).map_err(|error| {
+            blocked(format!(
+                "service management leaf is not a domain cgroup: {error}"
+            ))
+        })?;
+        let root_metadata = stat_cgroup_directory(root_fd.as_raw_fd()).map_err(|error| {
+            blocked(format!("cannot inspect delegated root ownership: {error}"))
+        })?;
+        let service_metadata = stat_cgroup_directory(service_fd.as_raw_fd()).map_err(|error| {
+            blocked(format!(
+                "cannot inspect service management ownership: {error}"
+            ))
+        })?;
+        let effective_uid = unsafe { libc::geteuid() };
 
         let available = read_cgroup_file(root_fd.as_raw_fd(), "cgroup.controllers")
             .map_err(|error| blocked(format!("cannot read cgroup.controllers: {error}")))?;
         let enabled = read_cgroup_file(root_fd.as_raw_fd(), "cgroup.subtree_control")
             .map_err(|error| blocked(format!("cannot read cgroup.subtree_control: {error}")))?;
-        for controller in ["cpu", "memory", "pids"] {
-            if !available
-                .split_ascii_whitespace()
-                .any(|item| item == controller)
-                || !enabled
-                    .split_ascii_whitespace()
-                    .any(|item| item == controller)
-            {
-                return Err(blocked(format!(
-                    "delegated cgroup root must expose and enable the {controller} controller"
-                )));
-            }
+        let root_processes =
+            read_cgroup_file(root_fd.as_raw_fd(), "cgroup.procs").map_err(|error| {
+                blocked(format!("cannot read delegated root cgroup.procs: {error}"))
+            })?;
+        super::validate_cgroup_delegation(
+            &available,
+            &enabled,
+            &root_processes,
+            root_metadata.st_uid,
+            effective_uid,
+        )
+        .map_err(|reason| blocked(format!("delegated root validation failed: {reason}")))?;
+        if service_metadata.st_uid != effective_uid {
+            return Err(blocked(
+                "service management leaf is not owned by the service effective UID".into(),
+            ));
         }
+        let service_processes =
+            read_cgroup_file(service_fd.as_raw_fd(), "cgroup.procs").map_err(|error| {
+                blocked(format!(
+                    "cannot read service management cgroup.procs: {error}"
+                ))
+            })?;
+        let child_cgroups = cgroup_child_directories(service_fd.as_raw_fd())
+            .map_err(|error| blocked(format!("cannot inspect service management leaf: {error}")))?;
+        let child_names = child_cgroups.iter().map(String::as_str).collect::<Vec<_>>();
+        super::validate_cgroup_management_leaf(
+            &service_processes,
+            unsafe { libc::getpid() } as u32,
+            &child_names,
+        )
+        .map_err(|reason| blocked(format!("invalid service management leaf: {reason}")))?;
 
         let job_name = CString::new(job_id)
             .map_err(|_| SandboxError::InvalidPolicy("job id contains NUL".into()))?;
@@ -1819,10 +2302,7 @@ mod linux {
                 open_cgroup_control(job_fd.as_raw_fd(), "cgroup.procs", true)
                     .map_err(|error| format!("cgroup.procs is not writable: {error}"))?,
             );
-            let expected_cgroup_path = format!("{}/{}", current_path.trim_end_matches('/'), job_id);
-            if expected_cgroup_path.starts_with("//") {
-                return Err("current cgroup path is malformed".into());
-            }
+            let expected_cgroup_path = topology.job_path.clone();
             let clone3_supported =
                 probe_clone3_into_cgroup(job_fd.as_raw_fd(), &expected_cgroup_path)
                     .map_err(|error| format!("CLONE_INTO_CGROUP probe failed: {error}"))?;
@@ -1921,6 +2401,37 @@ mod linux {
         Ok(current)
     }
 
+    fn open_cgroup_child_chain(root_fd: RawFd, components: &[&str]) -> io::Result<OwnedFd> {
+        let duplicate = unsafe { libc::fcntl(root_fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut current = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        for component in components {
+            if component.is_empty() || matches!(*component, "." | "..") || component.contains('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cgroup descendant has an ambiguous component",
+                ));
+            }
+            let name = CString::new(*component).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contains NUL")
+            })?;
+            let next = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if next < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            current = unsafe { OwnedFd::from_raw_fd(next) };
+        }
+        Ok(current)
+    }
+
     fn verify_cgroup2_fs(fd: RawFd) -> io::Result<()> {
         let mut stat: libc::statfs = unsafe { zeroed() };
         if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
@@ -1933,6 +2444,49 @@ mod linux {
             ));
         }
         Ok(())
+    }
+
+    fn stat_cgroup_directory(fd: RawFd) -> io::Result<libc::stat> {
+        let mut stat: libc::stat = unsafe { zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned cgroup descriptor is not a directory",
+            ));
+        }
+        Ok(stat)
+    }
+
+    fn verify_domain_cgroup(fd: RawFd) -> io::Result<()> {
+        let kind = read_cgroup_file(fd, "cgroup.type")?;
+        if kind.trim() != "domain" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cgroup.type is {:?}, expected domain", kind.trim()),
+            ));
+        }
+        Ok(())
+    }
+
+    fn cgroup_child_directories(fd: RawFd) -> io::Result<Vec<String>> {
+        let path = format!("/proc/self/fd/{fd}");
+        let mut children = Vec::new();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                children.push(entry.file_name().to_string_lossy().into_owned());
+            } else if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cgroup directory contains an unexpected symlink",
+                ));
+            }
+        }
+        Ok(children)
     }
 
     fn open_cgroup_control(dir_fd: RawFd, name: &str, write: bool) -> io::Result<File> {
@@ -2009,54 +2563,69 @@ mod linux {
         })
     }
 
-    fn decode_mountinfo_path(value: &str) -> String {
-        value
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\")
-    }
-
-    fn cgroup2_mountpoint() -> io::Result<PathBuf> {
-        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        for line in mountinfo.lines() {
-            let Some((before, after)) = line.split_once(" - ") else {
-                continue;
-            };
-            let left = before.split_ascii_whitespace().collect::<Vec<_>>();
-            let right = after.split_ascii_whitespace().collect::<Vec<_>>();
-            if right.first() == Some(&"cgroup2") && left.len() >= 5 {
-                return Ok(PathBuf::from(decode_mountinfo_path(left[4])));
-            }
+    fn cgroup_mount_id_for_fd(fd: RawFd) -> io::Result<u64> {
+        let mut buffer = [0_u64; 32];
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                fd,
+                c"".as_ptr(),
+                AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                STATX_BASIC_STATS | STATX_MNT_ID,
+                buffer.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
         }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no cgroup2 mount is visible",
-        ))
+        let bytes = buffer.as_ptr().cast::<u8>();
+        let mask = unsafe { std::ptr::read_unaligned(bytes.cast::<u32>()) };
+        if mask & STATX_MNT_ID == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel does not report mount IDs for pinned cgroups",
+            ));
+        }
+        Ok(unsafe { std::ptr::read_unaligned(bytes.add(144).cast::<u64>()) })
     }
 
-    fn verify_delegated_root_is_current_cgroup(
-        root_fd: RawFd,
-        _delegated_root: &Path,
-        current_path: &str,
-    ) -> io::Result<()> {
-        if !current_path.starts_with('/') || current_path.ends_with('/') {
-            return Err(io::Error::new(
+    fn cgroup_fd_path(fd: RawFd) -> io::Result<String> {
+        let path = fs::canonicalize(format!("/proc/self/fd/{fd}"))?;
+        let path = path.to_str().ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                "current cgroup path is malformed",
-            ));
-        }
-        let mountpoint = cgroup2_mountpoint()?;
-        let current_dir = mountpoint.join(current_path.trim_start_matches('/'));
-        let expected = fs::canonicalize(current_dir)?;
-        let actual = fs::canonicalize(format!("/proc/self/fd/{root_fd}"))?;
-        if actual != expected {
+                "pinned cgroup filesystem path is not UTF-8",
+            )
+        })?;
+        if path.ends_with(" (deleted)") {
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "only the caller's own delegated cgroup can be used as the root",
+                io::ErrorKind::NotFound,
+                "pinned cgroup path has been deleted",
             ));
         }
-        Ok(())
+        Ok(path.to_owned())
+    }
+
+    fn cgroup_mount_for_fd(fd: RawFd) -> io::Result<(Cgroup2MountInfo, u64, String)> {
+        let mount_id = cgroup_mount_id_for_fd(fd)?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        let mut mount = super::select_cgroup2_mount(&mountinfo, mount_id)
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
+        let mountpoint = fs::canonicalize(&mount.mountpoint)?;
+        mount.mountpoint = mountpoint
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pinned cgroup mountpoint is not UTF-8",
+                )
+            })?
+            .to_owned();
+        let pinned_root = cgroup_fd_path(fd)?;
+        let hierarchy_root =
+            super::derive_pinned_cgroup_path(&mount.root, &mount.mountpoint, &pinned_root)
+                .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
+        Ok((mount, mount_id, hierarchy_root))
     }
 
     fn probe_clone3_into_cgroup(fd: RawFd, expected_path: &str) -> io::Result<bool> {
@@ -3400,6 +3969,10 @@ mod linux {
                 ChildReaper::new()
             }
         };
+        let cgroup_cleanup = match &placement {
+            SpawnPlacement::CgroupV2(managed) => Some(Arc::clone(&managed.inner.cleanup)),
+            SpawnPlacement::CloneIntoCgroup(_) | SpawnPlacement::ParentAttachBarrier { .. } => None,
+        };
         validate_limits(policy.limits)?;
         let input = open_pinned_path(&policy.input, false, "input")?;
         let task = open_pinned_path(&policy.job_dir, true, "task directory")?;
@@ -3757,7 +4330,7 @@ mod linux {
         }
         if let SpawnPlacement::CgroupV2(managed) = &mut placement {
             if let Err(error) = managed.inner.attach_and_release(pid) {
-                let _ = kill_process_group(pid);
+                let _ = kill_supervisor(pid);
                 let _ = wait_for_child(pid);
                 return Err(error);
             }
@@ -3774,6 +4347,7 @@ mod linux {
             pid,
             root: Some(temp_root),
             reaper,
+            cgroup_cleanup,
         })
     }
 
@@ -5533,6 +6107,18 @@ mod linux {
         }
     }
 
+    fn kill_supervisor(pid: libc::pid_t) -> io::Result<()> {
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     fn success() -> ProbeResult {
         ProbeResult {
             operation: PROBE_OK,
@@ -6458,6 +7044,177 @@ mod review_regression_tests {
             "0::/delegated/job-42\n0::/other\n",
             "/delegated/job-42"
         ));
+    }
+
+    #[test]
+    fn cgroup_topology_places_jobs_as_siblings_of_the_management_leaf() {
+        let topology = cgroup_topology(
+            "/system.slice/fluxform.service",
+            "/system.slice/fluxform.service/management",
+            "job-42",
+        )
+        .expect("valid delegated root and service management leaf");
+
+        assert_eq!(topology.root_path, "/system.slice/fluxform.service");
+        assert_eq!(
+            topology.service_path,
+            "/system.slice/fluxform.service/management"
+        );
+        assert_eq!(topology.job_path, "/system.slice/fluxform.service/job-42");
+    }
+
+    #[test]
+    fn cgroup_cleanup_signals_before_and_after_draining_active_placements() {
+        let events = std::cell::RefCell::new(Vec::new());
+        run_cgroup_cleanup_sequence(
+            || {
+                events.borrow_mut().push("cgroup.kill");
+                Ok::<_, ()>(())
+            },
+            || {
+                events.borrow_mut().push("wait placements");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("wait populated 0");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("reap supervisor");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("remove cgroup");
+                Ok(())
+            },
+        )
+        .expect("cleanup sequence");
+        assert_eq!(
+            *events.borrow(),
+            [
+                "cgroup.kill",
+                "wait placements",
+                "cgroup.kill",
+                "wait populated 0",
+                "reap supervisor",
+                "remove cgroup",
+            ]
+        );
+    }
+
+    #[test]
+    fn cgroup_topology_rejects_equal_escape_nested_and_ambiguous_paths() {
+        for (root, service) in [
+            ("/delegated", "/delegated"),
+            ("/delegated", "/elsewhere/service"),
+            ("/delegated", "/delegated-sibling/service"),
+            ("/delegated/service", "/delegated"),
+            ("/delegated", "/delegated/management/nested"),
+            ("/delegated//nested", "/delegated//nested/management"),
+            ("/delegated/./nested", "/delegated/nested/management"),
+        ] {
+            assert!(
+                cgroup_topology(root, service, "job-42").is_err(),
+                "accepted ambiguous root/service topology {root:?} -> {service:?}"
+            );
+        }
+        assert!(
+            cgroup_topology("/delegated", "/delegated/management/service", "management").is_err()
+        );
+    }
+
+    #[test]
+    fn cgroup_delegation_requires_owned_empty_root_and_enabled_controllers() {
+        assert!(
+            validate_cgroup_delegation("cpu memory pids", "cpu memory pids", "", 1000, 1000,)
+                .is_ok()
+        );
+
+        assert!(validate_cgroup_delegation("cpu memory", "cpu memory", "", 1000, 1000).is_err());
+        assert!(
+            validate_cgroup_delegation("cpu memory pids", "cpu memory", "", 1000, 1000).is_err()
+        );
+        assert!(
+            validate_cgroup_delegation("cpu memory pids", "cpu memory pids", "42\n", 1000, 1000)
+                .is_err()
+        );
+        assert!(
+            validate_cgroup_delegation("cpu memory pids", "cpu memory pids", "", 0, 1000).is_err()
+        );
+    }
+
+    #[test]
+    fn cgroup_management_leaf_must_only_contain_service_and_have_no_children() {
+        assert!(validate_cgroup_management_leaf("1234\n", 1234, &[]).is_ok());
+        assert!(validate_cgroup_management_leaf("1234\n5678\n", 1234, &[]).is_err());
+        assert!(validate_cgroup_management_leaf("1234\n", 1234, &["nested-job"]).is_err());
+    }
+
+    #[test]
+    fn pinned_cgroup_mount_path_maps_filesystem_root_to_hierarchy_sibling_path() {
+        assert_eq!(
+            derive_pinned_cgroup_path("/", "/sys/fs/cgroup", "/sys/fs/cgroup/tenant/delegate",),
+            Ok("/tenant/delegate".into())
+        );
+        assert_eq!(
+            derive_pinned_cgroup_path(
+                "/",
+                "/sys/fs/cgroup",
+                "/sys/fs/cgroup/tenant/delegate/job-42",
+            ),
+            Ok("/tenant/delegate/job-42".into())
+        );
+        assert!(
+            derive_pinned_cgroup_path(
+                "/",
+                "/sys/fs/cgroup",
+                "/sys/fs/cgroup-other/tenant/delegate",
+            )
+            .is_err()
+        );
+        assert!(
+            derive_pinned_cgroup_path("/", "/sys/fs/cgroup", "/sys/fs/cgroup/tenant/../outside",)
+                .is_err()
+        );
+        assert_eq!(
+            derive_pinned_cgroup_path("/tenant/delegate", "/sys/fs/cgroup", "/sys/fs/cgroup",),
+            Ok("/tenant/delegate".into())
+        );
+        assert_eq!(
+            derive_cgroup_filesystem_path(
+                "/tenant/delegate",
+                "/sys/fs/cgroup",
+                "/tenant/delegate/management",
+            ),
+            Ok("/sys/fs/cgroup/management".into())
+        );
+        assert!(
+            derive_cgroup_filesystem_path(
+                "/tenant/delegate",
+                "/sys/fs/cgroup",
+                "/tenant/delegate-other/management",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cgroup_mount_mapping_is_selected_by_the_pinned_mount_id() {
+        let mountinfo = "29 1 0:24 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n30 29 0:24 /tenant/delegate /sys/fs/cgroup/delegate rw - cgroup2 cgroup rw\n31 1 0:8 / / rw - ext4 /dev/root rw\n";
+        assert_eq!(
+            select_cgroup2_mount(mountinfo, 30),
+            Ok(Cgroup2MountInfo {
+                mount_id: 30,
+                root: "/tenant/delegate".into(),
+                mountpoint: "/sys/fs/cgroup/delegate".into(),
+            })
+        );
+        assert!(select_cgroup2_mount(mountinfo, 99).is_err());
+        assert!(select_cgroup2_mount(
+            "29 1 0:24 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n29 1 0:24 /tenant /sys/fs/cgroup/tenant rw - cgroup2 cgroup rw\n",
+            29
+        )
+        .is_err());
     }
 
     #[test]

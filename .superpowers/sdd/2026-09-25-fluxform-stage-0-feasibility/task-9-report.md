@@ -78,7 +78,7 @@ tests above passed.
   The library-only target check then failed because the Linux `core` / `std`
   target is not installed. No target was downloaded and no network fetch was
   attempted.
-- There is no Linux host or delegated cgroup subtree here. The five native
+- There is no Linux host or delegated cgroup subtree here. The eight native
   resource tests remain **BLOCKED**, not skipped/passed evidence. Their Linux
   fixture requires `FLUXFORM_TEST_CGROUP_ROOT` to name an already delegated
   cgroup v2 subtree. A supported Linux runner must compile with strict Clippy
@@ -88,3 +88,62 @@ tests above passed.
 ## Commit
 
 Required subject: `feat(server): contain worker resources with cgroup v2`.
+
+## Review fix round 1 — topology and cancellation ownership
+
+- Root cause confirmed: setup equated the delegated root with the process's
+  current cgroup, which both blocks the normal no-internal-process delegated
+  domain layout and nests each job beneath the service process. Setup now pins
+  the root descriptor's mount ID with `statx`, selects exactly one matching
+  cgroup2 record from `/proc/self/mountinfo`, maps that pinned filesystem path
+  to its unified hierarchy path, and validates `root/service` as the direct,
+  single-process management leaf. The delegated root must be owned by the
+  effective service UID, have no internal processes, be a domain cgroup, and
+  expose and enable `cpu`, `memory`, and `pids`; the management leaf must be
+  same-owner, domain-type, contain only the service process, and have no child
+  cgroups. Jobs remain exclusive direct children of the delegated root, so
+  their exact `/proc/<pid>/cgroup` identity is derived as `root/job`, not from
+  the service leaf.
+- Added portable topology/mount/delegation fixtures covering valid
+  root/service plus root/job placement; root-equals-service, outside/prefix
+  escape, nested/noncanonical/ambiguous paths; duplicate or missing pinned
+  mount IDs; missing available/enabled controllers; wrong owner; internal root
+  processes; and non-leaf or shared-process management cgroups.
+- Cancellation root cause confirmed: a returned `SandboxChild` retained only
+  the supervisor PID and always signaled a process group, while `setsid`
+  descendants could remain outside it. The child now retains a shared Arc
+  cleanup handle for the job. Explicit `kill`, timeout, and `Drop` use the
+  serialized/idempotent cgroup cleanup path: `cgroup.kill` before waiting for
+  active placements, a second `cgroup.kill` after they drain, bounded wait for
+  `populated 0`, supervisor reap, and cgroup removal. Explicit kill returns
+  cleanup errors; Drop remains best-effort. Managed placement-failure paths
+  kill the still-blocked supervisor directly, with no process-group fallback.
+  Shared ownership supports either owner-drop order; Task 8 attestation ACK
+  and placement/release order is unchanged.
+- The Linux aggregate tests now exercise cleanup through
+  `SandboxChild::kill`, `wait_timeout`, and `Drop` rather than directly invoking
+  `fixture.cgroup.kill_all`; added tests cover both drop orders and verify exact
+  membership before cancellation, empty/removal afterward, and no surviving
+  reported processes. A final static audit replaced a stale reference to the
+  removed per-PID lookup helper with the live-member collector. These Linux
+  cases remain BLOCKED on this Windows host and cannot be type-checked here.
+- TDD evidence: portable tests first failed to compile on the missing topology,
+  delegation, management-leaf, and pinned-path helpers (expected RED); after
+  implementation, all 10 cgroup-focused portable unit tests passed. The
+  cleanup-order test then failed to compile on the missing sequence helper
+  (expected RED), and passed after the production cleanup path was routed
+  through the tested kill-before-drain / kill-after-drain sequence. The
+  Linux-only kill/timeout/Drop tests cannot be compiled or executed here and
+  are not claimed as RED/GREEN evidence.
+- Review-fix verification passed: `cargo test --offline --locked
+  -p fluxform-sandbox-probe --all-targets` (27 library tests, 2 filesystem
+  tests, 1 explicit non-Linux BLOCKED-evidence test), workspace Clippy with
+  `-D warnings`, formatting check, diff check, selected workspace tests
+  excluding the previously failing Windows-native atomic-output cases, and the
+  capability runner/manifest tests.
+- Native Linux compilation remains BLOCKED: only
+  `x86_64-pc-windows-msvc` is installed; offline all-target Linux check lacks
+  cached `errno v0.3.14`, and library-only Linux check lacks Linux `core` and
+  `std`. No target download or network fetch was attempted. A delegated Linux
+  runner is still required for the eight native cgroup integration tests.
+- Review-fix commit subject: `fix(server): correct cgroup delegation and cancellation`.

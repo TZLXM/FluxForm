@@ -159,22 +159,7 @@ mod linux {
     }
 
     fn expected_cgroup_path(fixture: &Fixture) -> String {
-        let own = fs::read_to_string("/proc/self/cgroup").expect("read own cgroup");
-        let parent = own
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .expect("unified cgroup membership");
-        let name = fixture
-            .cgroup
-            .path()
-            .file_name()
-            .expect("job cgroup name")
-            .to_string_lossy();
-        if parent == "/" {
-            format!("/{name}")
-        } else {
-            format!("{parent}/{name}")
-        }
+        fixture.cgroup.membership_path().to_owned()
     }
 
     fn assert_exact_membership(fixture: &Fixture, host_pids: &[u32]) {
@@ -196,22 +181,57 @@ mod linux {
         }
     }
 
-    fn host_pid_for_namespace_pid(fixture: &Fixture, namespace_pid: u32) -> u32 {
-        for host_pid in read_members(fixture) {
-            let status =
-                fs::read_to_string(format!("/proc/{host_pid}/status")).expect("read worker status");
-            let namespace_pids = status
+    fn host_tree_pids(fixture: &Fixture) -> Vec<u32> {
+        let reported = wait_for_lines(
+            &fixture.job_dir.join("tree-pids.txt"),
+            3,
+            Duration::from_secs(5),
+        )
+        .lines()
+        .map(|line| line.parse::<u32>().expect("namespace PID"))
+        .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 3, "worker and double-fork tree report PIDs");
+        let members = read_members(fixture);
+        assert!(
+            members.len() >= 2,
+            "setsid tree must leave live cgroup members"
+        );
+        for host_pid in &members {
+            let status = fs::read_to_string(format!("/proc/{host_pid}/status"))
+                .expect("read cgroup member status");
+            let namespace_pid = status
                 .lines()
                 .find_map(|line| line.strip_prefix("NSpid:"))
                 .expect("PID namespace mapping")
                 .split_ascii_whitespace()
-                .filter_map(|part| part.parse::<u32>().ok())
-                .collect::<Vec<_>>();
-            if namespace_pids.last() == Some(&namespace_pid) {
-                return host_pid;
-            }
+                .last()
+                .and_then(|part| part.parse::<u32>().ok())
+                .expect("numeric innermost namespace PID");
+            assert!(
+                reported.contains(&namespace_pid),
+                "cgroup PID {host_pid} ({namespace_pid}) was not reported by tree action"
+            );
         }
-        panic!("namespace PID {namespace_pid} has no host PID in the job cgroup");
+        members
+    }
+
+    fn assert_processes_gone(pids: &[u32]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let survivors = pids
+                .iter()
+                .filter(|pid| Path::new("/proc").join(pid.to_string()).exists())
+                .copied()
+                .collect::<Vec<_>>();
+            if survivors.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cgroup cancellation left descendants visible in /proc: {survivors:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait_for_file(path: &Path, timeout: Duration) -> String {
@@ -280,7 +300,7 @@ mod linux {
         assert!(members.len() <= fixture.limits.pids_max as usize);
         assert_exact_membership(&fixture, &members);
 
-        fixture.cgroup.kill_all().expect("kill and reap all pids");
+        child.kill().expect("cancel worker through SandboxChild");
         assert!(fixture.cgroup.is_empty().expect("check empty cgroup"));
         assert!(
             child
@@ -319,10 +339,9 @@ mod linux {
                 .trim(),
             "0"
         );
-        fixture
-            .cgroup
-            .kill_all()
-            .expect("kill aggregate memory workers");
+        child
+            .kill()
+            .expect("cancel aggregate memory workers through SandboxChild");
         assert!(child.try_wait().expect("reap memory supervisor").is_some());
     }
 
@@ -346,29 +365,16 @@ mod linux {
             usage <= 800_000,
             "job used {usage} CPU microseconds under a 25% quota"
         );
-        fixture
-            .cgroup
-            .kill_all()
-            .expect("remove empty CPU job cgroup");
+        child
+            .kill()
+            .expect("remove CPU job cgroup through SandboxChild");
     }
 
     #[test]
     fn setsid_double_fork_descendants_are_born_in_job_cgroup() {
         let fixture = Fixture::new(16, 128 * 1024 * 1024, 100_000);
         let mut child = fixture.spawn("resource-tree", &[]);
-        let pids = wait_for_lines(
-            &fixture.job_dir.join("tree-pids.txt"),
-            3,
-            Duration::from_secs(5),
-        )
-        .lines()
-        .map(|line| line.parse::<u32>().expect("namespace PID"))
-        .collect::<Vec<_>>();
-        assert_eq!(
-            pids.len(),
-            3,
-            "worker, setsid child, and grandchild must all report"
-        );
+        let host_pids = host_tree_pids(&fixture);
         let session: i32 = fs::read_to_string(fixture.job_dir.join("tree-session.txt"))
             .expect("setsid result")
             .trim()
@@ -378,13 +384,11 @@ mod linux {
             session > 0,
             "managed cgroup worker could not create a session"
         );
-        let host_pids = pids
-            .into_iter()
-            .map(|pid| host_pid_for_namespace_pid(&fixture, pid))
-            .collect::<Vec<_>>();
         assert_exact_membership(&fixture, &host_pids);
 
-        fixture.cgroup.kill_all().expect("kill setsid descendants");
+        child
+            .kill()
+            .expect("SandboxChild::kill stops every cgroup descendant");
         assert!(
             fixture
                 .cgroup
@@ -401,6 +405,73 @@ mod linux {
             !fixture.cgroup.path().exists(),
             "empty job cgroup was not removed"
         );
+        assert_processes_gone(&host_pids);
+    }
+
+    #[test]
+    fn dropping_sandbox_child_kills_setsid_double_fork_descendants_and_removes_cgroup() {
+        let fixture = Fixture::new(16, 128 * 1024 * 1024, 100_000);
+        let child = fixture.spawn("resource-tree", &[]);
+        let host_pids = host_tree_pids(&fixture);
+        assert_exact_membership(&fixture, &host_pids);
+
+        drop(child);
+
+        assert!(fixture.cgroup.is_empty().expect("drop should empty cgroup"));
+        assert!(
+            !fixture.cgroup.path().exists(),
+            "drop should remove job cgroup"
+        );
+        assert_processes_gone(&host_pids);
+    }
+
+    #[test]
+    fn dropping_cgroup_owner_before_child_is_idempotent_and_keeps_child_reapable() {
+        let fixture = Fixture::new(16, 128 * 1024 * 1024, 100_000);
+        let mut child = fixture.spawn("resource-tree", &[]);
+        let host_pids = host_tree_pids(&fixture);
+        assert_exact_membership(&fixture, &host_pids);
+        let cgroup_path = fixture.cgroup.path().to_path_buf();
+
+        drop(fixture.cgroup);
+
+        assert!(
+            !cgroup_path.exists(),
+            "job owner drop should empty and remove cgroup"
+        );
+        assert!(
+            child
+                .try_wait()
+                .expect("cgroup owner drop reaps supervisor")
+                .is_some()
+        );
+        drop(child);
+        assert_processes_gone(&host_pids);
+    }
+
+    #[test]
+    fn sandbox_child_timeout_kills_setsid_double_fork_descendants() {
+        let fixture = Fixture::new(16, 128 * 1024 * 1024, 100_000);
+        let mut child = fixture.spawn("resource-tree", &[]);
+        let host_pids = host_tree_pids(&fixture);
+        assert_exact_membership(&fixture, &host_pids);
+
+        let error = child
+            .wait_timeout(Duration::from_millis(25))
+            .expect_err("long-running tree should time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        assert!(
+            fixture
+                .cgroup
+                .is_empty()
+                .expect("timeout should empty cgroup")
+        );
+        assert!(
+            !fixture.cgroup.path().exists(),
+            "timeout should remove job cgroup"
+        );
+        assert_processes_gone(&host_pids);
     }
 
     #[test]
@@ -429,10 +500,9 @@ mod linux {
         );
         assert_exact_membership(&fixture, &members_before);
 
-        fixture
-            .cgroup
-            .kill_all()
-            .expect("cgroup.kill must stop concurrent forks");
+        child
+            .kill()
+            .expect("SandboxChild::kill must stop concurrent forks");
         assert!(
             fixture
                 .cgroup
