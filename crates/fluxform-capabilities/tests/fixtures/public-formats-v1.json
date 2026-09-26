@@ -1,0 +1,23 @@
+{
+  "api_version": "v1",
+  "formats": [
+    {
+      "category": "audio",
+      "edge_id": "audio.m4a-to-m4a",
+      "input_extensions": ["m4a"],
+      "output_format": "m4a"
+    },
+    {
+      "category": "image",
+      "edge_id": "image.jpeg-to-png",
+      "input_extensions": ["jpg", "jpeg"],
+      "output_format": "png"
+    },
+    {
+      "category": "video",
+      "edge_id": "video.mov-to-mp4",
+      "input_extensions": ["mov"],
+      "output_format": "mp4"
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use fluxform_ffmpeg_profile::{BuildProfile, ProbeReport, ProfileError};
+
+pub mod collector;
+pub mod evidence;
+pub mod runner;
+pub mod samples;
 
 pub type TargetTriple = String;
 
@@ -58,7 +63,7 @@ pub enum ManifestError {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConversionCategory {
     Image,
@@ -66,7 +71,7 @@ pub enum ConversionCategory {
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputTopology {
     SingleVideoFrame,
@@ -75,7 +80,7 @@ pub enum InputTopology {
     SingleVideoAndAudio,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlphaPolicy {
     PreserveIfPresent,
@@ -83,7 +88,7 @@ pub enum AlphaPolicy {
     Discard,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrientationPolicy {
     ApplyToPixels,
@@ -91,7 +96,7 @@ pub enum OrientationPolicy {
     Ignore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataPolicy {
     SafeImageMetadata,
@@ -106,7 +111,7 @@ struct ManifestDocument {
     edges: Vec<ConversionEdgeV1>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConversionEdgeV1 {
     pub id: String,
@@ -131,7 +136,7 @@ pub struct ConversionEdgeV1 {
     pub options: BTreeMap<String, ParameterBounds>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParameterBounds {
     pub minimum: i64,
@@ -151,6 +156,20 @@ pub struct InputProbeV1 {
 pub struct CapabilityManifestV1 {
     edges: Vec<ConversionEdgeV1>,
     profile_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicFormatsV1 {
+    pub api_version: String,
+    pub formats: Vec<PublicFormatV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicFormatV1 {
+    pub category: ConversionCategory,
+    pub edge_id: String,
+    pub input_extensions: Vec<String>,
+    pub output_format: String,
 }
 
 impl CapabilityManifestV1 {
@@ -248,6 +267,38 @@ impl CapabilityManifestV1 {
 
     pub fn edges(&self) -> &[ConversionEdgeV1] {
         &self.edges
+    }
+
+    /// Returns the stable product-facing format response derived only from
+    /// the approved product manifest, never from an FFmpeg feature listing.
+    pub fn normalized_public_formats(&self) -> PublicFormatsV1 {
+        let mut formats = self
+            .edges
+            .iter()
+            .map(|edge| PublicFormatV1 {
+                category: edge.category,
+                edge_id: edge.id.clone(),
+                input_extensions: edge.input_extensions.clone(),
+                output_format: edge.output_format.clone(),
+            })
+            .collect::<Vec<_>>();
+        formats.sort_by(|left, right| {
+            category_sort_key(left.category)
+                .cmp(category_sort_key(right.category))
+                .then_with(|| left.edge_id.cmp(&right.edge_id))
+        });
+        PublicFormatsV1 {
+            api_version: "v1".to_owned(),
+            formats,
+        }
+    }
+}
+
+fn category_sort_key(category: ConversionCategory) -> &'static str {
+    match category {
+        ConversionCategory::Audio => "audio",
+        ConversionCategory::Image => "image",
+        ConversionCategory::Video => "video",
     }
 }
 

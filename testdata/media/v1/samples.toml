@@ -1,0 +1,172 @@
+catalog_version = "v1"
+
+[[samples]]
+id = "video-mov-h264-silent-240p-v1"
+path = "files/video-mov-h264-silent-240p-v1.mov"
+sha256 = "77deddff643eb04d67de914fcd11c98a1cfa6f0511d12c8cfd164f446d1a1323"
+provenance = "Original synthetic media generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "video"
+container = "mov"
+codecs = ["h264"]
+stream_topology = "single_video_stream"
+width = 64
+height = 48
+duration_ms = 1000
+alpha = "absent"
+orientation = "none"
+metadata = "none"
+expected_outcome = "success"
+expected_error_code = ""
+
+[[samples]]
+id = "video-mov-hevc-silent-unsupported-v1"
+path = "files/video-mov-hevc-silent-unsupported-v1.mov"
+sha256 = "c76ffdd64a770ee6db9d52873b0732318537518195bc3eb3465e644c0c25beb0"
+provenance = "Original synthetic media generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "video"
+container = "mov"
+codecs = ["hevc"]
+stream_topology = "single_video_stream"
+width = 64
+height = 48
+duration_ms = 1000
+alpha = "absent"
+orientation = "none"
+metadata = "none"
+expected_outcome = "error"
+expected_error_code = "unsupported_input"
+
+[[samples]]
+id = "audio-m4a-aac-lc-mono-v1"
+path = "files/audio-m4a-aac-lc-mono-v1.m4a"
+sha256 = "4ee56dc90fbfe6b803483bc572f51962e5e72de99bb6a7f3016664f66ba4bf9a"
+provenance = "Original synthetic media generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "audio"
+container = "m4a"
+codecs = ["aac"]
+stream_topology = "single_audio_stream"
+width = 0
+height = 0
+duration_ms = 250
+alpha = "not_applicable"
+orientation = "not_applicable"
+metadata = "none"
+expected_outcome = "success"
+expected_error_code = ""
+
+[[samples]]
+id = "audio-m4a-alac-unsupported-v1"
+path = "files/audio-m4a-alac-unsupported-v1.m4a"
+sha256 = "4b8edb16ed9bbaf1e56d9fb123ef1e78fcdec6de79c27e41bb5264ad2b458be3"
+provenance = "Original synthetic media generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "audio"
+container = "m4a"
+codecs = ["alac"]
+stream_topology = "single_audio_stream"
+width = 0
+height = 0
+duration_ms = 250
+alpha = "not_applicable"
+orientation = "not_applicable"
+metadata = "none"
+expected_outcome = "error"
+expected_error_code = "unsupported_input"
+
+[[samples]]
+id = "image-jpeg-baseline-rgb-v1"
+path = "files/image-jpeg-baseline-rgb-v1.jpg"
+sha256 = "9c224b1ce08ca690f9ead8f1b160f1b8408ca3a0fb56bd945a73d030d8f4beaa"
+provenance = "Original synthetic media generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "image"
+container = "jpeg"
+codecs = ["mjpeg"]
+stream_topology = "single_video_frame"
+width = 32
+height = 32
+duration_ms = 0
+alpha = "absent"
+orientation = "none"
+metadata = "none"
+expected_outcome = "success"
+expected_error_code = ""
+
+[[samples]]
+id = "image-jpeg-truncated-v1"
+path = "files/image-jpeg-truncated-v1.jpg"
+sha256 = "47e367a01556391274f751220b6214aa1f5f9b3fceb05b79de6bb42bfdae774c"
+provenance = "Original synthetic JPEG generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880), then truncated by 8 bytes to remove its EOI marker."
+license = "CC0-1.0; original synthetic fixture"
+category = "image"
+container = "jpeg"
+codecs = ["mjpeg"]
+stream_topology = "single_video_frame"
+width = 32
+height = 32
+duration_ms = 0
+alpha = "absent"
+orientation = "none"
+metadata = "none"
+expected_outcome = "error"
+expected_error_code = "invalid_input"
+
+[[samples]]
+id = "image-gif-animated-v1"
+path = "files/image-gif-animated-v1.gif"
+sha256 = "6f9678ecf906e4626be2dee5dc10d8023c8832243c7e2a138089f4c668e3ab2e"
+provenance = "Original two-frame synthetic animation generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "image"
+container = "gif"
+codecs = ["gif"]
+stream_topology = "multiple_video_frames"
+width = 16
+height = 16
+duration_ms = 1000
+alpha = "present"
+orientation = "none"
+metadata = "none"
+expected_outcome = "error"
+expected_error_code = "unsupported_conversion"
+
+[[samples]]
+id = "image-webp-animated-v1"
+path = "files/image-webp-animated-v1.webp"
+sha256 = "1024dfa163859abac8e9d150959c49c133a97e8c7ad36973400679ec6b608591"
+provenance = "Original two-frame synthetic animation generated on 2026-09-26 with FFmpeg 5.1.1-full_build-www.gyan.dev (generator SHA-256 ff3360e9733af335b94518dafa86984df17c3b06da9e4e877d94306a21ac880)."
+license = "CC0-1.0; original synthetic fixture"
+category = "image"
+container = "webp"
+codecs = ["webp"]
+stream_topology = "multiple_video_frames"
+width = 16
+height = 16
+duration_ms = 1000
+alpha = "present"
+orientation = "none"
+metadata = "none"
+expected_outcome = "error"
+expected_error_code = "unsupported_conversion"
+
+[[samples]]
+id = "image-tiff-multipage-v1"
+path = "files/image-tiff-multipage-v1.tiff"
+sha256 = "08e4a0a8681c8fa0fdbca8e9d97f878a4eccd0de612327f5d4c2dd50e66c7b65"
+provenance = "Original two-page TIFF generated on 2026-09-26 with Windows GDI+ System.Drawing; verified to contain two Page frames."
+license = "CC0-1.0; original synthetic fixture"
+category = "image"
+container = "tiff"
+codecs = ["tiff"]
+stream_topology = "multiple_video_frames"
+width = 16
+height = 16
+duration_ms = 0
+alpha = "present"
+orientation = "none"
+metadata = "none"
+expected_outcome = "error"
+expected_error_code = "unsupported_conversion"

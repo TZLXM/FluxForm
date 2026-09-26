@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -486,5 +486,338 @@ fn extension_normalization_does_not_turn_unknown_extensions_into_matches() {
                 "png",
             )
             .is_none()
+    );
+}
+
+fn approved_matrix_from_adr() -> Vec<serde_json::Value> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adr =
+        fs::read_to_string(repository.join("docs/architecture/adr/0002-v1-capability-matrix.md"))
+            .expect("approved matrix ADR exists");
+    assert!(adr.contains("2026-09-26"));
+    assert!(adr.contains("“批准”"));
+    let marker = "<!-- matrix-json-v1:begin -->";
+    let start = adr.find(marker).expect("machine matrix start marker") + marker.len();
+    let contents = &adr[start..];
+    let fence = contents.find("```json").expect("JSON fence") + "```json".len();
+    let contents = &contents[fence..];
+    let end = contents.find("```").expect("JSON fence close");
+    serde_json::from_str(contents[..end].trim()).expect("valid matrix JSON")
+}
+
+fn stage0_candidate_edge_ids() -> Vec<String> {
+    let mut ids = Vec::new();
+    for input in [
+        "mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv",
+    ] {
+        for output in ["mp4", "mov", "mkv", "webm"] {
+            ids.push(format!("video.{input}-to-{output}"));
+        }
+    }
+    for input in ["mp3", "aac", "m4a", "wav", "flac", "ogg", "opus", "wma"] {
+        for output in ["mp3", "aac", "m4a", "wav", "flac", "ogg", "opus"] {
+            ids.push(format!("audio.{input}-to-{output}"));
+        }
+    }
+    for input in ["jpeg", "png", "webp", "bmp", "tiff", "gif"] {
+        for output in ["jpeg", "png", "webp", "bmp", "tiff"] {
+            ids.push(format!("image.{input}-to-{output}"));
+        }
+    }
+    for output in ["jpeg", "png", "webp"] {
+        ids.push(format!("image.heic-to-{output}"));
+    }
+    ids.sort();
+    ids
+}
+
+#[test]
+fn approved_v1_edges_are_explicit_and_complete() {
+    const APPROVED_ENABLED: &[&str] =
+        &["audio.m4a-to-m4a", "image.jpeg-to-png", "video.mov-to-mp4"];
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let matrix = approved_matrix_from_adr();
+    let candidate_ids = stage0_candidate_edge_ids();
+    assert_eq!(candidate_ids.len(), 129);
+    assert_eq!(matrix.len(), candidate_ids.len());
+
+    let mut matrix_rows = BTreeMap::new();
+    for row in &matrix {
+        let edge_id = row["edge_id"].as_str().expect("matrix edge ID");
+        let status = row["status"].as_str().expect("matrix status");
+        assert!(matches!(status, "enabled" | "deferred"));
+        assert!(
+            matrix_rows
+                .insert(edge_id.to_owned(), status.to_owned())
+                .is_none(),
+            "matrix contains duplicate edge ID {edge_id}"
+        );
+        if status == "deferred" {
+            for key in ["reason", "owner", "reconsideration"] {
+                assert!(
+                    row[key]
+                        .as_str()
+                        .is_some_and(|value| !value.trim().is_empty()),
+                    "deferred edge {edge_id} is missing {key}"
+                );
+            }
+        } else {
+            assert_eq!(
+                row["target_profiles"]
+                    .as_array()
+                    .expect("enabled profiles")
+                    .len(),
+                4,
+                "enabled edge {edge_id} binds four target profiles"
+            );
+            assert!(
+                !row["valid_samples"]
+                    .as_array()
+                    .expect("valid samples")
+                    .is_empty(),
+                "enabled edge {edge_id} names a valid sample"
+            );
+            assert!(
+                !row["invalid_samples"]
+                    .as_array()
+                    .expect("invalid samples")
+                    .is_empty(),
+                "enabled edge {edge_id} names an invalid sample"
+            );
+        }
+    }
+
+    assert_eq!(
+        matrix_rows.keys().cloned().collect::<Vec<_>>(),
+        candidate_ids,
+        "approved matrix must cover every and only candidate edge"
+    );
+    for edge_id in &candidate_ids {
+        let expected = if APPROVED_ENABLED.contains(&edge_id.as_str()) {
+            "enabled"
+        } else {
+            "deferred"
+        };
+        assert_eq!(
+            matrix_rows[edge_id], expected,
+            "approved status for {edge_id}"
+        );
+    }
+
+    let manifest = CapabilityManifestV1::load(repository.join("config/capabilities-v1.toml"))
+        .expect("v1 capability manifest exists");
+    let manifest_ids = manifest
+        .edges()
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        manifest_ids,
+        APPROVED_ENABLED.iter().copied().collect::<BTreeSet<_>>(),
+        "manifest contains exactly the approved enabled edge IDs"
+    );
+
+    let normalized_manifest = candidate_ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                if manifest_ids.contains(id.as_str()) {
+                    "enabled".to_owned()
+                } else {
+                    "deferred".to_owned()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(matrix_rows, normalized_manifest);
+}
+
+#[test]
+fn checked_in_sample_corpus_is_real_hashed_and_exactly_referenced() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = CapabilityManifestV1::load(repository.join("config/capabilities-v1.toml"))
+        .expect("approved manifest");
+    let catalog = SampleCatalogV1::load(repository.join("testdata/media/v1/samples.toml"))
+        .expect("versioned sample catalog");
+    catalog
+        .validate_manifest_samples(&manifest)
+        .expect("all manifest samples have matching checked-in bytes");
+
+    let samples = catalog.samples();
+    assert_eq!(samples.len(), 9);
+    let total_bytes: u64 = samples.iter().map(|sample| sample.size_bytes).sum();
+    assert!(total_bytes <= 10 * 1024 * 1024);
+    assert!(samples.iter().all(|sample| sample.size_bytes <= 512 * 1024));
+    for animated_id in [
+        "image-gif-animated-v1",
+        "image-webp-animated-v1",
+        "image-tiff-multipage-v1",
+    ] {
+        let sample = samples
+            .iter()
+            .find(|sample| sample.id == animated_id)
+            .expect("animated sample exists");
+        assert_eq!(sample.expected_error_code, "unsupported_conversion");
+    }
+}
+
+#[test]
+fn sample_catalog_rejects_unreferenced_media_and_manifest_ids_without_bytes() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let samples_path = repository.join("testdata/media/v1/samples.toml");
+    let manifest_text = fs::read_to_string(repository.join("config/capabilities-v1.toml"))
+        .expect("manifest source");
+    let manifest_dir = tempfile::tempdir().expect("temporary manifest dir");
+    let missing_id_manifest = manifest_text.replace(
+        "valid_samples = [\"image-jpeg-baseline-rgb-v1\"]",
+        "valid_samples = [\"image-jpeg-baseline-rgb-v1\", \"missing-real-bytes-v1\"]",
+    );
+    let missing_manifest_path = write_file(
+        manifest_dir.path(),
+        "capabilities-v1.toml",
+        &missing_id_manifest,
+    );
+    let missing_manifest = CapabilityManifestV1::load(missing_manifest_path)
+        .expect("valid shape with a missing sample reference");
+    let catalog = SampleCatalogV1::load(&samples_path).expect("real corpus catalog");
+    assert!(
+        catalog
+            .validate_manifest_samples(&missing_manifest)
+            .is_err()
+    );
+
+    let unreferenced_dir = tempfile::tempdir().expect("temporary sample dir");
+    copy_sample_catalog_and_files(&repository, unreferenced_dir.path());
+    let catalog_path = unreferenced_dir
+        .path()
+        .join("testdata/media/v1/samples.toml");
+    let mut catalog_text = fs::read_to_string(&catalog_path).expect("copied catalog");
+    let first_table = catalog_text.find("[[samples]]").expect("sample table");
+    let next_table = catalog_text[first_table + 1..]
+        .find("[[samples]]")
+        .map(|index| first_table + 1 + index)
+        .unwrap_or(catalog_text.len());
+    let first_record = catalog_text[first_table..next_table].replace(
+        "id = \"video-mov-h264-silent-240p-v1\"",
+        "id = \"orphan-media-v1\"",
+    );
+    catalog_text.push_str("\n\n");
+    catalog_text.push_str(&first_record);
+    fs::write(&catalog_path, catalog_text).expect("write unreferenced catalog copy");
+    let unreferenced_catalog =
+        SampleCatalogV1::load(&catalog_path).expect("orphan still has real, hashed bytes");
+    let manifest = CapabilityManifestV1::load(repository.join("config/capabilities-v1.toml"))
+        .expect("current manifest");
+    assert!(
+        unreferenced_catalog
+            .validate_manifest_samples(&manifest)
+            .is_err()
+    );
+}
+
+#[test]
+fn sample_catalog_rejects_changed_bytes_even_when_the_manifest_id_is_unchanged() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let temporary = tempfile::tempdir().expect("temporary corpus");
+    copy_sample_catalog_and_files(&repository, temporary.path());
+    let tampered = temporary
+        .path()
+        .join("testdata/media/v1/files/video-mov-h264-silent-240p-v1.mov");
+    let mut bytes = fs::read(&tampered).expect("copied real bytes");
+    bytes[0] ^= 1;
+    fs::write(tampered, bytes).expect("tamper test copy only");
+    let catalog_path = temporary.path().join("testdata/media/v1/samples.toml");
+    let error = SampleCatalogV1::load(catalog_path).expect_err("SHA mismatch must fail closed");
+    assert!(error.to_string().contains("SHA-256 mismatch"));
+}
+
+fn copy_sample_catalog_and_files(repository: &Path, destination: &Path) {
+    let source_root = repository.join("testdata/media/v1");
+    let destination_root = destination.join("testdata/media/v1");
+    fs::create_dir_all(destination_root.join("files")).expect("create copied corpus dir");
+    fs::copy(
+        source_root.join("samples.toml"),
+        destination_root.join("samples.toml"),
+    )
+    .expect("copy corpus catalog");
+    for entry in fs::read_dir(source_root.join("files")).expect("list source corpus") {
+        let entry = entry.expect("source sample");
+        fs::copy(
+            entry.path(),
+            destination_root.join("files").join(entry.file_name()),
+        )
+        .expect("copy real sample bytes");
+    }
+}
+
+#[test]
+fn public_formats_are_normalized_from_manifest_and_ignore_unlisted_ffmpeg_encoders() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = CapabilityManifestV1::load(repository.join("config/capabilities-v1.toml"))
+        .expect("approved manifest");
+    let actual = serde_json::to_value(manifest.normalized_public_formats())
+        .expect("serializable public response");
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/public-formats-v1.json"))
+            .expect("committed normalized fixture");
+    assert_eq!(actual, expected);
+
+    // This is a TEST-ONLY report. A reported encoder outside the manifest must
+    // never leak into the public product response.
+    let (_temporary, fixture_manifest, mut reports) = load_fixture(VALID_MANIFEST);
+    let report = reports
+        .get_mut("x86_64-pc-windows-msvc")
+        .expect("TEST-ONLY Windows report");
+    report.encoders.push("libx265".to_owned());
+    assert!(report.encoders.iter().any(|encoder| encoder == "libx265"));
+    let response = serde_json::to_string(&fixture_manifest.normalized_public_formats())
+        .expect("serializable response");
+    assert!(!response.contains("libx265"));
+}
+
+#[test]
+fn evidence_input_digest_closes_over_runner_crates_and_metadata_discovered_local_dependencies() {
+    use fluxform_capabilities::evidence::compute_evidence_input_digest;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let closure =
+        compute_evidence_input_digest(&repository).expect("complete local evidence closure");
+    assert!(closure.files.windows(2).all(|pair| pair[0] < pair[1]));
+    for required in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        ".cargo/config.toml",
+        "config/ffmpeg-profile.toml",
+        "config/capabilities-v1.toml",
+        "testdata/media/v1/samples.toml",
+        "crates/fluxform-capabilities/src/bin/run_manifest_samples.rs",
+        "crates/fluxform-capabilities/src/bin/collect_sample_reports.rs",
+        "crates/fluxform-capabilities/src/samples.rs",
+        "crates/fluxform-ffmpeg-profile/src/lib.rs",
+    ] {
+        assert!(
+            closure.files.iter().any(|path| path == required),
+            "evidence closure omits {required}"
+        );
+    }
+    assert_eq!(
+        closure.local_packages,
+        BTreeSet::from([
+            "crates/fluxform-capabilities".to_owned(),
+            "crates/fluxform-ffmpeg-profile".to_owned(),
+        ]),
+        "hashed local-package set follows cargo metadata path dependencies"
+    );
+    assert_eq!(
+        closure.digest,
+        compute_evidence_input_digest(&repository).unwrap().digest
     );
 }
