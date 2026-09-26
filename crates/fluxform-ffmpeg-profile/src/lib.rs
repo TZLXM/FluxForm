@@ -1278,11 +1278,51 @@ mod zip_inventory_tests {
         assert_eq!(verified.license_text_size_bytes, license.len() as u64);
         let temp_path = verified.temp_root().to_path_buf();
         assert!(temp_path.exists());
+        let private_archive_path = temp_path.join("authenticated-candidate.zip");
+        assert!(
+            private_archive_path.is_file(),
+            "extraction must retain a private copy of the authenticated archive"
+        );
+        assert_eq!(
+            fs::read(&private_archive_path).expect("read private archive copy"),
+            bytes,
+            "private archive copy must contain the exact authenticated bytes"
+        );
+
+        fs::write(&archive_path, b"replacement at the original pathname")
+            .expect("replace original archive path after verification");
+        assert_eq!(
+            fs::read(&private_archive_path).expect("private archive survives source replacement"),
+            bytes,
+            "replacing the public path must not change the authenticated extractor input"
+        );
 
         verified.close().expect("explicit temporary cleanup");
         assert!(
             !temp_path.exists(),
             "explicit cleanup removes extracted contents"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn rejects_symlink_archive_path_instead_of_following_target() {
+        let ffmpeg = b"non-executable ffmpeg fixture";
+        let ffprobe = b"non-executable ffprobe fixture";
+        let license = b"license fixture";
+        let bytes = small_candidate_zip(ffmpeg, ffprobe, license);
+        let artifact = test_artifact(&bytes, ffmpeg, ffprobe, license);
+        let archive_directory = tempfile::tempdir().expect("archive fixture directory");
+        let archive_path = archive_directory.path().join("candidate.zip");
+        let symlink_path = archive_directory.path().join("candidate-alias.zip");
+        fs::write(&archive_path, &bytes).expect("write archive fixture");
+        std::os::unix::fs::symlink(&archive_path, &symlink_path).expect("create archive symlink");
+
+        let error = archive::verify_archive_identity(&artifact, &symlink_path)
+            .expect_err("archive verification must reject a symlink path");
+        assert!(
+            error.to_string().contains("regular"),
+            "symlink rejection should identify a non-regular archive path: {error}"
         );
     }
 

@@ -2,10 +2,10 @@ use super::{ArchiveFormat, ArtifactRecord, ProfileError};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-#[cfg(windows)]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -23,6 +23,7 @@ pub(super) const MAX_ENTRY_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
 const SYSTEM_UNZIP: &str = "/usr/bin/unzip";
+const PRIVATE_ARCHIVE_NAME: &str = "authenticated-candidate.zip";
 
 #[derive(Debug, Clone)]
 pub(super) struct ZipEntry {
@@ -76,6 +77,14 @@ pub(super) fn verify_archive_identity(
     artifact: &ArtifactRecord,
     archive_path: &Path,
 ) -> Result<(), ProfileError> {
+    let _ = open_verified_archive(artifact, archive_path)?;
+    Ok(())
+}
+
+fn open_verified_archive(
+    artifact: &ArtifactRecord,
+    archive_path: &Path,
+) -> Result<(File, String, u64), ProfileError> {
     let mut archive = open_regular_file_without_reparse(archive_path)?;
     let metadata = archive
         .metadata()
@@ -89,14 +98,13 @@ pub(super) fn verify_archive_identity(
     {
         return Err(ProfileError::ArchiveIdentityMismatch);
     }
-    Ok(())
+    Ok((archive, observed_sha256, observed_size_bytes))
 }
 
 pub(crate) fn extract_and_verify(
     artifact: &ArtifactRecord,
     archive_path: &Path,
 ) -> Result<VerifiedArchive, ProfileError> {
-    verify_archive_identity(artifact, archive_path)?;
     extract_and_verify_native(artifact, archive_path)
 }
 
@@ -104,44 +112,43 @@ fn extract_and_verify_native(
     artifact: &ArtifactRecord,
     archive_path: &Path,
 ) -> Result<VerifiedArchive, ProfileError> {
-    let original_archive = open_regular_file_without_reparse(archive_path)?;
-    let metadata = original_archive
-        .metadata()
-        .map_err(|source| io_error(archive_path, source))?;
-    if !metadata.is_file() || is_reparse_point(&metadata) {
-        return Err(unsafe_archive("archive path is not a regular file"));
-    }
-
-    let resolved_path = archive_path
-        .canonicalize()
-        .map_err(|source| io_error(archive_path, source))?;
-    let mut archive_file = open_regular_file_without_reparse(&resolved_path)?;
-    let (artifact_sha256, artifact_size_bytes) = fingerprint_handle(&mut archive_file)?;
-    if artifact_size_bytes != artifact.artifact_size_bytes
-        || !artifact_sha256.eq_ignore_ascii_case(&artifact.artifact_sha256)
-    {
-        return Err(ProfileError::ArchiveIdentityMismatch);
-    }
-
-    let entries = inspect_zip_archive(&mut archive_file, artifact_size_bytes)?;
+    let (mut original_archive, _, _) = open_verified_archive(artifact, archive_path)?;
     let (ffmpeg_name, ffprobe_name) = executable_names(&artifact.target_triple)?;
-    let ffmpeg_entry = unique_executable_entry(&entries, ffmpeg_name)?;
-    let ffprobe_entry = unique_executable_entry(&entries, ffprobe_name)?;
-    if parent_entry(&ffmpeg_entry.name) != parent_entry(&ffprobe_entry.name) {
-        return Err(unsafe_archive("ffmpeg and ffprobe must be sibling entries"));
-    }
-    let license_entry = entries
-        .iter()
-        .find(|entry| entry.name == artifact.license_text_path && !entry.is_directory)
-        .ok_or_else(|| unsafe_archive("declared license text is missing from the archive"))?;
-    validate_entry_name(&artifact.license_text_path, false)?;
-
     let temp_dir = TempDir::new().map_err(|source| io_error(Path::new("system temp"), source))?;
+    let private_archive_path = temp_dir.path().join(PRIVATE_ARCHIVE_NAME);
     let extracted = (|| {
+        let (copy_sha256, copy_size_bytes) =
+            copy_authenticated_archive(&mut original_archive, archive_path, &private_archive_path)?;
+        if copy_size_bytes != artifact.artifact_size_bytes
+            || !copy_sha256.eq_ignore_ascii_case(&artifact.artifact_sha256)
+        {
+            return Err(ProfileError::ArchiveIdentityMismatch);
+        }
+
+        let mut archive_copy = open_regular_file_without_reparse(&private_archive_path)?;
+        let (artifact_sha256, artifact_size_bytes) = fingerprint_handle(&mut archive_copy)?;
+        if artifact_size_bytes != artifact.artifact_size_bytes
+            || !artifact_sha256.eq_ignore_ascii_case(&artifact.artifact_sha256)
+        {
+            return Err(ProfileError::ArchiveIdentityMismatch);
+        }
+        let entries = inspect_zip_archive(&mut archive_copy, artifact_size_bytes)?;
+        let ffmpeg_entry = unique_executable_entry(&entries, ffmpeg_name)?;
+        let ffprobe_entry = unique_executable_entry(&entries, ffprobe_name)?;
+        if parent_entry(&ffmpeg_entry.name) != parent_entry(&ffprobe_entry.name) {
+            return Err(unsafe_archive("ffmpeg and ffprobe must be sibling entries"));
+        }
+        let license_entry = entries
+            .iter()
+            .find(|entry| entry.name == artifact.license_text_path && !entry.is_directory)
+            .ok_or_else(|| unsafe_archive("declared license text is missing from the archive"))?;
+        validate_entry_name(&artifact.license_text_path, false)?;
+        drop(archive_copy);
+
         let extractor = extractor_spec(
             std::env::consts::OS,
             artifact.archive_format,
-            &resolved_path,
+            &private_archive_path,
             temp_dir.path(),
         )?;
         extract_with_trusted_program(&extractor)?;
@@ -185,10 +192,11 @@ fn extract_and_verify_native(
             ffprobe_size_bytes,
             license_text_sha256,
             license_text_size_bytes,
+            artifact_sha256,
+            artifact_size_bytes,
         ))
     })();
 
-    drop(archive_file);
     drop(original_archive);
     let (
         ffmpeg_path,
@@ -199,6 +207,8 @@ fn extract_and_verify_native(
         ffprobe_size_bytes,
         license_text_sha256,
         license_text_size_bytes,
+        artifact_sha256,
+        artifact_size_bytes,
     ) = match extracted {
         Ok(measurements) => measurements,
         Err(error) => {
@@ -412,15 +422,62 @@ fn open_regular_file_without_reparse(path: &Path) -> Result<File, ProfileError> 
         }
         Ok(file)
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let file = File::open(path).map_err(|source| io_error(path, source))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| {
+                if source.raw_os_error() == Some(libc::ELOOP) {
+                    unsafe_archive("path is a symbolic link, not a regular file")
+                } else {
+                    io_error(path, source)
+                }
+            })?;
         let metadata = file.metadata().map_err(|source| io_error(path, source))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(unsafe_archive("path is not a regular file"));
         }
         Ok(file)
     }
+}
+
+fn copy_authenticated_archive(
+    source: &mut File,
+    source_path: &Path,
+    destination_path: &Path,
+) -> Result<(String, u64), ProfileError> {
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error(source_path, source))?;
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination_path)
+        .map_err(|source| io_error(destination_path, source))?;
+    let mut hasher = Sha256::new();
+    let mut bytes_copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .map_err(|source| io_error(source_path, source))?;
+        if count == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|source| io_error(destination_path, source))?;
+        hasher.update(&buffer[..count]);
+        bytes_copied = bytes_copied
+            .checked_add(count as u64)
+            .ok_or_else(|| unsafe_archive("archive copy size overflow"))?;
+    }
+    destination
+        .flush()
+        .map_err(|source| io_error(destination_path, source))?;
+    Ok((format!("{:x}", hasher.finalize()), bytes_copied))
 }
 
 #[cfg(windows)]
@@ -1036,6 +1093,44 @@ mod extractor_spec_tests {
                 Path::new("out")
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod authenticated_copy_tests {
+    use super::{copy_authenticated_archive, fingerprint_handle};
+    use std::fs::{self, File};
+
+    #[test]
+    fn copies_the_open_authenticated_file_after_its_public_path_is_replaced() {
+        let original_bytes = b"identity-checked archive bytes";
+        let replacement_bytes = b"different bytes at the original path";
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let source_path = source_directory.path().join("candidate.zip");
+        let displaced_path = source_directory.path().join("displaced.zip");
+        fs::write(&source_path, original_bytes).expect("write original archive");
+
+        let mut authenticated_handle = File::open(&source_path).expect("open source archive");
+        let (expected_sha256, expected_size_bytes) =
+            fingerprint_handle(&mut authenticated_handle).expect("authenticate source handle");
+        fs::rename(&source_path, &displaced_path).expect("move authenticated inode aside");
+        fs::write(&source_path, replacement_bytes).expect("replace public source path");
+
+        let destination_directory = tempfile::tempdir().expect("private destination directory");
+        let private_path = destination_directory
+            .path()
+            .join("authenticated-candidate.zip");
+        let (copied_sha256, copied_size_bytes) =
+            copy_authenticated_archive(&mut authenticated_handle, &source_path, &private_path)
+                .expect("copy authenticated file handle");
+
+        assert_eq!(copied_sha256, expected_sha256);
+        assert_eq!(copied_size_bytes, expected_size_bytes);
+        assert_eq!(
+            fs::read(&private_path).expect("read private archive snapshot"),
+            original_bytes,
+            "path replacement must not substitute bytes copied from the authenticated handle"
         );
     }
 }

@@ -11,3 +11,6 @@ tempfile = "3.23"
 thiserror.workspace = true
 
 [dev-dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
