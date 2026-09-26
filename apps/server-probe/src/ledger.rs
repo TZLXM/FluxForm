@@ -13,7 +13,7 @@ use uuid::Uuid;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS global_budget (
@@ -266,12 +266,38 @@ impl UploadLedger {
         limits: LedgerLimits,
         secrets: Vec<[u8; 32]>,
     ) -> Result<Self, LimitError> {
-        Self::open_with_disk_space(
+        Self::open_internal(
             database_path,
             upload_root,
             limits,
             secrets,
             Arc::new(SystemDiskSpace),
+            None,
+        )
+    }
+
+    /// Opens a legacy database while retaining the explicitly declared key
+    /// whose HMACs were used for its key-ID-less quota rows.
+    ///
+    /// The ID is SHA-256 of the 32-byte secret material.
+    /// The operator must declare the key that generated every legacy IP hash;
+    /// the key must also be present in `secrets` so quota lookup and future
+    /// rotation checks continue to work. Legacy sessions without capabilities
+    /// are expired and their files are queued for secure cleanup.
+    pub fn open_with_legacy_key_id(
+        database_path: impl AsRef<Path>,
+        upload_root: impl AsRef<Path>,
+        limits: LedgerLimits,
+        secrets: Vec<[u8; 32]>,
+        retained_key_id: [u8; 32],
+    ) -> Result<Self, LimitError> {
+        Self::open_internal(
+            database_path,
+            upload_root,
+            limits,
+            secrets,
+            Arc::new(SystemDiskSpace),
+            Some(retained_key_id),
         )
     }
 
@@ -282,8 +308,33 @@ impl UploadLedger {
         secrets: Vec<[u8; 32]>,
         disk_space: Arc<dyn DiskSpaceProvider>,
     ) -> Result<Self, LimitError> {
+        Self::open_internal(
+            database_path,
+            upload_root,
+            limits,
+            secrets,
+            disk_space,
+            None,
+        )
+    }
+
+    fn open_internal(
+        database_path: impl AsRef<Path>,
+        upload_root: impl AsRef<Path>,
+        limits: LedgerLimits,
+        secrets: Vec<[u8; 32]>,
+        disk_space: Arc<dyn DiskSpaceProvider>,
+        retained_legacy_key_id: Option<[u8; 32]>,
+    ) -> Result<Self, LimitError> {
         validate_limits(limits)?;
         if secrets.is_empty() || secrets.len() > MAX_SECRET_ROTATION_KEYS {
+            return Err(LimitError::InvalidConfiguration);
+        }
+        if retained_legacy_key_id.is_some_and(|retained| {
+            !secrets
+                .iter()
+                .any(|secret| secret_key_id(secret) == retained)
+        }) {
             return Err(LimitError::InvalidConfiguration);
         }
         let upload_root =
@@ -338,23 +389,31 @@ impl UploadLedger {
             "INSERT OR IGNORE INTO global_budget(singleton, reserved_bytes) VALUES (1, 0)",
             [],
         )?;
-        if had_uploads && !had_capability_hash {
-            // Legacy sessions had no capability proof, so they cannot remain mutable.
+        if schema_version < CURRENT_SCHEMA_VERSION {
+            // Retire every legacy session without a capability, regardless of
+            // its former state, and preserve deletion work before committing.
             transaction.execute(
                 "INSERT OR IGNORE INTO cleanup_outbox(session_id, relative_path, attempts) \
                  SELECT id, upload_path, 0 FROM uploads \
-                 WHERE state IN ('reserved', 'receiving') AND upload_path IS NOT NULL",
+                 WHERE capability_hash IS NULL AND upload_path IS NOT NULL",
                 [],
             )?;
             transaction.execute(
                 "UPDATE uploads SET state = 'expired', reserved_bytes = 0, capability_hash = NULL \
-                 WHERE state IN ('reserved', 'receiving')",
+                 WHERE capability_hash IS NULL",
                 [],
+            )?;
+        }
+        if let Some(retained_key_id) = retained_legacy_key_id {
+            transaction.execute(
+                "UPDATE ip_hashes SET key_id = ?1 WHERE key_id IS NULL",
+                [retained_key_id.as_slice()],
             )?;
         }
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         ledger.validate_startup_invariants(&transaction)?;
         transaction.commit()?;
+        ledger.reconcile_unreferenced_files()?;
         Ok(ledger)
     }
 
@@ -754,8 +813,19 @@ impl UploadLedger {
                 .reservation_directory
                 .open_file(&file_name, false)
                 .map_err(LimitError::Filesystem)?;
-            let file_size = file.metadata().map_err(LimitError::Filesystem)?.len();
-            if file_size < reserved || allocated_file_bytes(&file)? < reserved {
+            let allocated = allocated_file_bytes(&file)?;
+            if allocated < reserved {
+                self.check_disk_capacity(reserved - allocated)?;
+            }
+            // Always reassert the committed size: a crash can leave excess
+            // physical allocation even when the logical length looks correct.
+            set_file_allocation(&file, reserved).map_err(LimitError::Filesystem)?;
+            if allocated < reserved {
+                self.check_disk_safety_margin()?;
+            }
+            if file.metadata().map_err(LimitError::Filesystem)?.len() != reserved
+                || allocated_file_bytes(&file)? < reserved
+            {
                 return Err(LimitError::AccountingInvariant);
             }
         }
@@ -819,6 +889,42 @@ impl UploadLedger {
         }
         if active_reserved > 0 {
             self.check_disk_safety_margin()?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_unreferenced_files(&self) -> Result<(), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let committed_paths = {
+            let mut statement = transaction.prepare(
+                "SELECT upload_path FROM uploads \
+                 WHERE upload_path IS NOT NULL \
+                   AND state IN ('reserved', 'receiving', 'uploaded', 'probing', 'queued') \
+                 UNION SELECT relative_path FROM cleanup_outbox",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let referenced_leaves: std::collections::HashSet<String> = committed_paths
+            .iter()
+            .filter_map(|relative| reservation_leaf(Path::new(relative)).ok())
+            .collect();
+
+        let orphans = self
+            .reservation_directory
+            .enumerate_files()
+            .map_err(LimitError::Filesystem)?
+            .into_iter()
+            .filter(|leaf| !referenced_leaves.contains(leaf))
+            .collect::<Vec<_>>();
+        transaction.commit()?;
+
+        for leaf in orphans {
+            self.reservation_directory
+                .remove_file(&leaf)
+                .map_err(LimitError::Filesystem)?;
         }
         Ok(())
     }
@@ -1135,6 +1241,167 @@ impl SecureReservationDirectory {
     fn remove_file(&self, leaf: &str) -> io::Result<()> {
         secure_unlink(&self.handle, leaf)
     }
+
+    #[cfg(unix)]
+    fn enumerate_files(&self) -> io::Result<Vec<String>> {
+        use std::os::fd::AsRawFd;
+
+        let descriptor_path = if cfg!(target_os = "linux") {
+            PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()))
+        } else {
+            PathBuf::from(format!("/dev/fd/{}", self.handle.as_raw_fd()))
+        };
+        let mut names = Vec::new();
+        for entry in fs::read_dir(descriptor_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reservation filename is not UTF-8",
+                )
+            })?;
+            names.push(name);
+        }
+        Ok(names)
+    }
+
+    #[cfg(windows)]
+    fn enumerate_files(&self) -> io::Result<Vec<String>> {
+        windows_enumerate_files(&self.handle)
+    }
+}
+
+#[cfg(windows)]
+fn windows_enumerate_files(directory: &fs::File) -> io::Result<Vec<String>> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileIdBothDirectoryInfo {
+        next_entry_offset: u32,
+        file_index: u32,
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        end_of_file: i64,
+        allocation_size: i64,
+        file_attributes: u32,
+        file_name_length: u32,
+        ea_size: u32,
+        short_name_length: u8,
+        short_name: [u16; 12],
+        file_id: i64,
+        file_name: [u16; 1],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            info_class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    const BUFFER_BYTES: usize = 64 * 1024;
+    const FILE_ID_BOTH_DIRECTORY_INFO: i32 = 10;
+    const FILE_ID_BOTH_DIRECTORY_RESTART_INFO: i32 = 11;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+
+    let mut names = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut buffer = vec![0_u64; BUFFER_BYTES / std::mem::size_of::<u64>()];
+        let info_class = if restart {
+            FILE_ID_BOTH_DIRECTORY_RESTART_INFO
+        } else {
+            FILE_ID_BOTH_DIRECTORY_INFO
+        };
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle().cast(),
+                info_class,
+                buffer.as_mut_ptr().cast(),
+                BUFFER_BYTES as u32,
+            )
+        };
+        if success == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                break;
+            }
+            return Err(error);
+        }
+        restart = false;
+
+        let mut offset = 0_usize;
+        loop {
+            if offset + std::mem::size_of::<FileIdBothDirectoryInfo>() > BUFFER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid directory enumeration entry",
+                ));
+            }
+            let info = unsafe {
+                &*(buffer
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<FileIdBothDirectoryInfo>())
+            };
+            let name_length = usize::try_from(info.file_name_length).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid filename length")
+            })?;
+            let file_name_offset = std::mem::offset_of!(FileIdBothDirectoryInfo, file_name);
+            if name_length % 2 != 0
+                || offset
+                    .checked_add(file_name_offset)
+                    .and_then(|start| start.checked_add(name_length))
+                    .is_none_or(|end| end > BUFFER_BYTES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid directory enumeration filename",
+                ));
+            }
+            let name_units = unsafe {
+                std::slice::from_raw_parts(
+                    info.file_name.as_ptr(),
+                    name_length / std::mem::size_of::<u16>(),
+                )
+            };
+            let name = String::from_utf16(name_units).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reservation filename is not UTF-16",
+                )
+            })?;
+            if name != "."
+                && name != ".."
+                && info.file_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+                    == 0
+            {
+                names.push(name);
+            }
+
+            if info.next_entry_offset == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(info.next_entry_offset as usize)
+                .filter(|next| *next < BUFFER_BYTES)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid directory entry offset")
+                })?;
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(unix)]

@@ -9,6 +9,7 @@ use fluxform_server_probe::{
     DiskSpaceProvider, LedgerLimits, LimitError, UploadLedger, UploadState,
 };
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SECRET_A: [u8; 32] = [0xA1; 32];
@@ -656,9 +657,242 @@ fn opening_a_legacy_database_applies_a_schema_versioned_migration() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 2,
+        version, 3,
         "the database needs the current committed schema version"
     );
+}
+
+#[test]
+fn startup_recovers_orphaned_and_oversized_files_after_an_allocation_crash() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    let session = ledger.reserve("192.0.2.10", Some(4)).unwrap();
+    let reservations = temp_dir.path().join(".fluxform-reservations");
+    let orphan = reservations.join("crashed-before-commit.upload");
+    fs::write(&orphan, [0_u8; 8]).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&session.upload_path)
+        .unwrap()
+        .set_len(8)
+        .unwrap();
+    drop(ledger);
+
+    let reopened = open(&temp_dir, limits(), vec![SECRET_A]);
+
+    assert_eq!(reopened.reserved_bytes().unwrap(), 4);
+    assert_eq!(fs::metadata(&session.upload_path).unwrap().len(), 4);
+    assert!(
+        !orphan.exists(),
+        "uncommitted reservation files must be reclaimed on startup"
+    );
+}
+
+#[test]
+fn populated_legacy_sessions_in_every_state_are_retired_and_their_files_enqueued() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    let mut sessions = Vec::new();
+    for index in 10..17 {
+        sessions.push(
+            ledger
+                .reserve(&format!("192.0.2.{index}"), Some(2))
+                .unwrap(),
+        );
+    }
+    ledger
+        .transition(
+            sessions[1].session_id,
+            &sessions[1].session_token,
+            UploadState::Receiving,
+        )
+        .unwrap();
+    for index in [2, 3, 4] {
+        ledger
+            .transition(
+                sessions[index].session_id,
+                &sessions[index].session_token,
+                UploadState::Receiving,
+            )
+            .unwrap();
+        ledger
+            .settle(
+                sessions[index].session_id,
+                &sessions[index].session_token,
+                0,
+            )
+            .unwrap();
+    }
+    ledger
+        .transition(
+            sessions[3].session_id,
+            &sessions[3].session_token,
+            UploadState::Probing,
+        )
+        .unwrap();
+    ledger
+        .transition(
+            sessions[4].session_id,
+            &sessions[4].session_token,
+            UploadState::Probing,
+        )
+        .unwrap();
+    ledger
+        .transition(
+            sessions[4].session_id,
+            &sessions[4].session_token,
+            UploadState::Queued,
+        )
+        .unwrap();
+    ledger
+        .expire(sessions[5].session_id, &sessions[5].session_token)
+        .unwrap();
+    ledger
+        .transition(
+            sessions[6].session_id,
+            &sessions[6].session_token,
+            UploadState::Rejected,
+        )
+        .unwrap();
+    drop(ledger);
+
+    raw_connection(&temp_dir)
+        .execute_batch(
+            "ALTER TABLE uploads DROP COLUMN capability_hash;
+             ALTER TABLE ip_hashes DROP COLUMN key_id;
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+
+    let migrated = open(&temp_dir, limits(), vec![SECRET_A]);
+
+    for session in &sessions {
+        assert_eq!(
+            migrated
+                .state(session.session_id, &session.session_token)
+                .unwrap_err()
+                .to_string(),
+            "upload session capability is invalid"
+        );
+    }
+    let states: Vec<String> = {
+        let connection = raw_connection(&temp_dir);
+        let mut statement = connection
+            .prepare("SELECT state FROM uploads ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(states, vec!["expired"; sessions.len()]);
+    assert_eq!(cleanup_job_count(&temp_dir), sessions.len() as i64);
+
+    let cleanup = migrated.reconcile_cleanup_jobs().unwrap();
+    assert_eq!(cleanup.completed, sessions.len());
+    assert!(sessions.iter().all(|session| !session.upload_path.exists()));
+}
+
+#[test]
+fn populated_legacy_quota_is_preserved_with_an_operator_retained_key_id() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut configured = limits();
+    configured.daily_quota_bytes = 1;
+    let ledger = open(&temp_dir, configured, vec![SECRET_A]);
+    let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+    ledger
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving,
+        )
+        .unwrap();
+    ledger
+        .settle(session.session_id, &session.session_token, 1)
+        .unwrap();
+    drop(ledger);
+
+    raw_connection(&temp_dir)
+        .execute_batch(
+            "ALTER TABLE uploads DROP COLUMN capability_hash;
+             ALTER TABLE ip_hashes DROP COLUMN key_id;
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    let retained_key_id: [u8; 32] = Sha256::digest(SECRET_A).into();
+
+    let migrated = UploadLedger::open_with_legacy_key_id(
+        temp_dir.path().join("ledger.sqlite3"),
+        temp_dir.path(),
+        configured,
+        vec![SECRET_B, SECRET_A],
+        retained_key_id,
+    )
+    .expect("operator-declared retained key should preserve the v0 quota identity");
+
+    let stored_key_id: Vec<u8> = raw_connection(&temp_dir)
+        .query_row("SELECT key_id FROM ip_hashes LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored_key_id, retained_key_id);
+    assert!(matches!(
+        migrated.reserve("192.0.2.10", Some(1)),
+        Err(LimitError::DailyQuotaExceeded)
+    ));
+    let migrated_state: String = raw_connection(&temp_dir)
+        .query_row(
+            "SELECT state FROM uploads WHERE id = ?1",
+            [session.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migrated_state, "expired");
+    assert_eq!(cleanup_job_count(&temp_dir), 1);
+}
+
+#[test]
+fn previously_migrated_v2_rows_without_capabilities_are_retired() {
+    let temp_dir = TempDir::new().unwrap();
+    let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
+    let session = ledger.reserve("192.0.2.10", Some(2)).unwrap();
+    ledger
+        .transition(
+            session.session_id,
+            &session.session_token,
+            UploadState::Receiving,
+        )
+        .unwrap();
+    ledger
+        .settle(session.session_id, &session.session_token, 0)
+        .unwrap();
+    drop(ledger);
+
+    raw_connection(&temp_dir)
+        .execute_batch(
+            "ALTER TABLE uploads DROP COLUMN capability_hash;
+             ALTER TABLE uploads ADD COLUMN capability_hash BLOB
+                 CHECK (capability_hash IS NULL OR length(capability_hash) = 32);
+             ALTER TABLE ip_hashes DROP COLUMN key_id;
+             ALTER TABLE ip_hashes ADD COLUMN key_id BLOB
+                 CHECK (key_id IS NULL OR length(key_id) = 32);
+             UPDATE uploads SET state = 'queued', capability_hash = NULL;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+    let migrated = open(&temp_dir, limits(), vec![SECRET_A]);
+
+    let state: String = raw_connection(&temp_dir)
+        .query_row(
+            "SELECT state FROM uploads WHERE id = ?1",
+            [session.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "expired");
+    assert_eq!(cleanup_job_count(&temp_dir), 1);
+    assert_eq!(migrated.reconcile_cleanup_jobs().unwrap().completed, 1);
+    assert!(!session.upload_path.exists());
 }
 
 #[test]
