@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::net::IpAddr;
@@ -15,7 +16,7 @@ use crate::auth::Capability;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS global_budget (
@@ -45,7 +46,9 @@ CREATE TABLE IF NOT EXISTS uploads (
     reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
     actual_bytes INTEGER CHECK (actual_bytes IS NULL OR actual_bytes >= 0),
     created_day INTEGER NOT NULL CHECK (created_day >= 0),
-    upload_path TEXT
+    upload_path TEXT,
+    file_identity BLOB,
+    lease_expires_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS uploads_identity_state ON uploads(identity_id, state);
 CREATE TABLE IF NOT EXISTS cleanup_outbox (
@@ -89,6 +92,10 @@ pub enum LimitError {
     InvalidUploadPath,
     #[error("upload accounting invariant failed")]
     AccountingInvariant,
+    #[error("upload staging file identity changed")]
+    FileIdentityMismatch,
+    #[error("upload capability has expired")]
+    CapabilityExpired,
     #[error("database is busy")]
     DatabaseBusy,
     #[error("database operation failed")]
@@ -387,12 +394,25 @@ impl UploadLedger {
         let had_uploads = table_exists(&transaction, "uploads")?;
         let had_capability_hash =
             had_uploads && table_has_column(&transaction, "uploads", "capability_hash")?;
+        let had_file_identity =
+            had_uploads && table_has_column(&transaction, "uploads", "file_identity")?;
+        let had_lease_expiry =
+            had_uploads && table_has_column(&transaction, "uploads", "lease_expires_at")?;
         let had_ip_hashes = table_exists(&transaction, "ip_hashes")?;
         let had_key_id = had_ip_hashes && table_has_column(&transaction, "ip_hashes", "key_id")?;
         transaction.execute_batch(SCHEMA)?;
         if had_uploads && !had_capability_hash {
             transaction.execute(
                 "ALTER TABLE uploads ADD COLUMN capability_hash BLOB CHECK (capability_hash IS NULL OR length(capability_hash) = 32)",
+                [],
+            )?;
+        }
+        if had_uploads && !had_file_identity {
+            transaction.execute("ALTER TABLE uploads ADD COLUMN file_identity BLOB", [])?;
+        }
+        if had_uploads && !had_lease_expiry {
+            transaction.execute(
+                "ALTER TABLE uploads ADD COLUMN lease_expires_at INTEGER",
                 [],
             )?;
         }
@@ -420,6 +440,22 @@ impl UploadLedger {
                  WHERE capability_hash IS NULL",
                 [],
             )?;
+            // Rows predating persisted file identities cannot safely unlink a
+            // reservation filename after restart because it may now name a
+            // different file. Release quota and preserve a retryable cleanup
+            // record instead of guessing which object the old row referred to.
+            transaction.execute(
+                "INSERT OR IGNORE INTO cleanup_outbox(session_id, relative_path, attempts) \
+                 SELECT id, upload_path, 0 FROM uploads \
+                 WHERE file_identity IS NULL AND upload_path IS NOT NULL \
+                   AND state IN ('reserved', 'receiving')",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE uploads SET state = 'expired', reserved_bytes = 0 \
+                 WHERE file_identity IS NULL AND state IN ('reserved', 'receiving')",
+                [],
+            )?;
         }
         if let Some(retained_key_id) = retained_legacy_key_id {
             transaction.execute(
@@ -427,9 +463,11 @@ impl UploadLedger {
                 [retained_key_id.as_slice()],
             )?;
         }
+        expire_abandoned_sessions_in_transaction(&transaction, current_unix_seconds())?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         ledger.validate_startup_invariants(&transaction)?;
         transaction.commit()?;
+        ledger.reconcile_cleanup_jobs()?;
         ledger.reconcile_unreferenced_files()?;
         Ok(ledger)
     }
@@ -513,12 +551,13 @@ impl UploadLedger {
             &file_name,
             requested,
         )?;
+        let file_identity = file_reservation.file_identity.clone();
         self.check_disk_safety_margin()?;
 
         transaction.execute(
-            "INSERT INTO uploads(identity_id, capability_hash, state, reserved_bytes, actual_bytes, created_day, upload_path) \
-             VALUES (?1, ?2, 'reserved', ?3, NULL, ?4, ?5)",
-            params![identity_id, capability_hash.as_slice(), to_sql_integer(requested)?, day, relative_path],
+            "INSERT INTO uploads(identity_id, capability_hash, state, reserved_bytes, actual_bytes, created_day, upload_path, file_identity) \
+             VALUES (?1, ?2, 'reserved', ?3, NULL, ?4, ?5, ?6)",
+            params![identity_id, capability_hash.as_slice(), to_sql_integer(requested)?, day, relative_path, file_identity],
         )?;
         let session_id = transaction.last_insert_rowid();
 
@@ -571,7 +610,36 @@ impl UploadLedger {
         &self,
         session_id: i64,
         capability: &SessionToken,
+        file: &mut fs::File,
         required_total: u64,
+    ) -> Result<UploadReservation, LimitError> {
+        self.expand_internal(session_id, capability, file, required_total, None)
+    }
+
+    pub(crate) fn expand_receiving(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        file: &mut fs::File,
+        required_total: u64,
+        lease_duration: Duration,
+    ) -> Result<UploadReservation, LimitError> {
+        self.expand_internal(
+            session_id,
+            capability,
+            file,
+            required_total,
+            Some(lease_duration),
+        )
+    }
+
+    fn expand_internal(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        file: &mut fs::File,
+        required_total: u64,
+        lease_duration: Option<Duration>,
     ) -> Result<UploadReservation, LimitError> {
         if required_total == 0 {
             return Err(LimitError::InvalidSize);
@@ -584,10 +652,25 @@ impl UploadLedger {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, reserved, identity_id, relative_path) =
             load_session(&transaction, session_id, capability)?;
+        let expected_file_identity = load_file_identity(&transaction, session_id)?;
         let upload_path = self.reservation_path(relative_path.as_deref())?;
         if !state.is_reserved() {
             return Err(LimitError::InvalidTransition);
         }
+        if let Some(lease_duration) = lease_duration {
+            if state != UploadState::Receiving || lease_duration.is_zero() {
+                return Err(LimitError::InvalidTransition);
+            }
+            let current_lease = transaction.query_row(
+                "SELECT lease_expires_at FROM uploads WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+            if current_lease.is_none_or(|expires_at| expires_at <= current_unix_seconds()) {
+                return Err(LimitError::InvalidTransition);
+            }
+        }
+        self.verify_file_identity(relative_path.as_deref(), file, &expected_file_identity)?;
         if required_total <= reserved {
             transaction.commit()?;
             return Ok(UploadReservation {
@@ -610,22 +693,25 @@ impl UploadLedger {
             return Err(LimitError::GlobalCapacityExceeded);
         }
         self.check_disk_capacity(delta)?;
-        let file_name = reservation_leaf(Path::new(
-            relative_path
-                .as_deref()
-                .ok_or(LimitError::AccountingInvariant)?,
-        ))
-        .map_err(|_| LimitError::InvalidUploadPath)?;
-        let mut file_reservation = resize_reserved_file(
-            Arc::clone(&self.reservation_directory),
-            &file_name,
-            required_total,
-        )?;
+        let mut file_reservation = resize_reserved_file(file, required_total)?;
         self.check_disk_safety_margin()?;
 
+        // Expansion performs synchronous allocation while holding this
+        // immediate transaction, preventing another reconciler from expiring
+        // the row mid-operation. Renew again after allocation and commit the
+        // new lease with the reservation so no observer can see an expired
+        // lease in the gap after the transaction releases its write lock.
+        let renewed_lease = lease_duration
+            .map(|duration| {
+                capability_expiry(&transaction, session_id, capability)?;
+                new_lease_expiry(current_unix_seconds(), duration, i64::MAX)
+            })
+            .transpose()?;
+
         let changed = transaction.execute(
-            "UPDATE uploads SET reserved_bytes = ?1 WHERE id = ?2 AND state IN ('reserved', 'receiving')",
-            params![to_sql_integer(required_total)?, session_id],
+            "UPDATE uploads SET reserved_bytes = ?1, lease_expires_at = COALESCE(?2, lease_expires_at) \
+             WHERE id = ?3 AND state IN ('reserved', 'receiving')",
+            params![to_sql_integer(required_total)?, renewed_lease, session_id],
         )?;
         if changed != 1 {
             return Err(LimitError::AccountingInvariant);
@@ -679,15 +765,42 @@ impl UploadLedger {
         capability: &SessionToken,
         actual_bytes: u64,
     ) -> Result<(), LimitError> {
+        self.settle_internal(session_id, capability, None, actual_bytes)
+    }
+
+    pub(crate) fn settle_pinned(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        file: &fs::File,
+        actual_bytes: u64,
+    ) -> Result<(), LimitError> {
+        self.settle_internal(session_id, capability, Some(file), actual_bytes)
+    }
+
+    fn settle_internal(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        pinned_file: Option<&fs::File>,
+        actual_bytes: u64,
+    ) -> Result<(), LimitError> {
         if actual_bytes > self.limits.max_file_bytes {
             return Err(LimitError::FileTooLarge);
         }
         let day = current_day_bucket();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, reserved, identity_id, _) = load_session(&transaction, session_id, capability)?;
+        let (state, reserved, identity_id, relative_path) =
+            load_session(&transaction, session_id, capability)?;
         if state != UploadState::Receiving {
             return Err(LimitError::InvalidTransition);
+        }
+        let expected_file_identity = load_file_identity(&transaction, session_id)?;
+        if let Some(file) = pinned_file {
+            self.verify_file_identity(relative_path.as_deref(), file, &expected_file_identity)?;
+        } else {
+            self.verify_file_entry_identity(relative_path.as_deref(), &expected_file_identity)?;
         }
         if actual_bytes > reserved {
             return Err(LimitError::SettlementExceedsReservation);
@@ -711,7 +824,7 @@ impl UploadLedger {
             params![identity_id, day, to_sql_integer(actual_bytes)?],
         )?;
         let changed = transaction.execute(
-            "UPDATE uploads SET state = 'uploaded', reserved_bytes = 0, actual_bytes = ?1 \
+            "UPDATE uploads SET state = 'uploaded', reserved_bytes = 0, actual_bytes = ?1, lease_expires_at = NULL \
              WHERE id = ?2 AND state = 'receiving' AND reserved_bytes = ?3",
             params![
                 to_sql_integer(actual_bytes)?,
@@ -742,7 +855,7 @@ impl UploadLedger {
             release_global_reserved(&transaction, reserved)?;
         }
         let changed = transaction.execute(
-            "UPDATE uploads SET state = 'expired', reserved_bytes = 0 WHERE id = ?1 AND state = ?2",
+            "UPDATE uploads SET state = 'expired', reserved_bytes = 0, lease_expires_at = NULL WHERE id = ?1 AND state = ?2",
             params![session_id, state.as_str()],
         )?;
         if changed != 1 {
@@ -757,22 +870,37 @@ impl UploadLedger {
         let connection = self.connect()?;
         let jobs = {
             let mut statement = connection.prepare(
-                "SELECT session_id, relative_path FROM cleanup_outbox ORDER BY session_id",
+                "SELECT cleanup_outbox.session_id, cleanup_outbox.relative_path, uploads.file_identity \
+                 FROM cleanup_outbox JOIN uploads ON uploads.id = cleanup_outbox.session_id \
+                 ORDER BY cleanup_outbox.session_id",
             )?;
             statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         drop(connection);
 
         let mut report = CleanupReport::default();
-        for (session_id, relative_path) in jobs {
+        for (session_id, relative_path, expected_identity) in jobs {
             let relative = normalize_relative_path(Path::new(&relative_path));
-            let deletion = match relative {
-                Ok(relative) => self.remove_upload_file(Path::new(&relative)),
-                Err(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path")),
+            let deletion = match (relative, expected_identity) {
+                (Ok(relative), Some(expected_identity)) => {
+                    self.remove_upload_file_if_identity(Path::new(&relative), &expected_identity)
+                }
+                (Ok(relative), None) if reservation_leaf(Path::new(&relative)).is_err() => {
+                    self.remove_upload_file(Path::new(&relative))
+                }
+                (Ok(_), None) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upload cleanup has no pinned file identity",
+                )),
+                (Err(_), _) => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path")),
             };
             let mut connection = self.connect()?;
             let transaction =
@@ -855,11 +983,146 @@ impl UploadLedger {
             .reservation_directory
             .open_file(&file_name, false)
             .map_err(LimitError::Filesystem)?;
+        let expected_file_identity = load_file_identity(&transaction, session_id)?;
+        if file_identity(&file).map_err(LimitError::Filesystem)? != expected_file_identity {
+            return Err(LimitError::FileIdentityMismatch);
+        }
         if file.metadata().map_err(LimitError::Filesystem)?.len() != reserved_bytes {
             return Err(LimitError::AccountingInvariant);
         }
         transaction.commit()?;
         Ok((file, reserved_bytes))
+    }
+
+    pub(crate) fn verify_upload_file_identity(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        file: &fs::File,
+    ) -> Result<(), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, _, _, relative_path) = load_session(&transaction, session_id, capability)?;
+        let expected_file_identity = load_file_identity(&transaction, session_id)?;
+        self.verify_file_identity(relative_path.as_deref(), file, &expected_file_identity)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn claim_receiving_lease(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        lease_duration: Duration,
+    ) -> Result<i64, LimitError> {
+        let now = current_unix_seconds();
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, _, _, _) = load_session(&transaction, session_id, capability)?;
+        if state != UploadState::Reserved {
+            return Err(LimitError::InvalidTransition);
+        }
+        let capability_expiry = capability_expiry(&transaction, session_id, capability)?;
+        let lease_expiry = new_lease_expiry(now, lease_duration, capability_expiry)?;
+        let changed = transaction.execute(
+            "UPDATE uploads SET state = 'receiving', lease_expires_at = ?1 \
+             WHERE id = ?2 AND state = 'reserved'",
+            params![lease_expiry, session_id],
+        )?;
+        if changed != 1 {
+            return Err(LimitError::InvalidTransition);
+        }
+        transaction.commit()?;
+        Ok(lease_expiry)
+    }
+
+    pub fn renew_receiving_lease(
+        &self,
+        session_id: i64,
+        capability: &SessionToken,
+        lease_duration: Duration,
+    ) -> Result<i64, LimitError> {
+        let now = current_unix_seconds();
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, _, _, _) = load_session(&transaction, session_id, capability)?;
+        if state != UploadState::Receiving {
+            return Err(LimitError::InvalidTransition);
+        }
+        let current_lease = transaction.query_row(
+            "SELECT lease_expires_at FROM uploads WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        if current_lease.is_none_or(|expires_at| expires_at <= now) {
+            return Err(LimitError::InvalidTransition);
+        }
+        let capability_expiry = capability_expiry(&transaction, session_id, capability)?;
+        let lease_expiry = new_lease_expiry(now, lease_duration, capability_expiry)?;
+        let changed = transaction.execute(
+            "UPDATE uploads SET lease_expires_at = ?1 \
+             WHERE id = ?2 AND state = 'receiving' AND lease_expires_at > ?3",
+            params![lease_expiry, session_id, now],
+        )?;
+        if changed != 1 {
+            return Err(LimitError::InvalidTransition);
+        }
+        transaction.commit()?;
+        Ok(lease_expiry)
+    }
+
+    /// Expires durable sessions whose capability or renewable receiver lease
+    /// has elapsed, then runs the idempotent cleanup outbox.
+    pub fn reconcile_expired_sessions(&self) -> Result<CleanupReport, LimitError> {
+        self.reconcile_expired_sessions_excluding(&[])
+    }
+
+    /// Expires abandoned sessions except for upload owners held by this live
+    /// process. The durable lease is still checked transactionally; the owner
+    /// set only protects a non-cancellable syscall that has outlived its lease.
+    pub fn reconcile_expired_sessions_excluding(
+        &self,
+        active_uploads: &[i64],
+    ) -> Result<CleanupReport, LimitError> {
+        let now = current_unix_seconds();
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_abandoned_sessions_excluding_in_transaction(&transaction, now, active_uploads)?;
+        transaction.commit()?;
+        self.reconcile_cleanup_jobs()
+    }
+
+    fn verify_file_identity(
+        &self,
+        relative_path: Option<&str>,
+        file: &fs::File,
+        expected_file_identity: &[u8],
+    ) -> Result<(), LimitError> {
+        let relative_path = relative_path.ok_or(LimitError::AccountingInvariant)?;
+        if file_identity(file).map_err(LimitError::Filesystem)? != expected_file_identity {
+            return Err(LimitError::FileIdentityMismatch);
+        }
+        self.verify_file_entry_identity(Some(relative_path), expected_file_identity)
+    }
+
+    fn verify_file_entry_identity(
+        &self,
+        relative_path: Option<&str>,
+        expected_file_identity: &[u8],
+    ) -> Result<(), LimitError> {
+        let relative_path = relative_path.ok_or(LimitError::AccountingInvariant)?;
+        let file_name = reservation_leaf(Path::new(relative_path))
+            .map_err(|_| LimitError::InvalidUploadPath)?;
+        let directory_entry = self
+            .reservation_directory
+            .open_file(&file_name, false)
+            .map_err(LimitError::Filesystem)?;
+        if file_identity(&directory_entry).map_err(LimitError::Filesystem)?
+            != expected_file_identity
+        {
+            return Err(LimitError::FileIdentityMismatch);
+        }
+        Ok(())
     }
 
     fn reservation_path(&self, relative: Option<&str>) -> Result<PathBuf, LimitError> {
@@ -908,16 +1171,20 @@ impl UploadLedger {
 
         let active_files = {
             let mut statement = transaction.prepare(
-                "SELECT reserved_bytes, upload_path FROM uploads \
+                "SELECT reserved_bytes, upload_path, file_identity FROM uploads \
                  WHERE state IN ('reserved', 'receiving') ORDER BY id",
             )?;
             statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        for (reserved_sql, relative) in active_files {
+        for (reserved_sql, relative, expected_identity) in active_files {
             let reserved = from_sql_integer(reserved_sql)?;
             if reserved > self.limits.max_file_bytes {
                 return Err(LimitError::ExistingCommitmentsExceedLimits);
@@ -929,6 +1196,10 @@ impl UploadLedger {
                 .reservation_directory
                 .open_file(&file_name, false)
                 .map_err(LimitError::Filesystem)?;
+            let expected_identity = expected_identity.ok_or(LimitError::AccountingInvariant)?;
+            if file_identity(&file).map_err(LimitError::Filesystem)? != expected_identity {
+                return Err(LimitError::FileIdentityMismatch);
+            }
             let allocated = allocated_file_bytes(&file)?;
             if allocated < reserved {
                 self.check_disk_capacity(reserved - allocated)?;
@@ -1099,7 +1370,27 @@ impl UploadLedger {
         self.remove_upload_file_with_hook(relative, || {})
     }
 
+    fn remove_upload_file_if_identity(
+        &self,
+        relative: &Path,
+        expected_identity: &[u8],
+    ) -> io::Result<()> {
+        self.remove_upload_file_with_identity_and_hook(relative, Some(expected_identity), || {})
+    }
+
     fn remove_upload_file_with_hook<F>(&self, relative: &Path, before_remove: F) -> io::Result<()>
+    where
+        F: FnOnce(),
+    {
+        self.remove_upload_file_with_identity_and_hook(relative, None, before_remove)
+    }
+
+    fn remove_upload_file_with_identity_and_hook<F>(
+        &self,
+        relative: &Path,
+        expected_identity: Option<&[u8]>,
+        before_remove: F,
+    ) -> io::Result<()>
     where
         F: FnOnce(),
     {
@@ -1133,6 +1424,13 @@ impl UploadLedger {
             components.push(component.to_owned());
         }
         if components.len() == 2 && components[0] == ".fluxform-reservations" {
+            if let Some(expected_identity) = expected_identity {
+                return remove_file_if_identity(
+                    &self.reservation_directory,
+                    &components[1],
+                    expected_identity,
+                );
+            }
             before_remove();
             return self.reservation_directory.remove_file(&components[1]);
         }
@@ -1142,6 +1440,9 @@ impl UploadLedger {
         let mut parent = self.upload_root_directory.try_clone()?;
         for component in components {
             parent = parent.open_directory_child(&component)?;
+        }
+        if let Some(expected_identity) = expected_identity {
+            return remove_file_if_identity(&parent, &leaf, expected_identity);
         }
         before_remove();
         parent.remove_file(&leaf)
@@ -1230,6 +1531,139 @@ fn load_session(
         row.2,
         row.4,
     ))
+}
+
+fn remove_file_if_identity(
+    directory: &SecureReservationDirectory,
+    file_name: &str,
+    expected_identity: &[u8],
+) -> io::Result<()> {
+    let file = match directory.open_file(file_name, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if file_identity(&file)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "upload path now identifies a different file",
+        ));
+    }
+    drop(file);
+    directory.remove_file(file_name)
+}
+
+fn load_file_identity(
+    transaction: &Transaction<'_>,
+    session_id: i64,
+) -> Result<Vec<u8>, LimitError> {
+    transaction
+        .query_row(
+            "SELECT file_identity FROM uploads WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or(LimitError::AccountingInvariant)
+}
+
+fn capability_expiry(
+    transaction: &Transaction<'_>,
+    session_id: i64,
+    capability: &SessionToken,
+) -> Result<i64, LimitError> {
+    transaction
+        .query_row(
+            "SELECT expires_at FROM capabilities \
+             WHERE token_hash = ?1 AND subject = ?2",
+            params![
+                capability.hash().as_slice(),
+                format!("upload-session:{session_id}")
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(LimitError::CapabilityExpired)
+}
+
+fn new_lease_expiry(
+    now: i64,
+    lease_duration: Duration,
+    capability_expiry: i64,
+) -> Result<i64, LimitError> {
+    if capability_expiry <= now || lease_duration.is_zero() {
+        return Err(LimitError::CapabilityExpired);
+    }
+    let whole_seconds = lease_duration
+        .as_secs()
+        .checked_add(u64::from(lease_duration.subsec_nanos() > 0))
+        .ok_or(LimitError::InvalidConfiguration)?;
+    let seconds =
+        i64::try_from(whole_seconds.max(1)).map_err(|_| LimitError::InvalidConfiguration)?;
+    let lease_expiry = now
+        .checked_add(seconds)
+        .ok_or(LimitError::InvalidConfiguration)?;
+    Ok(lease_expiry.min(capability_expiry))
+}
+
+fn expire_abandoned_sessions_in_transaction(
+    transaction: &Transaction<'_>,
+    now: i64,
+) -> Result<(), LimitError> {
+    expire_abandoned_sessions_excluding_in_transaction(transaction, now, &[])
+}
+
+fn expire_abandoned_sessions_excluding_in_transaction(
+    transaction: &Transaction<'_>,
+    now: i64,
+    active_uploads: &[i64],
+) -> Result<(), LimitError> {
+    let active_uploads = active_uploads.iter().copied().collect::<HashSet<_>>();
+    let sessions = if table_exists(transaction, "capabilities")? {
+        let mut statement = transaction.prepare(
+            "SELECT uploads.id, uploads.reserved_bytes FROM uploads \
+             LEFT JOIN capabilities ON capabilities.token_hash = uploads.capability_hash \
+               AND capabilities.subject = 'upload-session:' || uploads.id \
+             WHERE (uploads.state = 'reserved' AND \
+                    (capabilities.expires_at IS NULL OR capabilities.expires_at <= ?1)) \
+                OR (uploads.state = 'receiving' AND \
+                    (uploads.lease_expires_at IS NULL OR uploads.lease_expires_at <= ?1)) \
+             ORDER BY uploads.id",
+        )?;
+        statement
+            .query_map([now], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = transaction.prepare(
+            "SELECT id, reserved_bytes FROM uploads WHERE state = 'receiving' \
+             AND (lease_expires_at IS NULL OR lease_expires_at <= ?1) ORDER BY id",
+        )?;
+        statement
+            .query_map([now], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (session_id, reserved_sql) in sessions {
+        if active_uploads.contains(&session_id) {
+            continue;
+        }
+        let reserved = from_sql_integer(reserved_sql)?;
+        enqueue_cleanup(transaction, session_id)?;
+        let changed = transaction.execute(
+            "UPDATE uploads SET state = 'expired', reserved_bytes = 0, lease_expires_at = NULL \
+             WHERE id = ?1 AND state IN ('reserved', 'receiving')",
+            [session_id],
+        )?;
+        if changed == 1 && reserved > 0 {
+            release_global_reserved(transaction, reserved)?;
+        }
+    }
+    Ok(())
 }
 
 fn reservation_leaf(relative: &Path) -> io::Result<String> {
@@ -2206,11 +2640,93 @@ fn merge_identity(
 }
 
 fn current_day_bucket() -> i64 {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    i64::try_from(seconds / 86_400).unwrap_or(i64::MAX)
+    current_unix_seconds() / 86_400
+}
+
+fn current_unix_seconds() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    let mut identity = Vec::with_capacity(17);
+    identity.push(b'u');
+    identity.extend_from_slice(&metadata.dev().to_be_bytes());
+    identity.extend_from_slice(&metadata.ino().to_be_bytes());
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time_low: u32,
+        creation_time_high: u32,
+        last_access_time_low: u32,
+        last_access_time_high: u32,
+        last_write_time_low: u32,
+        last_write_time_high: u32,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time_low: 0,
+        creation_time_high: 0,
+        last_access_time_low: 0,
+        last_access_time_high: 0,
+        last_write_time_low: 0,
+        last_write_time_high: 0,
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    let valid =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } != 0;
+    if !valid {
+        return Err(io::Error::last_os_error());
+    }
+    let mut identity = Vec::with_capacity(13);
+    identity.push(b'w');
+    identity.extend_from_slice(&information.volume_serial_number.to_be_bytes());
+    identity.extend_from_slice(&information.file_index_high.to_be_bytes());
+    identity.extend_from_slice(&information.file_index_low.to_be_bytes());
+    Ok(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &fs::File) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable file identities are unsupported on this platform",
+    ))
 }
 
 fn checked_add(left: u64, right: u64) -> Result<u64, LimitError> {
@@ -2255,6 +2771,7 @@ fn hmac_ip(secret: &[u8; 32], canonical_ip: &str) -> String {
 struct ReservationFileGuard {
     directory: Arc<SecureReservationDirectory>,
     file_name: String,
+    file_identity: Vec<u8>,
     previous_size: Option<u64>,
     committed: bool,
 }
@@ -2271,11 +2788,17 @@ impl Drop for ReservationFileGuard {
             return;
         }
         if let Some(previous_size) = self.previous_size {
-            if let Ok(file) = self.directory.open_file(&self.file_name, false) {
+            if let Ok(file) = self.directory.open_file(&self.file_name, false)
+                && file_identity(&file).ok().as_deref() == Some(self.file_identity.as_slice())
+            {
                 let _ = set_file_allocation(&file, previous_size);
             }
         } else {
-            let _ = self.directory.remove_file(&self.file_name);
+            if let Ok(file) = self.directory.open_file(&self.file_name, false)
+                && file_identity(&file).ok().as_deref() == Some(self.file_identity.as_slice())
+            {
+                let _ = self.directory.remove_file(&self.file_name);
+            }
         }
     }
 }
@@ -2288,9 +2811,11 @@ fn create_reserved_file(
     let file = directory
         .open_file(file_name, true)
         .map_err(LimitError::Filesystem)?;
+    let file_identity = file_identity(&file).map_err(LimitError::Filesystem)?;
     let guard = ReservationFileGuard {
         directory,
         file_name: file_name.to_owned(),
+        file_identity,
         previous_size: None,
         committed: false,
     };
@@ -2298,22 +2823,37 @@ fn create_reserved_file(
     Ok(guard)
 }
 
+struct PinnedFileResizeGuard<'a> {
+    file: &'a fs::File,
+    previous_size: u64,
+    committed: bool,
+}
+
+impl PinnedFileResizeGuard<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PinnedFileResizeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = set_file_allocation(self.file, self.previous_size);
+        }
+    }
+}
+
 fn resize_reserved_file(
-    directory: Arc<SecureReservationDirectory>,
-    file_name: &str,
+    file: &fs::File,
     size: u64,
-) -> Result<ReservationFileGuard, LimitError> {
-    let file = directory
-        .open_file(file_name, false)
-        .map_err(LimitError::Filesystem)?;
+) -> Result<PinnedFileResizeGuard<'_>, LimitError> {
     let previous_size = file.metadata().map_err(LimitError::Filesystem)?.len();
-    let guard = ReservationFileGuard {
-        directory,
-        file_name: file_name.to_owned(),
-        previous_size: Some(previous_size),
+    let guard = PinnedFileResizeGuard {
+        file,
+        previous_size,
         committed: false,
     };
-    set_file_allocation(&file, size).map_err(LimitError::Filesystem)?;
+    set_file_allocation(file, size).map_err(LimitError::Filesystem)?;
     Ok(guard)
 }
 

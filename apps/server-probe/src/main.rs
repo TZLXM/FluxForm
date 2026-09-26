@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fluxform_server_probe::auth::CapabilityStore;
-use fluxform_server_probe::routes::{ServerState, serve};
+use fluxform_server_probe::routes::{ServerState, serve_with_shutdown};
 use fluxform_server_probe::{LedgerLimits, UploadLedger};
 use tokio::net::TcpListener;
 
@@ -66,7 +66,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "WARNING: FluxForm server probe is local-development only, is bound to loopback, and is not a production service."
     );
     println!("server probe listening at http://{bound_address}");
-    serve(listener, state).await?;
+    serve_with_shutdown(listener, state, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
 

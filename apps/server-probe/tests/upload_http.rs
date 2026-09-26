@@ -1,16 +1,21 @@
 use std::collections::VecDeque;
 use std::error::Error;
+use std::fs::File;
 use std::io;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::Duration;
 
 use fluxform_server_probe::auth::CapabilityStore;
-use fluxform_server_probe::routes::{HttpBody, ServerState, TransportPeer, router, serve};
+use fluxform_server_probe::routes::{
+    HttpBody, ServerState, TransportPeer, UploadChunkWriter, router, serve, serve_with_shutdown,
+};
 use fluxform_server_probe::{
     DiskSpaceProvider, LedgerLimits, SessionToken, UploadLedger, UploadState,
 };
@@ -23,6 +28,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
@@ -150,6 +156,21 @@ impl Harness {
     where
         B: Body<Data = Bytes, Error = io::Error> + Send + 'static,
     {
+        self.put_body_with_state(&self.state, session_id, token, body, content_length)
+            .await
+    }
+
+    async fn put_body_with_state<B>(
+        &self,
+        state: &ServerState,
+        session_id: i64,
+        token: &str,
+        body: B,
+        content_length: Option<&str>,
+    ) -> Response<HttpBody>
+    where
+        B: Body<Data = Bytes, Error = io::Error> + Send + 'static,
+    {
         let request_body = body
             .map_err(|error| -> BoxError { Box::new(error) })
             .boxed_unsync();
@@ -165,7 +186,7 @@ impl Harness {
         request
             .extensions_mut()
             .insert(TransportPeer(SocketAddr::new(DEFAULT_PEER, 43123)));
-        router(self.state.clone()).oneshot(request).await.unwrap()
+        router(state.clone()).oneshot(request).await.unwrap()
     }
 
     fn upload_path(&self, session_id: i64) -> PathBuf {
@@ -190,6 +211,33 @@ impl Harness {
         self.ledger.reserved_bytes().unwrap()
     }
 
+    fn lease_is_future(&self, session_id: i64) -> bool {
+        Connection::open(&self.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT lease_expires_at > unixepoch('now') FROM uploads WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    async fn wait_until_cleaned(&self, session_id: i64, token: &str, path: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !path.exists()
+                    && self.state(session_id, token) == UploadState::Expired
+                    && self.reserved_bytes() == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervised upload worker should eventually expire and clean the allocation");
+    }
+
     fn with_upload_timeouts(mut self, idle: Duration, total: Duration) -> Self {
         self.state = self.state.with_upload_timeouts(idle, total).unwrap();
         self
@@ -200,12 +248,78 @@ impl Harness {
             .unwrap()
             .count()
     }
+
+    fn expire_capability(&self, session_id: i64) {
+        Connection::open(&self.database_path)
+            .unwrap()
+            .execute(
+                "UPDATE capabilities SET expires_at = 0 WHERE token_hash = \
+                 (SELECT capability_hash FROM uploads WHERE id = ?1)",
+                [session_id],
+            )
+            .unwrap();
+    }
+}
+
+#[derive(Clone)]
+struct ReservationObservingWriter {
+    ledger: UploadLedger,
+    reservations_at_write: Arc<Mutex<Vec<u64>>>,
+}
+
+impl UploadChunkWriter for ReservationObservingWriter {
+    fn write_chunk(&self, file: &mut File, chunk: &[u8]) -> io::Result<()> {
+        self.reservations_at_write
+            .lock()
+            .unwrap()
+            .push(self.ledger.reserved_bytes().map_err(io::Error::other)?);
+        file.write_all(chunk)
+    }
+}
+
+#[derive(Clone)]
+struct BlockingUploadWriter {
+    entered: Arc<Semaphore>,
+    delay: Duration,
+}
+
+impl BlockingUploadWriter {
+    fn new(delay: Duration) -> Self {
+        Self {
+            entered: Arc::new(Semaphore::new(0)),
+            delay,
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+}
+
+impl UploadChunkWriter for BlockingUploadWriter {
+    fn write_chunk(&self, file: &mut File, chunk: &[u8]) -> io::Result<()> {
+        self.entered.add_permits(1);
+        thread::sleep(self.delay);
+        file.write_all(chunk)
+    }
 }
 
 async fn start_server(state: ServerState) -> (SocketAddr, JoinHandle<io::Result<()>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     (address, tokio::spawn(serve(listener, state)))
+}
+
+async fn start_server_with_shutdown(
+    state: ServerState,
+) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<io::Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, shutdown_receiver) = oneshot::channel();
+    let server = tokio::spawn(serve_with_shutdown(listener, state, async move {
+        let _ = shutdown_receiver.await;
+    }));
+    (address, shutdown, server)
 }
 
 async fn connect(address: SocketAddr) -> BufReader<TcpStream> {
@@ -447,6 +561,400 @@ async fn underdeclared_upload_expands_before_polling_and_writing_the_excess_chun
 }
 
 #[tokio::test]
+async fn committed_expansion_is_observable_at_the_exact_excess_chunk_write() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(4).await;
+    let reservations_at_write = Arc::new(Mutex::new(Vec::new()));
+    let writer = ReservationObservingWriter {
+        ledger: harness.ledger.clone(),
+        reservations_at_write: Arc::clone(&reservations_at_write),
+    };
+    let state = harness
+        .state
+        .clone()
+        .with_upload_chunk_writer(Arc::new(writer));
+    let (body, polls) = InstrumentedBody::chunks([
+        Bytes::from_static(b"abc"),
+        Bytes::from_static(b"de"),
+        Bytes::from_static(b"f"),
+    ]);
+
+    let (status, response_body) = response_parts(
+        harness
+            .put_body_with_state(&state, session_id, &token, body, Some("1"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&response_body)
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        *reservations_at_write.lock().unwrap(),
+        [4, 5, 6],
+        "the first excess write must observe its committed reservation"
+    );
+}
+
+#[tokio::test]
+async fn replacement_of_open_staging_entry_cannot_be_reported_as_a_successful_upload() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(4).await;
+    let path = harness.upload_path(session_id);
+    let displaced = path.with_extension("displaced");
+    let path_during_poll = path.clone();
+    let displaced_during_poll = displaced.clone();
+    let body = InstrumentedBody::chunks([Bytes::from_static(b"payload")])
+        .0
+        .with_before_chunk(Arc::new(move |index| {
+            if index == 0 {
+                std::fs::rename(&path_during_poll, &displaced_during_poll).unwrap();
+                std::fs::write(&path_during_poll, b"unrelated replacement").unwrap();
+            }
+        }));
+
+    let (status, response_body) =
+        response_parts(harness.put_body(session_id, &token, body, None).await).await;
+
+    assert!(
+        !status.is_success(),
+        "replacement race must not settle successfully: {}",
+        String::from_utf8_lossy(&response_body)
+    );
+    assert_ne!(harness.state(session_id, &token), UploadState::Uploaded);
+    assert_eq!(std::fs::read(&path).unwrap(), b"unrelated replacement");
+    assert_eq!(harness.reserved_bytes(), 0);
+    assert!(
+        displaced.exists(),
+        "pinned original handle remains distinguishable"
+    );
+}
+
+#[tokio::test]
+async fn startup_reconciles_expired_four_session_quota_and_crash_partial_receiving_file() {
+    let harness = Harness::with_active_session_limit(64, 0, 4);
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        sessions.push(harness.create_upload(1).await);
+    }
+    let paths = sessions
+        .iter()
+        .map(|(session_id, _)| harness.upload_path(*session_id))
+        .collect::<Vec<_>>();
+    for (index, (session_id, _)) in sessions.iter().enumerate() {
+        if index == 0 {
+            Connection::open(&harness.database_path)
+                .unwrap()
+                .execute(
+                    "UPDATE uploads SET state = 'receiving', lease_expires_at = 0 WHERE id = ?1",
+                    [session_id],
+                )
+                .unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&paths[index])
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        } else {
+            harness.expire_capability(*session_id);
+        }
+    }
+
+    let reopened = UploadLedger::open(
+        &harness.database_path,
+        &harness.upload_root,
+        LedgerLimits {
+            max_file_bytes: MAX_FILE_BYTES,
+            daily_quota_bytes: 256,
+            max_active_sessions_per_ip: 4,
+            max_global_reserved_bytes: 64,
+            disk_safety_margin_bytes: 0,
+        },
+        vec![[0x41; 32]],
+    )
+    .unwrap();
+
+    assert_eq!(reopened.reserved_bytes().unwrap(), 0);
+    for ((session_id, token), path) in sessions.iter().zip(&paths) {
+        assert_eq!(
+            reopened
+                .state(*session_id, &SessionToken::parse(token).unwrap())
+                .unwrap(),
+            UploadState::Expired
+        );
+        assert!(!path.exists(), "expired crash allocation must be deleted");
+    }
+}
+
+#[tokio::test]
+async fn periodic_cleanup_releases_four_expired_sessions_and_the_ip_slot() {
+    let harness = Harness::with_active_session_limit(64, 0, 4);
+    let (_address, server) = start_server(harness.state.clone()).await;
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        sessions.push(harness.create_upload(1).await);
+    }
+    let paths = sessions
+        .iter()
+        .map(|(session_id, _)| harness.upload_path(*session_id))
+        .collect::<Vec<_>>();
+    for (session_id, _) in &sessions {
+        harness.expire_capability(*session_id);
+    }
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    assert_eq!(harness.reserved_bytes(), 0);
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert!(harness.create_upload(1).await.0 > 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn renewed_receiving_lease_prevents_cleanup_from_claiming_an_active_stream() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(1).await;
+    let session_token = SessionToken::parse(&token).unwrap();
+    let path = harness.upload_path(session_id);
+    let first_expiry = harness
+        .ledger
+        .claim_receiving_lease(session_id, &session_token, Duration::from_secs(2))
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let renewed_expiry = harness
+        .ledger
+        .renew_receiving_lease(session_id, &session_token, Duration::from_secs(4))
+        .unwrap();
+    assert!(renewed_expiry > first_expiry);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    let cleanup = harness.ledger.reconcile_expired_sessions().unwrap();
+
+    assert_eq!(cleanup.completed, 0);
+    assert_eq!(harness.state(session_id, &token), UploadState::Receiving);
+    assert_eq!(harness.reserved_bytes(), 1);
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn active_upload_owner_survives_a_storage_operation_that_outlives_its_lease() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(1).await;
+    let session_token = SessionToken::parse(&token).unwrap();
+    harness
+        .ledger
+        .claim_receiving_lease(session_id, &session_token, Duration::from_secs(1))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    let cleanup = harness
+        .ledger
+        .reconcile_expired_sessions_excluding(&[session_id])
+        .unwrap();
+    assert_eq!(cleanup.completed, 0);
+    assert_eq!(harness.state(session_id, &token), UploadState::Receiving);
+    assert_eq!(harness.reserved_bytes(), 1);
+
+    let cleanup = harness.ledger.reconcile_expired_sessions().unwrap();
+    assert_eq!(cleanup.completed, 1);
+    assert_eq!(harness.state(session_id, &token), UploadState::Expired);
+    assert_eq!(harness.reserved_bytes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_write_returns_at_deadline_and_defers_cleanup_until_worker_finishes() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(1).await;
+    let path = harness.upload_path(session_id);
+    let writer = BlockingUploadWriter::new(Duration::from_secs(1));
+    let state = harness
+        .state
+        .clone()
+        .with_upload_timeouts(Duration::from_secs(1), Duration::from_millis(100))
+        .unwrap()
+        .with_upload_chunk_writer(Arc::new(writer.clone()));
+    let (address, shutdown, server) = start_server_with_shutdown(state).await;
+    let mut upload = std::net::TcpStream::connect(address).unwrap();
+    upload
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut response_stream = upload.try_clone().unwrap();
+    let response_reader = thread::spawn(move || {
+        let mut response = Vec::new();
+        let result = response_stream.read_to_end(&mut response);
+        (response, result)
+    });
+    let request = format!(
+        "PUT /v1/upload-sessions/{session_id}/content HTTP/1.1\r\nHost: localhost\r\nOrigin: {PUBLIC_ORIGIN}\r\nAuthorization: Bearer {token}\r\nContent-Length: 1\r\n\r\nx"
+    );
+    upload.write_all(request.as_bytes()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), writer.wait_until_entered())
+        .await
+        .expect("request should reach the injected storage operation");
+
+    let (mut response_bytes, timely_read) = response_reader.join().unwrap();
+    let returned_at_deadline = timely_read.is_ok();
+    if !returned_at_deadline {
+        upload
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        upload.read_to_end(&mut response_bytes).unwrap();
+    }
+    let response_text = String::from_utf8_lossy(&response_bytes);
+    let status = response_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .unwrap();
+    let body_start = response_bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+
+    assert!(
+        returned_at_deadline,
+        "blocking storage exceeded the upload deadline"
+    );
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT.as_u16());
+    assert_error_code(&response_bytes[body_start..], "upload_timeout");
+    assert_eq!(harness.state(session_id, &token), UploadState::Receiving);
+    assert!(
+        path.exists(),
+        "cleanup cannot race the still-running writer"
+    );
+    shutdown.send(()).unwrap();
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("shutdown should wait for the supervised slow-storage worker")
+        .unwrap();
+    assert!(shutdown_result.is_ok());
+    assert!(
+        !path.exists(),
+        "worker should clean only after the injected syscall returns"
+    );
+    assert_eq!(harness.state(session_id, &token), UploadState::Expired);
+    assert_eq!(harness.reserved_bytes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_heartbeat_keeps_persisted_lease_valid_past_its_original_expiry() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(1).await;
+    let writer = BlockingUploadWriter::new(Duration::from_millis(3_500));
+    let state = harness
+        .state
+        .clone()
+        .with_upload_timeouts(Duration::from_secs(4), Duration::from_secs(5))
+        .unwrap()
+        .with_upload_lease_policy(Duration::from_secs(2), Duration::from_millis(100))
+        .unwrap()
+        .with_upload_chunk_writer(Arc::new(writer.clone()));
+    let (address, server) = start_server(state).await;
+    let mut stream = connect(address).await;
+    let headers = [
+        ("Origin", PUBLIC_ORIGIN),
+        ("Authorization", &format!("Bearer {token}")),
+        ("Content-Length", "1"),
+    ];
+    send_request(
+        &mut stream,
+        "PUT",
+        &format!("/v1/upload-sessions/{session_id}/content"),
+        &headers,
+        b"x",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), writer.wait_until_entered())
+        .await
+        .expect("write worker should enter the injected blocking operation");
+
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert_eq!(harness.state(session_id, &token), UploadState::Receiving);
+    assert!(harness.lease_is_future(session_id));
+    assert_eq!(harness.reserved_bytes(), 1);
+
+    let (status, _, _) = tokio::time::timeout(Duration::from_secs(3), read_response(&mut stream))
+        .await
+        .expect("upload should finish after the blocked writer is released")
+        .unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
+    assert_eq!(harness.state(session_id, &token), UploadState::Uploaded);
+    server.abort();
+}
+
+#[tokio::test]
+async fn listener_closes_a_connection_that_exceeds_the_incomplete_header_deadline() {
+    let harness = Harness::new(64, 0);
+    let state = harness
+        .state
+        .clone()
+        .with_listener_limits(1, Duration::from_millis(100))
+        .unwrap();
+    let (address, server) = start_server(state).await;
+    let mut slow = TcpStream::connect(address).await.unwrap();
+    slow.write_all(b"GET /v1/jobs/x HTTP/1.1\r\nHost:")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_millis(500), slow.read_to_end(&mut response))
+        .await
+        .expect("incomplete HTTP headers must not retain a socket indefinitely")
+        .unwrap();
+    assert!(
+        response.is_empty(),
+        "the timed-out connection is closed pre-request"
+    );
+
+    let mut next = TcpStream::connect(address).await.unwrap();
+    next.write_all(b"GET /v1/jobs/x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, _, _) = read_response(&mut BufReader::new(next)).await.unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16());
+    server.abort();
+}
+
+#[tokio::test]
+async fn listener_connection_cap_closes_excess_sockets_and_releases_slots() {
+    let harness = Harness::new(64, 0);
+    let state = harness
+        .state
+        .clone()
+        .with_listener_limits(1, Duration::from_secs(1))
+        .unwrap();
+    let (address, server) = start_server(state).await;
+    let mut first = TcpStream::connect(address).await.unwrap();
+    first
+        .write_all(b"GET /v1/jobs/x HTTP/1.1\r\nHost:")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let mut excess = TcpStream::connect(address).await.unwrap();
+    let mut excess_bytes = [0; 1];
+    let excess_read =
+        tokio::time::timeout(Duration::from_millis(300), excess.read(&mut excess_bytes))
+            .await
+            .expect("connections over the cap should be promptly closed")
+            .unwrap();
+    assert_eq!(excess_read, 0);
+
+    first.write_all(b" localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_response(&mut BufReader::new(first)).await.unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16());
+    server.abort();
+}
+
+#[tokio::test]
 async fn declared_size_and_hard_limit_boundaries_are_counted_across_chunks() {
     for (declared, actual, expected_status) in [
         (4, 3, StatusCode::NO_CONTENT),
@@ -585,8 +1093,8 @@ async fn body_error_rejects_upload_and_stops_polling() {
 
 #[tokio::test]
 async fn upload_total_timeout_cleans_staging_and_stops_polling() {
-    let harness =
-        Harness::new(64, 0).with_upload_timeouts(Duration::from_secs(1), Duration::from_millis(10));
+    let harness = Harness::new(64, 0)
+        .with_upload_timeouts(Duration::from_secs(1), Duration::from_millis(100));
     let (session_id, token) = harness.create_upload(8).await;
     let path = harness.upload_path(session_id);
     let (body, polls, emitted_frames) = StallingBody::after_first_chunk(Duration::from_millis(200));
@@ -598,9 +1106,7 @@ async fn upload_total_timeout_cleans_staging_and_stops_polling() {
     assert_error_code(&response_body, "upload_timeout");
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert_eq!(emitted_frames.load(Ordering::SeqCst), 1);
-    assert!(!path.exists());
-    assert_eq!(harness.state(session_id, &token), UploadState::Expired);
-    assert_eq!(harness.reserved_bytes(), 0);
+    harness.wait_until_cleaned(session_id, &token, &path).await;
 }
 
 #[tokio::test]
@@ -618,9 +1124,7 @@ async fn upload_idle_timeout_cleans_staging_and_stops_polling() {
     assert_error_code(&response_body, "upload_timeout");
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert_eq!(emitted_frames.load(Ordering::SeqCst), 1);
-    assert!(!path.exists());
-    assert_eq!(harness.state(session_id, &token), UploadState::Expired);
-    assert_eq!(harness.reserved_bytes(), 0);
+    harness.wait_until_cleaned(session_id, &token, &path).await;
 }
 
 #[tokio::test]
@@ -781,6 +1285,12 @@ async fn timed_out_partial_socket_upload_returns_error_then_closes_without_drain
         .expect("server should close the incomplete request connection")
         .unwrap();
     assert_eq!(closed, 0);
+    // The request must stop promptly at the deadline, while its supervised
+    // blocking owner may only clean the staging allocation after any
+    // non-cancellable storage operation returns.
+    harness
+        .wait_until_cleaned(session_id, capability, &path)
+        .await;
     assert!(!path.exists());
     assert_eq!(harness.state(session_id, capability), UploadState::Expired);
     assert_eq!(harness.reserved_bytes(), 0);

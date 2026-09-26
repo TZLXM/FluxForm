@@ -1,17 +1,17 @@
 # Task 12 Fix Round 1: Streaming Upload Lifecycle and Resource Bounds
 
 **Date:** 2026-09-27  
-**Status:** Parent-approved architecture; detailed implementation plan pending review.
+**Status:** Approved.
 
 ## Scope
 
-Close the five Task 12 review findings without weakening existing authorization, origin, streaming, quota, peer identity, or error-close behavior. This remains a loopback server probe, not a production deployment claim. No new dependency is planned; use the already locked Hyper/Tokio stack.
+Close the five Task 12 review findings without weakening existing authorization, origin, streaming, quota, peer identity, or error-close behavior. This remains a loopback server probe, not a production deployment claim. The listener uses the parent-approved cached/locked `hyper-util 0.1.21` timer integration; all dependency resolution remains offline.
 
 ## Invariants
 
 1. The staging file is one pinned file identity from reservation through expansion, write, settlement, and cleanup. Expansion mutates the opened file handle; settle verifies the recorded directory entry still names that same object. A replaced or renamed entry cannot be reported as a successful upload.
 2. A persisted upload lease protects an active receiver from cleanup. Lease acquisition/renewal and expiry are transactional. Reserved-session expiry follows the durable capability expiry timestamp; Receiving expiry additionally requires an elapsed renewable lease. Startup reconciliation and bounded periodic cleanup release quota and enqueue/delete stale partial files idempotently.
-3. HTTP/Tokio tasks perform no synchronous SQLite or filesystem calls. A bounded blocking-operation pool owns each storage action. Per-operation and overall upload deadlines bound the handler's wait. A timed-out non-cancellable OS operation remains owned by its worker and lease; the response closes promptly, while later worker completion performs truthful settlement or cleanup. No response claims deletion until deletion is confirmed.
+3. Upload request storage work runs on bounded blocking workers rather than Tokio executor threads. Per-operation and overall upload deadlines bound the handler's wait. A timed-out non-cancellable OS operation remains owned by its worker and persisted lease; the response closes promptly, while later worker completion performs truthful settlement or cleanup. No response claims deletion until deletion is confirmed.
 4. Reservation expansion commits before the writer is invoked for the excess chunk; tests observe state at that exact writer call.
 5. The listener limits accepted live connections and uses Hyper's HTTP/1 header-read timeout before a request reaches route/body enforcement. Over-cap connections are closed without spawning work; timed-out partial headers are closed.
 6. The accepted socket supplies `TransportPeer`. Exact `Origin`, upload capability scope, checked streamed totals, hard byte limit, quota and disk watermark behavior, redacted errors, and `Connection: close` on rejected PUT responses remain unchanged.
@@ -24,13 +24,13 @@ Pass the pinned staging `File` into ledger expansion and perform `set_len`/alloc
 
 ### Durable session expiry and leases
 
-Persist `expires_at` with each upload row at the same ledger transaction that reserves bytes; derive it from the capability's authenticated durable expiry, not a separately guessed TTL. Persist a lease deadline for `Receiving`. Starting and renewing a receiver lease require the expected session state/capability; renewal is conditional and occurs at a bounded interval during body and storage work. Cleanup takes an immediate transaction and expires only `Reserved` rows after their persisted expiry or `Receiving` rows whose lease expired. Startup performs reconciliation before serving, and the runnable process runs a bounded periodic maintenance loop. Active lease ownership prevents cleanup; stale crash allocations release IP/global reservation and enqueue path cleanup atomically.
+Use the capability row's durable `expires_at` as the authoritative expiry for `Reserved` rows; persist a renewable lease deadline on each `Receiving` upload. Starting and renewing a receiver lease require the expected session state/capability; an independent tracked heartbeat renews the persisted lease while the actor owns the pinned file, including when a synchronous write is blocked. Expansion renews the lease in the same transaction that commits its reservation, after file allocation returns, so a held SQLite write lock cannot be followed by an expired lease becoming visible. Cleanup takes an immediate transaction and expires only `Reserved` rows after their capability expiry or `Receiving` rows whose lease expired. Startup performs reconciliation before serving, and the runnable process runs a bounded periodic maintenance loop. Stale crash allocations release IP/global reservation and enqueue path cleanup atomically.
 
-The server shutdown path stops accepting first, then waits a bounded grace period for connection/worker owners. On deadline, it aborts request tasks but does not pretend to cancel blocking syscalls; supervised workers retain their persisted lease until they return and settle or clean up. The process does not exit while untracked blocking workers remain.
+The server shutdown path stops accepting first, then waits a bounded grace period for connection/worker owners. Blocking workers are explicitly tracked. On deadline, it aborts request tasks but does not pretend to cancel blocking syscalls; supervised workers retain their persisted lease until they return and settle or clean up. If a non-cancellable syscall outlives the grace period, shutdown remains pending or reports a distinct shutdown failure; it never silently orphans the worker or claims clean shutdown.
 
 ### Blocking storage and deadlines
 
-Use a shared semaphore-bounded `spawn_blocking` executor for ledger/filesystem operations, acquired asynchronously before spawning. Handler waits use `timeout_at` with the absolute upload deadline and the per-operation bound. Each queued operation receives a deadline/lease context and rechecks it before mutation; a running OS syscall is explicitly non-cancellable. A slow-storage test hook blocks a storage operation to prove the Tokio runtime remains responsive, the request returns at deadline, the lease is retained until worker completion, and eventual cleanup occurs after release. Error text reflects whether cleanup is confirmed or pending.
+Use a semaphore-bounded `spawn_blocking` executor for route storage operations and a separately bounded per-upload blocking actor that owns its pinned handle and lease. Handler waits use `timeout_at` with the absolute upload deadline and the per-operation bound. Queued storage and actor commands carry deadlines and recheck them before mutation; a running OS syscall is explicitly non-cancellable. A slow-storage test hook blocks a write to prove the Tokio runtime remains responsive, the request returns at deadline, the lease is independently renewed while the actor is blocked, and cleanup occurs only after release. Error text reflects whether cleanup is confirmed or pending.
 
 ### Listener admission
 

@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
+use std::fs::File;
+use std::future::Future;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -23,20 +26,31 @@ use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
 use hyper::server::conn::http1;
 use hyper::service::service_fn as hyper_service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioTimer;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf as TokioReadBuf};
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tower::Service;
 use tower::service_fn;
 use uuid::Uuid;
 
 use crate::auth::{Capability, CapabilityError, CapabilityStore, Scope};
-use crate::ledger::{LimitError, SessionToken, UploadLedger, UploadState};
+use crate::ledger::{LimitError, SessionToken, UploadLedger};
 
 const MAX_BOOTSTRAP_BODY_BYTES: usize = 16 * 1024;
 const DEFAULT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_UPLOAD_LEASE_DURATION: Duration = Duration::from_secs(60);
+const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_CONNECTIONS: usize = 64;
+const DEFAULT_MAX_UPLOAD_WORKERS: usize = 4;
+const DEFAULT_MAX_STORAGE_WORKERS: usize = 8;
+const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const STORAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_FORWARDED_HOPS: usize = 8;
 const MAX_FORWARDED_HEADER_BYTES: usize = 4 * 1024;
 const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
@@ -76,6 +90,22 @@ const TOO_MANY_FORWARDING_HOPS_ERROR: HttpError = HttpError {
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 pub type HttpBody = UnsyncBoxBody<Bytes, BoxError>;
 
+/// Performs the final synchronous write of one already-reserved upload chunk.
+///
+/// The trait is injectable so tests can observe the committed reservation at
+/// the exact writer call. Implementations run on the bounded storage worker.
+pub trait UploadChunkWriter: Send + Sync + 'static {
+    fn write_chunk(&self, file: &mut File, chunk: &[u8]) -> io::Result<()>;
+}
+
+struct FileUploadChunkWriter;
+
+impl UploadChunkWriter for FileUploadChunkWriter {
+    fn write_chunk(&self, file: &mut File, chunk: &[u8]) -> io::Result<()> {
+        file.write_all(chunk)
+    }
+}
+
 /// Socket peer supplied by the connection adapter, never copied from a header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportPeer(pub SocketAddr);
@@ -89,6 +119,16 @@ pub struct ServerState {
     capability_ttl: Duration,
     upload_idle_timeout: Duration,
     upload_total_timeout: Duration,
+    upload_lease_duration: Duration,
+    upload_lease_renew_interval: Duration,
+    storage_operation_timeout: Duration,
+    upload_chunk_writer: Arc<dyn UploadChunkWriter>,
+    max_connections: usize,
+    header_read_timeout: Duration,
+    upload_workers: Arc<Semaphore>,
+    storage_workers: Arc<Semaphore>,
+    active_uploads: Arc<Mutex<HashSet<i64>>>,
+    worker_tracker: Arc<WorkerTracker>,
     resources: Arc<Mutex<ResourceCatalog>>,
 }
 
@@ -123,6 +163,16 @@ impl ServerState {
             capability_ttl,
             upload_idle_timeout: DEFAULT_UPLOAD_IDLE_TIMEOUT,
             upload_total_timeout: DEFAULT_UPLOAD_TOTAL_TIMEOUT,
+            upload_lease_duration: DEFAULT_UPLOAD_LEASE_DURATION,
+            upload_lease_renew_interval: Duration::from_secs(10),
+            storage_operation_timeout: STORAGE_OPERATION_TIMEOUT,
+            upload_chunk_writer: Arc::new(FileUploadChunkWriter),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT,
+            upload_workers: Arc::new(Semaphore::new(DEFAULT_MAX_UPLOAD_WORKERS)),
+            storage_workers: Arc::new(Semaphore::new(DEFAULT_MAX_STORAGE_WORKERS)),
+            active_uploads: Arc::new(Mutex::new(HashSet::new())),
+            worker_tracker: Arc::new(WorkerTracker::default()),
             resources: Arc::new(Mutex::new(ResourceCatalog::default())),
         })
     }
@@ -137,6 +187,51 @@ impl ServerState {
         }
         self.upload_idle_timeout = idle_timeout;
         self.upload_total_timeout = total_timeout;
+        Ok(self)
+    }
+
+    pub fn with_upload_chunk_writer(mut self, writer: Arc<dyn UploadChunkWriter>) -> Self {
+        self.upload_chunk_writer = writer;
+        self
+    }
+
+    pub fn with_upload_lease_policy(
+        mut self,
+        lease_duration: Duration,
+        renewal_interval: Duration,
+    ) -> Result<Self, RouteConfigurationError> {
+        if lease_duration.is_zero()
+            || renewal_interval.is_zero()
+            || renewal_interval >= lease_duration
+        {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
+        self.upload_lease_duration = lease_duration;
+        self.upload_lease_renew_interval = renewal_interval;
+        Ok(self)
+    }
+
+    pub fn with_storage_operation_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, RouteConfigurationError> {
+        if timeout.is_zero() {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
+        self.storage_operation_timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn with_listener_limits(
+        mut self,
+        max_connections: usize,
+        header_read_timeout: Duration,
+    ) -> Result<Self, RouteConfigurationError> {
+        if max_connections == 0 || header_read_timeout.is_zero() {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
+        self.max_connections = max_connections;
+        self.header_read_timeout = header_read_timeout;
         Ok(self)
     }
 
@@ -199,6 +294,517 @@ impl ServerState {
     }
 }
 
+#[derive(Default)]
+struct WorkerTracker {
+    active: AtomicUsize,
+    finished: Notify,
+}
+
+impl WorkerTracker {
+    fn begin(self: &Arc<Self>) -> WorkerGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        WorkerGuard(Arc::clone(self))
+    }
+
+    async fn wait_until_idle(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.active.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+}
+
+struct WorkerGuard(Arc<WorkerTracker>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.finished.notify_one();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StorageTaskError {
+    Timeout,
+    Failed,
+}
+
+async fn run_storage<T, F>(
+    state: &ServerState,
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> Result<T, StorageTaskError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit: OwnedSemaphorePermit =
+        tokio::time::timeout_at(deadline, Arc::clone(&state.storage_workers).acquire_owned())
+            .await
+            .map_err(|_| StorageTaskError::Timeout)?
+            .map_err(|_| StorageTaskError::Failed)?;
+    let worker_guard = state.worker_tracker.begin();
+    let (sender, receiver) = oneshot::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _worker_guard = worker_guard;
+        (tokio::time::Instant::now() < deadline).then(operation)
+    });
+    tokio::spawn(async move {
+        let _ = sender.send(worker.await);
+    });
+    match tokio::time::timeout_at(deadline, receiver).await {
+        Err(_) => Err(StorageTaskError::Timeout),
+        Ok(Err(_)) | Ok(Ok(Err(_))) => Err(StorageTaskError::Failed),
+        Ok(Ok(Ok(Some(value)))) => Ok(value),
+        Ok(Ok(Ok(None))) => Err(StorageTaskError::Timeout),
+    }
+}
+
+fn active_upload_ids(state: &ServerState) -> Vec<i64> {
+    state
+        .active_uploads
+        .lock()
+        .map(|sessions| sessions.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+enum UploadWorkerCommand {
+    Start {
+        deadline: tokio::time::Instant,
+        response: oneshot::Sender<Result<u64, UploadWorkerError>>,
+    },
+    Write {
+        required_total: u64,
+        chunk: Bytes,
+        deadline: tokio::time::Instant,
+        response: oneshot::Sender<Result<u64, UploadWorkerError>>,
+    },
+    Finish {
+        actual_bytes: u64,
+        deadline: tokio::time::Instant,
+        response: oneshot::Sender<Result<(), UploadWorkerError>>,
+    },
+    Abort(Option<oneshot::Sender<()>>),
+}
+
+enum UploadWorkerError {
+    Timeout,
+    Storage(LimitError),
+}
+
+impl From<LimitError> for UploadWorkerError {
+    fn from(error: LimitError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+struct UploadWorker {
+    sender: mpsc::Sender<UploadWorkerCommand>,
+}
+
+impl UploadWorker {
+    async fn start(
+        state: &ServerState,
+        session_id: i64,
+        token: SessionToken,
+        lease_duration: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Self, oneshot::Receiver<Result<u64, UploadWorkerError>>), HttpError> {
+        let permit =
+            tokio::time::timeout_at(deadline, Arc::clone(&state.upload_workers).acquire_owned())
+                .await
+                .map_err(|_| UPLOAD_TIMEOUT_ERROR)?
+                .map_err(|_| HttpError::storage_unavailable())?;
+        let inserted = state
+            .active_uploads
+            .lock()
+            .map_err(|_| HttpError::storage_unavailable())?
+            .insert(session_id);
+        if !inserted {
+            return Err(HttpError {
+                status: StatusCode::CONFLICT,
+                code: "invalid_state",
+                message: "The request cannot be completed in the current state.",
+            });
+        }
+
+        let ledger = state.ledger.clone();
+        let writer = Arc::clone(&state.upload_chunk_writer);
+        let active_uploads = Arc::clone(&state.active_uploads);
+        let worker_state = state.clone();
+        let recovery_token = token.clone();
+        let worker_guard = state.worker_tracker.begin();
+        let (sender, receiver) = mpsc::channel(1);
+        let (reply, reply_receiver) = oneshot::channel();
+        let (claimed_sender, claimed_receiver) = oneshot::channel();
+        let actor = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _worker_guard = worker_guard;
+            run_upload_worker(
+                UploadWorkerContext {
+                    ledger,
+                    writer,
+                    active_uploads,
+                    session_id,
+                    token,
+                    lease_duration,
+                    claimed_sender,
+                },
+                receiver,
+            );
+        });
+        let heartbeat_sender = sender.clone();
+        let heartbeat_guard = state.worker_tracker.begin();
+        tokio::spawn(async move {
+            let mut actor = actor;
+            if claimed_receiver.await.is_err() {
+                if actor.await.is_err() {
+                    recover_upload_worker(&worker_state, session_id, recovery_token).await;
+                }
+                return;
+            }
+
+            let _heartbeat_guard = heartbeat_guard;
+            let mut renewal = tokio::time::interval(worker_state.upload_lease_renew_interval);
+            renewal.tick().await;
+            loop {
+                tokio::select! {
+                    result = &mut actor => {
+                        if result.is_err() {
+                            recover_upload_worker(&worker_state, session_id, recovery_token).await;
+                        }
+                        break;
+                    }
+                    _ = renewal.tick() => {
+                        let ledger = worker_state.ledger.clone();
+                        let token = recovery_token.clone();
+                        let lease_duration = worker_state.upload_lease_duration;
+                        let deadline = tokio::time::Instant::now()
+                            + worker_state.storage_operation_timeout;
+                        if !matches!(
+                            run_storage(&worker_state, deadline, move || {
+                                ledger.renew_receiving_lease(session_id, &token, lease_duration)
+                            }).await,
+                            Ok(Ok(_))
+                        ) {
+                            let _ = heartbeat_sender.try_send(UploadWorkerCommand::Abort(None));
+                        }
+                    }
+                }
+            }
+        });
+
+        tokio::time::timeout_at(
+            deadline,
+            sender.send(UploadWorkerCommand::Start {
+                deadline,
+                response: reply,
+            }),
+        )
+        .await
+        .map_err(|_| UPLOAD_TIMEOUT_ERROR)?
+        .map_err(|_| HttpError::storage_unavailable())?;
+        Ok((Self { sender }, reply_receiver))
+    }
+
+    async fn write(
+        &self,
+        required_total: u64,
+        chunk: Bytes,
+        deadline: tokio::time::Instant,
+    ) -> Result<oneshot::Receiver<Result<u64, UploadWorkerError>>, HttpError> {
+        let (reply, receiver) = oneshot::channel();
+        tokio::time::timeout_at(
+            deadline,
+            self.sender.send(UploadWorkerCommand::Write {
+                required_total,
+                chunk,
+                deadline,
+                response: reply,
+            }),
+        )
+        .await
+        .map_err(|_| UPLOAD_TIMEOUT_ERROR)?
+        .map_err(|_| HttpError::storage_unavailable())?;
+        Ok(receiver)
+    }
+
+    async fn finish(
+        &self,
+        actual_bytes: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<oneshot::Receiver<Result<(), UploadWorkerError>>, HttpError> {
+        let (reply, receiver) = oneshot::channel();
+        tokio::time::timeout_at(
+            deadline,
+            self.sender.send(UploadWorkerCommand::Finish {
+                actual_bytes,
+                deadline,
+                response: reply,
+            }),
+        )
+        .await
+        .map_err(|_| UPLOAD_TIMEOUT_ERROR)?
+        .map_err(|_| HttpError::storage_unavailable())?;
+        Ok(receiver)
+    }
+
+    async fn abort(&self, deadline: tokio::time::Instant) -> bool {
+        let (reply, receiver) = oneshot::channel();
+        if tokio::time::timeout_at(
+            deadline,
+            self.sender.send(UploadWorkerCommand::Abort(Some(reply))),
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+        tokio::time::timeout_at(deadline, receiver).await.is_ok()
+    }
+}
+
+impl Drop for UploadWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.try_send(UploadWorkerCommand::Abort(None));
+    }
+}
+
+struct UploadWorkerContext {
+    ledger: UploadLedger,
+    writer: Arc<dyn UploadChunkWriter>,
+    active_uploads: Arc<Mutex<HashSet<i64>>>,
+    session_id: i64,
+    token: SessionToken,
+    lease_duration: Duration,
+    claimed_sender: oneshot::Sender<()>,
+}
+
+fn run_upload_worker(
+    context: UploadWorkerContext,
+    mut commands: mpsc::Receiver<UploadWorkerCommand>,
+) {
+    let UploadWorkerContext {
+        ledger,
+        writer,
+        active_uploads,
+        session_id,
+        token,
+        lease_duration,
+        claimed_sender,
+    } = context;
+    let mut file = None;
+    let mut reserved_bytes = 0;
+    let mut claimed = false;
+    let mut settled = false;
+    let mut claimed_sender = Some(claimed_sender);
+
+    while let Some(command) = commands.blocking_recv() {
+        match command {
+            UploadWorkerCommand::Start { deadline, response } => {
+                let result = if tokio::time::Instant::now() >= deadline {
+                    Err(UploadWorkerError::Timeout)
+                } else {
+                    let claimed_result =
+                        ledger.claim_receiving_lease(session_id, &token, lease_duration);
+                    if claimed_result.is_ok() {
+                        claimed = true;
+                        if let Some(sender) = claimed_sender.take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                    match claimed_result {
+                        Err(error) => Err(UploadWorkerError::Storage(error)),
+                        Ok(_) if tokio::time::Instant::now() >= deadline => {
+                            Err(UploadWorkerError::Timeout)
+                        }
+                        Ok(_) => match ledger.open_receiving_upload_file(session_id, &token) {
+                            Err(error) => Err(UploadWorkerError::Storage(error)),
+                            Ok((mut opened, reserved)) => {
+                                if tokio::time::Instant::now() >= deadline {
+                                    Err(UploadWorkerError::Timeout)
+                                } else if let Err(error) = opened.seek(SeekFrom::Start(0)) {
+                                    Err(UploadWorkerError::Storage(LimitError::Filesystem(error)))
+                                } else if tokio::time::Instant::now() >= deadline {
+                                    Err(UploadWorkerError::Timeout)
+                                } else {
+                                    file = Some(opened);
+                                    reserved_bytes = reserved;
+                                    Ok(reserved)
+                                }
+                            }
+                        },
+                    }
+                };
+                if result.is_err() && claimed {
+                    cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                }
+                let success = result.is_ok();
+                let delivered = response.send(result).is_ok();
+                if !success || !delivered {
+                    if claimed && !settled {
+                        cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                    }
+                    break;
+                }
+            }
+            UploadWorkerCommand::Write {
+                required_total,
+                chunk,
+                deadline,
+                response,
+            } => {
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = response.send(Err(UploadWorkerError::Timeout));
+                    cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                    break;
+                }
+                let Some(mut pinned_file) = file.take() else {
+                    let _ = response.send(Err(UploadWorkerError::Storage(
+                        LimitError::InvalidTransition,
+                    )));
+                    break;
+                };
+                let result = (|| {
+                    ledger.renew_receiving_lease(session_id, &token, lease_duration)?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(UploadWorkerError::Timeout);
+                    }
+                    ledger.ensure_disk_safety_margin()?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(UploadWorkerError::Timeout);
+                    }
+                    if required_total > reserved_bytes {
+                        reserved_bytes = ledger
+                            .expand_receiving(
+                                session_id,
+                                &token,
+                                &mut pinned_file,
+                                required_total,
+                                lease_duration,
+                            )?
+                            .reserved_bytes;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(UploadWorkerError::Timeout);
+                    }
+                    ledger.verify_upload_file_identity(session_id, &token, &pinned_file)?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(UploadWorkerError::Timeout);
+                    }
+                    writer
+                        .write_chunk(&mut pinned_file, &chunk)
+                        .map_err(LimitError::Filesystem)?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(UploadWorkerError::Timeout);
+                    }
+                    Ok(reserved_bytes)
+                })();
+                if result.is_ok() {
+                    file = Some(pinned_file);
+                } else {
+                    drop(pinned_file);
+                    cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                }
+                let success = result.is_ok();
+                let delivered = response.send(result).is_ok();
+                if !success || !delivered {
+                    if claimed && !settled {
+                        cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                    }
+                    break;
+                }
+            }
+            UploadWorkerCommand::Finish {
+                actual_bytes,
+                deadline,
+                response,
+            } => {
+                let result = if tokio::time::Instant::now() >= deadline {
+                    Err(UploadWorkerError::Timeout)
+                } else {
+                    match file.take() {
+                        Some(mut pinned_file) => match pinned_file
+                            .set_len(actual_bytes)
+                            .map_err(LimitError::Filesystem)
+                        {
+                            Err(error) => Err(UploadWorkerError::Storage(error)),
+                            Ok(()) if tokio::time::Instant::now() >= deadline => {
+                                Err(UploadWorkerError::Timeout)
+                            }
+                            Ok(()) => match pinned_file.flush().map_err(LimitError::Filesystem) {
+                                Err(error) => Err(UploadWorkerError::Storage(error)),
+                                Ok(()) if tokio::time::Instant::now() >= deadline => {
+                                    Err(UploadWorkerError::Timeout)
+                                }
+                                Ok(()) => ledger
+                                    .settle_pinned(session_id, &token, &pinned_file, actual_bytes)
+                                    .map_err(UploadWorkerError::Storage),
+                            },
+                        },
+                        None => Err(UploadWorkerError::Storage(LimitError::InvalidTransition)),
+                    }
+                };
+                if result.is_ok() {
+                    settled = true;
+                } else {
+                    cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                }
+                let _ = response.send(result);
+                break;
+            }
+            UploadWorkerCommand::Abort(reply) => {
+                cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+                if let Some(reply) = reply {
+                    let _ = reply.send(());
+                }
+                break;
+            }
+        }
+    }
+
+    if !settled && claimed {
+        cleanup_upload_worker(&ledger, session_id, &token, &mut file);
+    }
+    if let Ok(mut active) = active_uploads.lock() {
+        active.remove(&session_id);
+    }
+}
+
+fn cleanup_upload_worker(
+    ledger: &UploadLedger,
+    session_id: i64,
+    token: &SessionToken,
+    file: &mut Option<File>,
+) {
+    drop(file.take());
+    let _ = ledger.expire(session_id, token);
+    let _ = ledger.reconcile_cleanup_jobs();
+}
+
+async fn recover_upload_worker(state: &ServerState, session_id: i64, token: SessionToken) {
+    let ledger = state.ledger.clone();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    let _ = run_storage(state, deadline, move || {
+        match ledger.expire(session_id, &token) {
+            Ok(()) => ledger.reconcile_cleanup_jobs(),
+            Err(error) => Err(error),
+        }
+    })
+    .await;
+    if let Ok(mut active) = state.active_uploads.lock() {
+        active.remove(&session_id);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RouteConfigurationError {
     #[error("invalid server route configuration")]
@@ -240,26 +846,119 @@ pub fn router(
 /// Accepts HTTP/1 connections and attaches each accepted socket's peer address
 /// to its requests. Forwarding headers are never used as the transport identity.
 pub async fn serve(listener: TcpListener, state: ServerState) -> io::Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let connection_state = state.clone();
-        tokio::spawn(async move {
-            let service = hyper_service_fn(move |request: Request<Incoming>| {
-                let state = connection_state.clone();
-                async move {
-                    let mut request = request.map(|body| {
-                        body.map_err(|error| Box::new(error) as BoxError)
-                            .boxed_unsync()
-                    });
-                    request.extensions_mut().insert(TransportPeer(peer));
-                    Ok::<_, Infallible>(handle_request(request, state).await)
-                }
-            });
-            let _ = http1::Builder::new()
-                .serve_connection(TokioIo(stream), service)
-                .await;
-        });
+    serve_with_shutdown(listener, state, std::future::pending()).await
+}
+
+/// Serves HTTP/1 connections until `shutdown` resolves, then stops accepting,
+/// drains connections and waits for tracked blocking workers within a grace
+/// period. A non-cancellable worker past that deadline is reported explicitly.
+pub async fn serve_with_shutdown<F>(
+    listener: TcpListener,
+    state: ServerState,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let startup_ledger = state.ledger.clone();
+    let startup_deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    let startup = run_storage(&state, startup_deadline, move || {
+        startup_ledger.reconcile_expired_sessions()
+    })
+    .await;
+    match startup {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => {
+            return Err(io::Error::other(
+                "upload session startup reconciliation failed",
+            ));
+        }
     }
+    let mut maintenance = tokio::time::interval(SESSION_CLEANUP_INTERVAL);
+    maintenance.tick().await;
+    let connection_slots = Arc::new(Semaphore::new(state.max_connections));
+    let mut connections = JoinSet::new();
+    let mut shutdown = Box::pin(shutdown);
+    let mut serve_error = None;
+    'accept: loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        drop(stream);
+                        continue;
+                    }
+                };
+                let connection_state = state.clone();
+                let header_timeout = connection_state.header_read_timeout;
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let service = hyper_service_fn(move |request: Request<Incoming>| {
+                        let state = connection_state.clone();
+                        async move {
+                            let mut request = request.map(|body| {
+                                body.map_err(|error| Box::new(error) as BoxError)
+                                    .boxed_unsync()
+                            });
+                            request.extensions_mut().insert(TransportPeer(peer));
+                            Ok::<_, Infallible>(handle_request(request, state).await)
+                        }
+                    });
+                    let mut builder = http1::Builder::new();
+                    builder.timer(TokioTimer::new());
+                    builder.header_read_timeout(header_timeout);
+                    let _ = builder.serve_connection(TokioIo(stream), service).await;
+                });
+            }
+            _ = maintenance.tick() => {
+                let ledger = state.ledger.clone();
+                let active = active_upload_ids(&state);
+                let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+                match run_storage(&state, deadline, move || {
+                    ledger.reconcile_expired_sessions_excluding(&active)
+                }).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) | Err(_) => {
+                        serve_error = Some(io::Error::other(
+                            "upload session periodic reconciliation failed",
+                        ));
+                        break 'accept;
+                    }
+                }
+            }
+            _ = &mut shutdown => break 'accept,
+            _ = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
+
+    let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    while !connections.is_empty() {
+        match tokio::time::timeout_at(shutdown_deadline, connections.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                connections.abort_all();
+                while connections.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    if !state
+        .worker_tracker
+        .wait_until_idle(shutdown_deadline)
+        .await
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server shutdown grace elapsed with non-cancellable storage workers still active",
+        ));
+    }
+    if let Some(error) = serve_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 struct TokioIo<T>(T);
@@ -386,10 +1085,18 @@ async fn create_upload_session(
     let expires_at = SystemTime::now()
         .checked_add(state.capability_ttl)
         .ok_or_else(HttpError::storage_unavailable)?;
-    let (reservation, capability) = state
-        .ledger
-        .reserve_with_upload_capability(&client_ip.to_string(), declared_bytes, expires_at)
-        .map_err(map_limit_error)?;
+    let ledger = state.ledger.clone();
+    let client_ip = client_ip.to_string();
+    let storage_deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    let (reservation, capability) = run_storage(state, storage_deadline, move || {
+        ledger.reserve_with_upload_capability(&client_ip, declared_bytes, expires_at)
+    })
+    .await
+    .map_err(|error| match error {
+        StorageTaskError::Timeout => UPLOAD_TIMEOUT_ERROR,
+        StorageTaskError::Failed => HttpError::storage_unavailable(),
+    })?
+    .map_err(map_limit_error)?;
 
     Ok(json_response(
         StatusCode::CREATED,
@@ -408,30 +1115,29 @@ async fn upload_content(
 ) -> Result<Response<HttpBody>, HttpError> {
     let session_id = parse_session_id(session_id)?;
     let subject = format!("upload-session:{session_id}");
-    let token = authorize(request.headers(), state, &subject, Scope::Upload)?;
+    let token = authorize_upload(request.headers(), state, &subject, Scope::Upload).await?;
     let session_token = SessionToken::parse(&token).map_err(map_limit_error)?;
     let max_file_bytes = state.ledger.max_file_bytes();
-
-    state
-        .ledger
-        .transition(session_id, &session_token, UploadState::Receiving)
-        .map_err(map_limit_error)?;
-
     let body = request.into_body();
+    let started = tokio::time::Instant::now();
+    let total_deadline = started
+        .checked_add(state.upload_total_timeout)
+        .ok_or_else(HttpError::storage_unavailable)?;
+    let lease_duration = state.upload_lease_duration;
+    let start_deadline =
+        total_deadline.min(tokio::time::Instant::now() + state.storage_operation_timeout);
+    let (worker, start_reply) = UploadWorker::start(
+        state,
+        session_id,
+        session_token.clone(),
+        lease_duration,
+        start_deadline,
+    )
+    .await?;
     let received = async {
-        let (mut file, mut reserved_bytes) = state
-            .ledger
-            .open_receiving_upload_file(session_id, &session_token)
-            .map_err(map_limit_error)?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| HttpError::storage_unavailable())?;
+        await_upload_worker(start_reply, start_deadline).await?;
         let mut stream = body.into_data_stream();
-        let started = tokio::time::Instant::now();
-        let total_deadline = started
-            .checked_add(state.upload_total_timeout)
-            .ok_or_else(HttpError::storage_unavailable)?;
         let mut actual_bytes = 0_u64;
-
         loop {
             let now = tokio::time::Instant::now();
             if now >= total_deadline {
@@ -473,45 +1179,51 @@ async fn upload_content(
             if next_total > max_file_bytes {
                 return Err(map_limit_error(LimitError::FileTooLarge));
             }
-            if next_total > reserved_bytes {
-                let reservation = state
-                    .ledger
-                    .expand(session_id, &session_token, next_total)
-                    .map_err(map_limit_error)?;
-                reserved_bytes = reservation.reserved_bytes;
-            }
-            state
-                .ledger
-                .ensure_disk_safety_margin()
-                .map_err(map_limit_error)?;
-            file.write_all(&chunk)
-                .map_err(|_| HttpError::storage_unavailable())?;
+            let operation_deadline =
+                total_deadline.min(tokio::time::Instant::now() + state.storage_operation_timeout);
+            let response = worker.write(next_total, chunk, operation_deadline).await?;
+            await_upload_worker(response, operation_deadline).await?;
             actual_bytes = next_total;
         }
 
-        file.set_len(actual_bytes)
-            .map_err(|_| HttpError::storage_unavailable())?;
-        file.flush().map_err(|_| HttpError::storage_unavailable())?;
-        Ok::<_, HttpError>(actual_bytes)
+        let operation_deadline =
+            total_deadline.min(tokio::time::Instant::now() + state.storage_operation_timeout);
+        let response = worker.finish(actual_bytes, operation_deadline).await?;
+        await_upload_worker(response, operation_deadline).await?;
+        Ok::<_, HttpError>(())
     }
     .await;
 
-    let actual_bytes = match received {
-        Ok(actual_bytes) => actual_bytes,
-        Err(error) => return Err(abort_upload(state, session_id, &session_token, error)),
-    };
-    if let Err(error) = state
-        .ledger
-        .settle(session_id, &session_token, actual_bytes)
-    {
-        return Err(abort_upload(
-            state,
-            session_id,
-            &session_token,
-            map_limit_error(error),
-        ));
+    match received {
+        Ok(()) => Ok(empty_response(StatusCode::NO_CONTENT)),
+        Err(error) => {
+            // The actor still owns its pinned file and lease until any
+            // non-cancellable syscall returns. Do not hold the HTTP response
+            // open for cleanup once the upload deadline itself has elapsed.
+            if error.code != UPLOAD_TIMEOUT_ERROR.code {
+                let cleanup_deadline =
+                    tokio::time::Instant::now() + state.storage_operation_timeout;
+                let _ = worker.abort(cleanup_deadline).await;
+            }
+            Err(error)
+        }
     }
-    Ok(empty_response(StatusCode::NO_CONTENT))
+}
+
+async fn await_upload_worker<T>(
+    receiver: oneshot::Receiver<Result<T, UploadWorkerError>>,
+    deadline: tokio::time::Instant,
+) -> Result<T, HttpError>
+where
+    T: Send + 'static,
+{
+    match tokio::time::timeout_at(deadline, receiver).await {
+        Err(_) => Err(UPLOAD_TIMEOUT_ERROR),
+        Ok(Err(_)) => Err(HttpError::storage_unavailable()),
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(UploadWorkerError::Timeout))) => Err(UPLOAD_TIMEOUT_ERROR),
+        Ok(Ok(Err(UploadWorkerError::Storage(error)))) => Err(map_limit_error(error)),
+    }
 }
 
 fn job_status(
@@ -633,19 +1345,26 @@ fn authorize(
     Ok(token)
 }
 
-fn abort_upload(
+async fn authorize_upload(
+    headers: &HeaderMap,
     state: &ServerState,
-    session_id: i64,
-    token: &SessionToken,
-    original_error: HttpError,
-) -> HttpError {
-    if let Err(error) = state.ledger.expire(session_id, token) {
-        return map_limit_error(error);
-    }
-    match state.ledger.reconcile_cleanup_jobs() {
-        Ok(report) if report.retryable == 0 => original_error,
-        Ok(_) => HttpError::storage_unavailable(),
-        Err(error) => map_limit_error(error),
+    subject: &str,
+    scope: Scope,
+) -> Result<String, HttpError> {
+    let token = bearer_token(headers)?;
+    let store = state.capabilities.clone();
+    let token_for_verification = token.clone();
+    let subject = subject.to_owned();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    match run_storage(state, deadline, move || {
+        Capability::verify(&store, &token_for_verification, &subject, scope)
+    })
+    .await
+    {
+        Ok(Ok(_)) => Ok(token),
+        Ok(Err(error)) => Err(map_capability_error(error)),
+        Err(StorageTaskError::Timeout) => Err(HttpError::storage_unavailable()),
+        Err(StorageTaskError::Failed) => Err(HttpError::storage_unavailable()),
     }
 }
 

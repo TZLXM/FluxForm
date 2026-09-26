@@ -263,15 +263,20 @@ fn expands_are_serialized_so_only_one_over_capacity_race_commits() {
 
     let barrier = Arc::new(Barrier::new(3));
     let handles = [
-        (first.session_id, first.session_token),
-        (second.session_id, second.session_token),
+        (first.session_id, first.session_token, first.upload_path),
+        (second.session_id, second.session_token, second.upload_path),
     ]
-    .map(|(session_id, token)| {
+    .map(|(session_id, token, upload_path)| {
         let ledger = ledger.clone();
         let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(upload_path)
+                .unwrap();
             barrier.wait();
-            ledger.expand(session_id, &token, 8)
+            ledger.expand(session_id, &token, &mut file, 8)
         })
     });
     barrier.wait();
@@ -488,8 +493,18 @@ fn rejects_values_that_cannot_be_represented_safely_by_sqlite_integers() {
 
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&session.upload_path)
+        .unwrap();
     assert!(matches!(
-        ledger.expand(session.session_id, &session.session_token, u64::MAX),
+        ledger.expand(
+            session.session_id,
+            &session.session_token,
+            &mut file,
+            u64::MAX
+        ),
         Err(LimitError::FileTooLarge)
     ));
 }
@@ -558,9 +573,14 @@ fn expand_rolls_back_when_post_allocation_space_would_violate_the_margin() {
     )
     .unwrap();
     let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&session.upload_path)
+        .unwrap();
 
     assert!(matches!(
-        ledger.expand(session.session_id, &session.session_token, 4),
+        ledger.expand(session.session_id, &session.session_token, &mut file, 4),
         Err(LimitError::DiskSafetyMargin)
     ));
     assert_eq!(ledger.reserved_bytes().unwrap(), 1);
@@ -573,13 +593,23 @@ fn guessed_session_ids_cannot_mutate_another_clients_session() {
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let victim = ledger.reserve("192.0.2.10", Some(4)).unwrap();
     let attacker = ledger.reserve("192.0.2.11", Some(2)).unwrap();
+    let mut victim_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&victim.upload_path)
+        .unwrap();
 
     assert_ne!(
         victim.session_token.as_str(),
         attacker.session_token.as_str()
     );
     assert!(matches!(
-        ledger.expand(victim.session_id, &attacker.session_token, 8),
+        ledger.expand(
+            victim.session_id,
+            &attacker.session_token,
+            &mut victim_file,
+            8
+        ),
         Err(LimitError::Unauthorized)
     ));
     assert!(matches!(
@@ -657,7 +687,7 @@ fn opening_a_legacy_database_applies_a_schema_versioned_migration() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 3,
+        version, 5,
         "the database needs the current committed schema version"
     );
 }
@@ -689,7 +719,7 @@ fn startup_recovers_orphaned_and_oversized_files_after_an_allocation_crash() {
 }
 
 #[test]
-fn populated_legacy_sessions_in_every_state_are_retired_and_their_files_enqueued() {
+fn populated_legacy_sessions_in_every_state_are_retired_and_their_files_reconciled() {
     let temp_dir = TempDir::new().unwrap();
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let mut sessions = Vec::new();
@@ -787,11 +817,9 @@ fn populated_legacy_sessions_in_every_state_are_retired_and_their_files_enqueued
             .unwrap()
     };
     assert_eq!(states, vec!["expired"; sessions.len()]);
-    assert_eq!(cleanup_job_count(&temp_dir), sessions.len() as i64);
-
-    let cleanup = migrated.reconcile_cleanup_jobs().unwrap();
-    assert_eq!(cleanup.completed, sessions.len());
+    assert_eq!(cleanup_job_count(&temp_dir), 0);
     assert!(sessions.iter().all(|session| !session.upload_path.exists()));
+    assert_eq!(migrated.reconcile_cleanup_jobs().unwrap().completed, 0);
 }
 
 #[test]
@@ -839,7 +867,7 @@ fn populated_v0_nested_cleanup_retries_a_link_and_deletes_after_safe_restore() {
         first.retryable, 1,
         "a linked legacy parent must be rejected"
     );
-    assert_eq!(cleanup_job_attempts_at(&db_path), 1);
+    assert_eq!(cleanup_job_attempts_at(&db_path), 2);
     assert_eq!(fs::read(&outside_payload).unwrap(), b"must survive");
 
     remove_directory_link(&legacy_directory);
@@ -908,7 +936,7 @@ fn populated_legacy_quota_is_preserved_with_an_operator_retained_key_id() {
         )
         .unwrap();
     assert_eq!(migrated_state, "expired");
-    assert_eq!(cleanup_job_count(&temp_dir), 1);
+    assert_eq!(cleanup_job_count(&temp_dir), 0);
 }
 
 #[test]
@@ -951,8 +979,8 @@ fn previously_migrated_v2_rows_without_capabilities_are_retired() {
         )
         .unwrap();
     assert_eq!(state, "expired");
-    assert_eq!(cleanup_job_count(&temp_dir), 1);
-    assert_eq!(migrated.reconcile_cleanup_jobs().unwrap().completed, 1);
+    assert_eq!(cleanup_job_count(&temp_dir), 0);
+    assert_eq!(migrated.reconcile_cleanup_jobs().unwrap().completed, 0);
     assert!(!session.upload_path.exists());
 }
 
