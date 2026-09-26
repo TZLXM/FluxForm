@@ -1,8 +1,11 @@
 use fluxform_sandbox_probe::{FilesystemEvidence, ProbeEvidence, ProbeStatus};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 #[test]
-fn native_linux_filesystem_gate_is_blocked_off_linux() {
+fn unsupported_platform_or_architecture_fails_closed() {
     use fluxform_sandbox_probe::{
         FilesystemPrerequisites, Sandbox, SandboxError, SandboxLimits, SandboxPolicy,
         SpawnPlacement,
@@ -63,9 +66,14 @@ fn filesystem_evidence_serializes_each_fail_closed_primitive() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux {
-    use fluxform_sandbox_probe::{Sandbox, SandboxLimits, SandboxPolicy, SpawnPlacement};
+    use fluxform_sandbox_probe::{
+        Sandbox, SandboxError, SandboxLimits, SandboxPolicy, SpawnPlacement,
+    };
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -194,6 +202,20 @@ mod linux {
 
         let status = child.wait().expect("wait for sandbox child");
         (status.code().unwrap_or(128), fixture)
+    }
+
+    fn assert_policy_rejected(fixture: &Fixture, policy: &SandboxPolicy) {
+        let (placement, ready, release) = barrier();
+        let result = Sandbox::spawn_blocked(&fixture.child, &[], policy, placement);
+        drop((ready, release));
+        match result {
+            Err(SandboxError::InvalidPolicy(_)) => {}
+            Err(error) => panic!("policy rejection should precede host probes: {error:?}"),
+            Ok(mut child) => {
+                let _ = child.kill();
+                panic!("overlapping sandbox policy was accepted");
+            }
+        }
     }
 
     #[test]
@@ -368,5 +390,91 @@ mod linux {
         release.write_all(&[1]).expect("confirm test placement");
         let status = child.wait().expect("wait for sandbox child");
         assert_eq!(status.code(), Some(51), "undeclared fd remained usable");
+    }
+
+    #[test]
+    fn assigned_input_cannot_be_nested_under_the_writable_task_directory() {
+        let fixture = Fixture::new();
+        let nested_input = fixture.job_dir.join("input.bin");
+        fs::write(&nested_input, b"task-alias").expect("write nested input");
+        let mut policy = fixture.policy();
+        policy.input = nested_input;
+
+        assert_policy_rejected(&fixture, &policy);
+    }
+
+    #[test]
+    fn task_and_tool_roots_cannot_overlap_in_either_direction() {
+        let fixture = Fixture::new();
+        let nested_tool = fixture.job_dir.join("tool");
+        fs::create_dir(&nested_tool).expect("create nested tool directory");
+        let mut task_contains_tool = fixture.policy();
+        task_contains_tool.tool_dir = nested_tool;
+        assert_policy_rejected(&fixture, &task_contains_tool);
+
+        let nested_task = fixture.tool_dir.join("job");
+        fs::create_dir(&nested_task).expect("create nested task directory");
+        let mut tool_contains_task = fixture.policy();
+        tool_contains_task.job_dir = nested_task;
+        assert_policy_rejected(&fixture, &tool_contains_task);
+    }
+
+    #[test]
+    fn policy_roots_cannot_be_symlinks_or_identical_directories() {
+        let fixture = Fixture::new();
+        let task_link = fixture._root.path().join("job-link");
+        std::os::unix::fs::symlink(&fixture.job_dir, &task_link).expect("create task alias");
+        let mut symlinked_task = fixture.policy();
+        symlinked_task.job_dir = task_link;
+        assert_policy_rejected(&fixture, &symlinked_task);
+
+        let mut identical_roots = fixture.policy();
+        identical_roots.tool_dir = identical_roots.job_dir.clone();
+        assert_policy_rejected(&fixture, &identical_roots);
+
+        let link_parent = fixture._root.path().join("linked-parent");
+        std::os::unix::fs::symlink(fixture._root.path(), &link_parent)
+            .expect("create symlinked parent");
+        let mut symlinked_ancestor = fixture.policy();
+        symlinked_ancestor.job_dir = link_parent.join("job");
+        assert_policy_rejected(&fixture, &symlinked_ancestor);
+    }
+
+    #[test]
+    fn input_inside_tool_tree_is_rejected_as_an_identity_overlap() {
+        let fixture = Fixture::new();
+        let tool_input = fixture.tool_dir.join("assigned-input.bin");
+        fs::write(&tool_input, b"tool-input").expect("write tool-contained input");
+        let mut policy = fixture.policy();
+        policy.input = tool_input;
+
+        assert_policy_rejected(&fixture, &policy);
+    }
+
+    #[test]
+    fn hard_link_aliases_between_input_and_writable_task_files_are_rejected() {
+        let fixture = Fixture::new();
+        let alias = fixture.job_dir.join("input-alias.bin");
+        fs::hard_link(&fixture.input, &alias).expect("hard-link input into task directory");
+
+        assert_policy_rejected(&fixture, &fixture.policy());
+    }
+
+    #[test]
+    fn hard_link_aliases_between_tool_and_writable_task_files_are_rejected() {
+        let fixture = Fixture::new();
+        let alias = fixture.job_dir.join("tool-alias");
+        fs::hard_link(&fixture.child, &alias).expect("hard-link tool into task directory");
+
+        assert_policy_rejected(&fixture, &fixture.policy());
+    }
+
+    #[test]
+    fn hard_link_aliases_between_input_and_tool_files_are_rejected() {
+        let fixture = Fixture::new();
+        let tool_alias = fixture.tool_dir.join("input-alias.bin");
+        fs::hard_link(&fixture.input, &tool_alias).expect("hard-link input into tool tree");
+
+        assert_policy_rejected(&fixture, &fixture.policy());
     }
 }

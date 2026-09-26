@@ -88,3 +88,32 @@ All tests reached before the artifact gate passed, but `fluxform-capabilities/te
 Commit subject required by the task: `feat(server): prove Linux filesystem isolation`.
 
 Report path: `.superpowers/sdd/2026-09-25-fluxform-stage-0-feasibility/task-7-report.md`.
+
+## Review round 1 — required fixes
+
+The three Important findings were checked against the implementation and addressed:
+
+1. **Policy path overlap and aliasing:** policy input/task/tool roots are opened component-by-component from `/` using `openat(O_PATH|O_NOFOLLOW)`; symlink components and non-absolute/dot paths fail closed. Device/inode identities and ancestor chains are taken from those opened handles, not from a canonicalize-then-reopen path. Task/tool trees are walked through pinned directory descriptors, regular-file identities and link counts are compared, and overlapping roots, input-under-task, tool/task nesting in either direction, identical roots, and hard links are rejected. The root descriptors are retained through `fork`, checked with `fstat` against their recorded dev/inode immediately before bind mount, and the input link count is rechecked.
+2. **Readiness/report pipe writes:** the shared writer retries injected or actual `EINTR`, completes partial writes, and propagates zero/error results. Readiness and report-message callers check the result; an incomplete ready report exits and closes the relevant descriptors instead of entering the release wait. Failure reporting remains best-effort only when the child is already exiting, and closes the report descriptor if that write fails.
+3. **Linux architecture support:** the syscall module, child type, prerequisite inspector, and spawn implementation are compiled only for Linux x86_64/aarch64. All other platforms/architectures return `UnsupportedPlatform`. The seccomp audit-architecture mapping has no zero fallback.
+
+Review-round TDD evidence:
+
+- Added Linux-only regression policies before the path implementation for input nested under task, task/tool nesting both ways, symlinked roots and ancestors, identical roots, input inside tool, and hard-link aliases across input/task/tool. Their Linux-native RED/GREEN behavior is **BLOCKED** on this Windows host; these tests are not counted as passed.
+- Added portable identity-graph tests, injected `EINTR`/partial-write tests, `BrokenPipe` propagation tests, and audit-architecture mapping tests before their helpers. The first portable RED command, `cargo test -p fluxform-sandbox-probe --lib --offline`, failed compilation because the new helper/type names were not implemented yet. After implementation, that command passed **4/4**.
+- Final portable package GREEN: `cargo test -p fluxform-sandbox-probe --offline --all-targets` passed **6/6** (four helper tests plus evidence serialization and Windows `UnsupportedPlatform`). These results do not establish Linux isolation.
+
+Final review-round checks:
+
+```text
+cargo fmt --all -- --check                                      PASS
+cargo clippy --workspace --all-targets --offline -- -D warnings PASS
+cargo test -p fluxform-sandbox-probe --offline --all-targets    PASS (6 tests)
+cargo test --workspace --exclude fluxform-capabilities --offline PASS
+cargo test -p fluxform-capabilities --lib --bins --test runner --test manifest --offline PASS
+git diff --check                                                PASS
+```
+
+`cargo test --workspace --offline` was rerun; all tests before `cross_platform_samples::every_approved_native_profile_has_a_current_sample_report` passed, and that gate remains **BLOCKED** because its approved artifact root is missing/unreadable (Windows OS error 3). Only `x86_64-pc-windows-msvc` is installed (`rustup target list --installed`); no Linux cross-compilation was attempted and no target was downloaded. The Linux native filesystem and adversarial test gate remains **BLOCKED**, not passed or skipped.
+
+Static Linux review confirms that ready-pipe `EINTR` retries, write errors terminate the supervisor before a release wait, report-pipe failure closes/exits, and unsupported architectures cannot reach a seccomp filter with audit arch zero. Native Linux compilation and execution are still required before treating these fixes as verified.

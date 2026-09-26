@@ -11,6 +11,23 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use std::collections::HashSet;
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use std::io;
+
 /// Result of actively checking one required Linux primitive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,7 +44,10 @@ pub struct ProbeEvidence {
 }
 
 impl ProbeEvidence {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn passed(detail: impl Into<String>) -> Self {
         Self {
             status: ProbeStatus::Passed,
@@ -35,7 +55,10 @@ impl ProbeEvidence {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn failed(detail: impl Into<String>) -> Self {
         Self {
             status: ProbeStatus::Failed,
@@ -155,17 +178,149 @@ pub enum SandboxError {
     ChildSetup { operation: &'static str, errno: i32 },
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+struct PolicyPathIdentityGraph {
+    input: FileIdentity,
+    input_parent_chain: Vec<FileIdentity>,
+    task: FileIdentity,
+    task_ancestors: Vec<FileIdentity>,
+    tool: FileIdentity,
+    tool_ancestors: Vec<FileIdentity>,
+    task_files: HashSet<FileIdentity>,
+    tool_files: HashSet<FileIdentity>,
+    has_hard_links: bool,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_policy_path_identities(graph: &PolicyPathIdentityGraph) -> Result<(), &'static str> {
+    if graph.input == graph.task || graph.input == graph.tool || graph.task == graph.tool {
+        return Err("policy roots must not identify the same filesystem object");
+    }
+    if graph.task_ancestors.contains(&graph.tool) || graph.tool_ancestors.contains(&graph.task) {
+        return Err("task and tool directories must not overlap");
+    }
+    if graph.input_parent_chain.contains(&graph.task) {
+        return Err("input must not be contained by the writable task directory");
+    }
+    if graph.task_files.contains(&graph.input)
+        || graph.tool_files.contains(&graph.input)
+        || graph
+            .task_files
+            .iter()
+            .any(|identity| graph.tool_files.contains(identity))
+    {
+        return Err("input, task, and tool files must not alias by filesystem identity");
+    }
+    if graph.has_hard_links {
+        return Err("policy files must not have hard-link aliases");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn write_all_with<F>(mut remaining: &[u8], mut write: F) -> io::Result<()>
+where
+    F: FnMut(&[u8]) -> io::Result<usize>,
+{
+    while !remaining.is_empty() {
+        match write(remaining) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "pipe write returned zero bytes",
+                ));
+            }
+            Ok(written) if written <= remaining.len() => remaining = &remaining[written..],
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pipe writer reported more bytes than requested",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeccompArchitecture {
+    X86_64,
+    Aarch64,
+    Unsupported,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+const fn seccomp_audit_arch(architecture: SeccompArchitecture) -> Option<u32> {
+    match architecture {
+        SeccompArchitecture::X86_64 => Some(0xc000_003e),
+        SeccompArchitecture::Aarch64 => Some(0xc000_00b7),
+        SeccompArchitecture::Unsupported => None,
+    }
+}
+
 /// Performs active checks for the Linux namespace and filesystem primitives.
 pub struct FilesystemPrerequisites;
 
 impl FilesystemPrerequisites {
     pub fn inspect() -> Result<FilesystemEvidence, SandboxError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             linux::inspect_prerequisites()
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         {
             Err(SandboxError::UnsupportedPlatform)
         }
@@ -183,12 +338,18 @@ impl Sandbox {
         policy: &SandboxPolicy,
         placement: SpawnPlacement,
     ) -> Result<SandboxChild, SandboxError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             linux::spawn_blocked(program, args, policy, placement)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         {
             let _ = (program, args, policy, placement);
             Err(SandboxError::UnsupportedPlatform)
@@ -196,17 +357,26 @@ impl Sandbox {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 pub struct SandboxChild;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub struct SandboxChild {
     pid: libc::pid_t,
     root: Option<linux::TempRoot>,
     status: Option<std::process::ExitStatus>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl SandboxChild {
     /// Host PID of the trusted supervisor, which is the barrier PID in
     /// `ParentAttachBarrier` mode.
@@ -246,7 +416,10 @@ impl SandboxChild {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl Drop for SandboxChild {
     fn drop(&mut self) {
         if self.status.is_none() {
@@ -259,15 +432,20 @@ impl Drop for SandboxChild {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 // Each unsafe function is a narrow syscall/FFI sequence; callers only enter
 // these helpers through the explicitly unsafe setup boundary.
 #[allow(unsafe_op_in_unsafe_fn)]
 mod linux {
     use super::{
-        FilesystemEvidence, FilesystemPrerequisites, ProbeEvidence, SandboxChild, SandboxError,
-        SandboxLimits, SandboxPolicy, SpawnPlacement,
+        FileIdentity, FilesystemEvidence, FilesystemPrerequisites, PolicyPathIdentityGraph,
+        ProbeEvidence, SandboxChild, SandboxError, SandboxLimits, SandboxPolicy, SpawnPlacement,
+        validate_policy_path_identities,
     };
+    use std::collections::HashSet;
     use std::ffi::CString;
     use std::fs;
     use std::io;
@@ -455,6 +633,12 @@ mod linux {
         input_source: CString,
         task_source: CString,
         tool_source: CString,
+        input_fd: RawFd,
+        input_identity: FileIdentity,
+        task_fd: RawFd,
+        task_identity: FileIdentity,
+        tool_fd: RawFd,
+        tool_identity: FileIdentity,
         uid_map: CString,
         gid_map: CString,
         tmpfs_data: CString,
@@ -468,6 +652,14 @@ mod linux {
         argv: Vec<usize>,
         envp: [usize; 1],
         seccomp: Vec<libc::sock_filter>,
+    }
+
+    struct PinnedPath {
+        fd: OwnedFd,
+        identity: FileIdentity,
+        directory_chain: Vec<FileIdentity>,
+        link_count: u64,
+        mode: libc::mode_t,
     }
 
     pub(super) fn inspect_prerequisites() -> Result<FilesystemEvidence, SandboxError> {
@@ -595,7 +787,9 @@ mod linux {
             unsafe {
                 libc::close(pipe[0]);
                 let result = run_probe_child(kind, scratch.as_ref(), &uid_map, &gid_map);
-                write_struct(pipe[1], &result);
+                if write_struct(pipe[1], &result).is_err() {
+                    libc::_exit(125);
+                }
                 libc::_exit(if result.operation == PROBE_OK { 0 } else { 1 });
             }
         }
@@ -678,7 +872,9 @@ mod linux {
                         errno: errno(),
                     }
                 };
-                write_struct(pipe[1], &result);
+                if write_struct(pipe[1], &result).is_err() {
+                    libc::_exit(125);
+                }
                 libc::_exit(if result.operation == PROBE_OK { 0 } else { 1 });
             }
         }
@@ -865,19 +1061,16 @@ mod linux {
         if fd < 0 {
             return -errno();
         }
-        let mut written = 0;
-        while written < bytes.len() {
-            let count = libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written);
+        if let Err(error) = super::write_all_with(bytes, |remaining| {
+            let count = libc::write(fd, remaining.as_ptr().cast(), remaining.len());
             if count < 0 {
-                let error = errno();
-                libc::close(fd);
-                return -error;
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
             }
-            if count == 0 {
-                libc::close(fd);
-                return -libc::EIO;
-            }
-            written += count as usize;
+        }) {
+            libc::close(fd);
+            return -error.raw_os_error().unwrap_or(libc::EIO);
         }
         if libc::close(fd) != 0 {
             return -errno();
@@ -926,44 +1119,53 @@ mod linux {
         policy: &SandboxPolicy,
         placement: SpawnPlacement,
     ) -> Result<SandboxChild, SandboxError> {
-        FilesystemPrerequisites::inspect()?;
         validate_limits(policy.limits)?;
         let input = open_pinned_path(&policy.input, false, "input")?;
         let task = open_pinned_path(&policy.job_dir, true, "task directory")?;
         let tool = open_pinned_path(&policy.tool_dir, true, "tool directory")?;
-        let tool_dir = fs::canonicalize(&policy.tool_dir).map_err(|source| SandboxError::Io {
-            operation: "canonicalize tool directory",
-            source,
-        })?;
-        let program = fs::canonicalize(program).map_err(|source| SandboxError::Io {
-            operation: "canonicalize tool executable",
-            source,
-        })?;
-        if !program.starts_with(&tool_dir) {
+
+        let root_graph = PolicyPathIdentityGraph {
+            input: input.identity,
+            input_parent_chain: input.directory_chain.clone(),
+            task: task.identity,
+            task_ancestors: task.directory_chain.clone(),
+            tool: tool.identity,
+            tool_ancestors: tool.directory_chain.clone(),
+            task_files: HashSet::new(),
+            tool_files: HashSet::new(),
+            has_hard_links: input.link_count != 1,
+        };
+        validate_policy_path_identities(&root_graph)
+            .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
+
+        let (task_files, task_has_hard_links) = collect_policy_tree(&task, "task directory")?;
+        let (tool_files, tool_has_hard_links) = collect_policy_tree(&tool, "tool directory")?;
+        let policy_graph = PolicyPathIdentityGraph {
+            task_files,
+            tool_files,
+            has_hard_links: input.link_count != 1 || task_has_hard_links || tool_has_hard_links,
+            ..root_graph
+        };
+        validate_policy_path_identities(&policy_graph)
+            .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
+
+        let program_pin = open_pinned_path(program, false, "tool executable")?;
+        if !program_pin.directory_chain.contains(&tool.identity) {
             return Err(SandboxError::InvalidPolicy(
                 "tool executable must be inside the declared tool directory".into(),
             ));
         }
-        let metadata = fs::metadata(&program).map_err(|source| SandboxError::Io {
-            operation: "inspect tool executable",
-            source,
-        })?;
-        if !metadata.is_file() {
-            return Err(SandboxError::InvalidPolicy(
-                "tool executable is not a regular file".into(),
-            ));
-        }
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
+        if program_pin.mode & 0o111 == 0 {
             return Err(SandboxError::InvalidPolicy(
                 "tool executable has no execute permission".into(),
             ));
         }
-        let relative_program = program.strip_prefix(&tool_dir).map_err(|_| {
+        let relative_program = program.strip_prefix(&policy.tool_dir).map_err(|_| {
             SandboxError::InvalidPolicy(
                 "tool executable escaped the declared tool directory".into(),
             )
         })?;
+        FilesystemPrerequisites::inspect()?;
         let virtual_program = Path::new("/tool").join(relative_program);
         let program_c = c_path(&virtual_program)?;
         let exec_strings = prepare_exec_strings(&program_c, args)?;
@@ -977,9 +1179,9 @@ mod linux {
             source,
         })?;
         let root = RootPaths::new(temp_root.path())?;
-        let input_source = proc_fd_path(input.as_raw_fd())?;
-        let task_source = proc_fd_path(task.as_raw_fd())?;
-        let tool_source = proc_fd_path(tool.as_raw_fd())?;
+        let input_source = proc_fd_path(input.fd.as_raw_fd())?;
+        let task_source = proc_fd_path(task.fd.as_raw_fd())?;
+        let tool_source = proc_fd_path(tool.fd.as_raw_fd())?;
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
         let uid_map = map_line(host_uid);
@@ -1024,6 +1226,12 @@ mod linux {
             input_source,
             task_source,
             tool_source,
+            input_fd: input.fd.as_raw_fd(),
+            input_identity: input.identity,
+            task_fd: task.fd.as_raw_fd(),
+            task_identity: task.identity,
+            tool_fd: tool.fd.as_raw_fd(),
+            tool_identity: tool.identity,
             uid_map,
             gid_map,
             tmpfs_data,
@@ -1171,64 +1379,230 @@ mod linux {
         path: &Path,
         directory: bool,
         label: &'static str,
-    ) -> Result<OwnedFd, SandboxError> {
-        let path = fs::canonicalize(path).map_err(|source| SandboxError::Io {
-            operation: "canonicalize declared sandbox path",
-            source,
-        })?;
-        let c_path = c_path(&path)?;
-        let fd = unsafe {
+    ) -> Result<PinnedPath, SandboxError> {
+        if !path.is_absolute() {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "declared {label} must be an absolute path"
+            )));
+        }
+        let mut components = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(name) => components.push(name.to_os_string()),
+                std::path::Component::CurDir | std::path::Component::ParentDir => {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "declared {label} must not contain dot components"
+                    )));
+                }
+                std::path::Component::Prefix(_) => {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "declared {label} has an unsupported path prefix"
+                    )));
+                }
+            }
+        }
+
+        let root_fd = unsafe {
             libc::open(
-                c_path.as_ptr(),
-                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                c"/".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
-        if fd < 0 {
+        if root_fd < 0 {
             return Err(SandboxError::Io {
-                operation: "open declared sandbox path",
+                operation: "open filesystem root for declared sandbox path",
                 source: io::Error::last_os_error(),
             });
         }
-        let mut metadata: libc::stat = unsafe { zeroed() };
-        if unsafe { libc::fstat(fd, &mut metadata) } != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(SandboxError::Io {
-                operation: "inspect declared sandbox path",
-                source,
-            });
-        }
-        let file_type = metadata.st_mode & libc::S_IFMT;
-        let expected = if directory {
-            libc::S_IFDIR
-        } else {
-            libc::S_IFREG
-        };
-        if file_type != expected {
-            unsafe { libc::close(fd) };
-            return Err(SandboxError::InvalidPolicy(format!(
-                "declared {label} is not a {}",
-                if directory {
-                    "directory"
-                } else {
-                    "regular file"
-                }
-            )));
-        }
-        if fd < 3 {
-            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-            if duplicate < 0 {
-                let source = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
+        let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+        let mut directory_chain = vec![identity_from_fd(current.as_raw_fd())?];
+        let mut final_stat = stat_fd(current.as_raw_fd())?;
+
+        for (index, component) in components.iter().enumerate() {
+            let name = CString::new(component.as_bytes()).map_err(|_| {
+                SandboxError::InvalidPolicy(format!("declared {label} contains a NUL byte"))
+            })?;
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
                 return Err(SandboxError::Io {
-                    operation: "reserve declared sandbox path descriptor",
-                    source,
+                    operation: "open declared sandbox path component",
+                    source: io::Error::last_os_error(),
                 });
             }
-            unsafe { libc::close(fd) };
-            return Ok(unsafe { OwnedFd::from_raw_fd(duplicate) });
+            let next = unsafe { OwnedFd::from_raw_fd(fd) };
+            let metadata = stat_fd(next.as_raw_fd())?;
+            let final_component = index + 1 == components.len();
+            let expected = if !final_component || directory {
+                libc::S_IFDIR
+            } else {
+                libc::S_IFREG
+            };
+            if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "declared {label} must not traverse a symlink"
+                )));
+            }
+            if metadata.st_mode & libc::S_IFMT != expected {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "declared {label} is not a {}",
+                    if directory {
+                        "directory"
+                    } else {
+                        "regular file"
+                    }
+                )));
+            }
+            if expected == libc::S_IFDIR {
+                directory_chain.push(identity_from_stat(&metadata));
+            }
+            final_stat = metadata;
+            current = next;
         }
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+
+        if components.is_empty() && !directory {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "declared {label} is not a regular file"
+            )));
+        }
+        let identity = identity_from_stat(&final_stat);
+        let link_count = final_stat.st_nlink as u64;
+        if current.as_raw_fd() < 3 {
+            let duplicate = unsafe { libc::fcntl(current.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if duplicate < 0 {
+                return Err(SandboxError::Io {
+                    operation: "reserve declared sandbox path descriptor",
+                    source: io::Error::last_os_error(),
+                });
+            }
+            current = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        }
+        Ok(PinnedPath {
+            fd: current,
+            identity,
+            directory_chain,
+            link_count,
+            mode: final_stat.st_mode,
+        })
+    }
+
+    fn stat_fd(fd: RawFd) -> Result<libc::stat, SandboxError> {
+        let mut metadata: libc::stat = unsafe { zeroed() };
+        if unsafe { libc::fstat(fd, &mut metadata) } == 0 {
+            Ok(metadata)
+        } else {
+            Err(SandboxError::Io {
+                operation: "inspect pinned sandbox path",
+                source: io::Error::last_os_error(),
+            })
+        }
+    }
+
+    fn identity_from_stat(metadata: &libc::stat) -> FileIdentity {
+        FileIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+        }
+    }
+
+    fn identity_from_fd(fd: RawFd) -> Result<FileIdentity, SandboxError> {
+        Ok(identity_from_stat(&stat_fd(fd)?))
+    }
+
+    fn collect_policy_tree(
+        root: &PinnedPath,
+        label: &'static str,
+    ) -> Result<(HashSet<FileIdentity>, bool), SandboxError> {
+        const MAX_ENTRIES: usize = 200_000;
+        const MAX_DEPTH: usize = 256;
+
+        let duplicate = unsafe { libc::fcntl(root.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(SandboxError::Io {
+                operation: "duplicate pinned sandbox directory",
+                source: io::Error::last_os_error(),
+            });
+        }
+        let root_fd = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        let mut directories = vec![(root_fd, 0_usize)];
+        let mut seen_directories = HashSet::from([root.identity]);
+        let mut files = HashSet::new();
+        let mut has_hard_links = false;
+        let mut entry_count = 0_usize;
+
+        while let Some((directory, depth)) = directories.pop() {
+            if depth > MAX_DEPTH {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "declared {label} tree is nested too deeply"
+                )));
+            }
+            let directory_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+            let entries = fs::read_dir(directory_path).map_err(|source| SandboxError::Io {
+                operation: "inspect pinned sandbox directory contents",
+                source,
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|source| SandboxError::Io {
+                    operation: "read pinned sandbox directory entry",
+                    source,
+                })?;
+                entry_count += 1;
+                if entry_count > MAX_ENTRIES {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "declared {label} tree exceeds the inspection limit"
+                    )));
+                }
+                let name = CString::new(entry.file_name().as_bytes()).map_err(|_| {
+                    SandboxError::InvalidPolicy(format!(
+                        "declared {label} contains an invalid directory entry"
+                    ))
+                })?;
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if fd < 0 {
+                    return Err(SandboxError::Io {
+                        operation: "open pinned sandbox directory entry",
+                        source: io::Error::last_os_error(),
+                    });
+                }
+                let child = unsafe { OwnedFd::from_raw_fd(fd) };
+                let metadata = stat_fd(child.as_raw_fd())?;
+                match metadata.st_mode & libc::S_IFMT {
+                    libc::S_IFREG => {
+                        let identity = identity_from_stat(&metadata);
+                        files.insert(identity);
+                        has_hard_links |= metadata.st_nlink > 1;
+                    }
+                    libc::S_IFDIR => {
+                        let identity = identity_from_stat(&metadata);
+                        if !seen_directories.insert(identity) {
+                            return Err(SandboxError::InvalidPolicy(format!(
+                                "declared {label} contains an aliased directory"
+                            )));
+                        }
+                        directories.push((child, depth + 1));
+                    }
+                    libc::S_IFLNK => {}
+                    _ => {
+                        return Err(SandboxError::InvalidPolicy(format!(
+                            "declared {label} contains an unsupported special file"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok((files, has_hard_links))
     }
 
     fn prepare_exec_strings(
@@ -1259,6 +1633,26 @@ mod linux {
     fn proc_fd_path(fd: RawFd) -> Result<CString, SandboxError> {
         CString::new(format!("/proc/self/fd/{fd}"))
             .map_err(|_| SandboxError::InvalidPolicy("invalid pinned file descriptor".into()))
+    }
+
+    unsafe fn revalidate_pinned_path(
+        fd: RawFd,
+        identity: FileIdentity,
+        expected_type: libc::mode_t,
+        require_single_link: bool,
+    ) -> i32 {
+        let mut metadata: libc::stat = zeroed();
+        if libc::fstat(fd, &mut metadata) != 0 {
+            return -1;
+        }
+        if identity_from_stat(&metadata) != identity
+            || metadata.st_mode & libc::S_IFMT != expected_type
+            || (require_single_link && metadata.st_nlink != 1)
+        {
+            *libc::__errno_location() = libc::ESTALE;
+            return -1;
+        }
+        0
     }
 
     unsafe fn sandbox_supervisor(spec: &PreparedSpawn) -> ! {
@@ -1298,19 +1692,25 @@ mod linux {
         if make_root_layout(&spec.root) != 0 {
             fail_and_exit(spec.report_fd, STAGE_MKDIR, errno());
         }
-        if mount_bind(&spec.input_source, &spec.root.input) != 0 {
+        if revalidate_pinned_path(spec.input_fd, spec.input_identity, libc::S_IFREG, true) != 0
+            || mount_bind(&spec.input_source, &spec.root.input) != 0
+        {
             fail_and_exit(spec.report_fd, STAGE_BIND_INPUT, errno());
         }
         if remount_read_only(&spec.root.input, true) != 0 {
             fail_and_exit(spec.report_fd, STAGE_BIND_RO, errno());
         }
-        if mount_bind(&spec.tool_source, &spec.root.tool) != 0 {
+        if revalidate_pinned_path(spec.tool_fd, spec.tool_identity, libc::S_IFDIR, false) != 0
+            || mount_bind(&spec.tool_source, &spec.root.tool) != 0
+        {
             fail_and_exit(spec.report_fd, STAGE_BIND_TOOL, errno());
         }
         if remount_read_only(&spec.root.tool, false) != 0 {
             fail_and_exit(spec.report_fd, STAGE_BIND_RO, errno());
         }
-        if mount_bind(&spec.task_source, &spec.root.task) != 0 {
+        if revalidate_pinned_path(spec.task_fd, spec.task_identity, libc::S_IFDIR, false) != 0
+            || mount_bind(&spec.task_source, &spec.root.task) != 0
+        {
             fail_and_exit(spec.report_fd, STAGE_BIND_TASK, errno());
         }
         if remount_task_restricted(&spec.root.task) != 0 {
@@ -1353,15 +1753,14 @@ mod linux {
                     fail_and_exit(spec.report_fd, STAGE_FD_CLOSE, errno());
                 }
                 let pid = libc::getpid();
-                if write_all(
-                    ready,
-                    (&pid as *const libc::pid_t).cast(),
-                    size_of::<libc::pid_t>(),
-                ) != 0
-                {
-                    fail_and_exit(spec.report_fd, STAGE_READY_WRITE, errno());
+                if let Err(error) = write_all(ready, &pid.to_ne_bytes()) {
+                    fail_and_exit(
+                        spec.report_fd,
+                        STAGE_READY_WRITE,
+                        error.raw_os_error().unwrap_or(libc::EIO),
+                    );
                 }
-                send_message(
+                if send_message(
                     spec.report_fd,
                     Message {
                         kind: MSG_READY,
@@ -1369,7 +1768,14 @@ mod linux {
                         errno: 0,
                         pid,
                     },
-                );
+                )
+                .is_err()
+                {
+                    libc::close(ready);
+                    libc::close(release);
+                    libc::close(spec.report_fd);
+                    libc::_exit(125);
+                }
                 let mut release_byte = 0_u8;
                 if read_one(release, &mut release_byte) != 1 || release_byte != 1 {
                     fail_and_exit(spec.report_fd, STAGE_RELEASE_READ, errno());
@@ -1436,7 +1842,7 @@ mod linux {
                     );
                     libc::_exit(127);
                 }
-                send_message(
+                if send_message(
                     spec.report_fd,
                     Message {
                         kind: MSG_READY,
@@ -1444,7 +1850,13 @@ mod linux {
                         errno: 0,
                         pid: libc::getpid(),
                     },
-                );
+                )
+                .is_err()
+                {
+                    libc::close(cgroup_fd);
+                    libc::close(spec.report_fd);
+                    libc::_exit(125);
+                }
                 libc::close(cgroup_fd);
                 libc::close(spec.report_fd);
                 wait_target_or_exit(child);
@@ -1701,15 +2113,13 @@ mod linux {
     fn audit_arch() -> u32 {
         #[cfg(target_arch = "x86_64")]
         {
-            0xc000_003e
+            super::seccomp_audit_arch(super::SeccompArchitecture::X86_64)
+                .expect("x86_64 seccomp architecture is supported")
         }
         #[cfg(target_arch = "aarch64")]
         {
-            0xc000_00b7
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            0
+            super::seccomp_audit_arch(super::SeccompArchitecture::Aarch64)
+                .expect("aarch64 seccomp architecture is supported")
         }
     }
 
@@ -1775,8 +2185,9 @@ mod linux {
         0
     }
 
-    unsafe fn write_struct<T>(fd: RawFd, value: &T) {
-        let _ = write_all(fd, (value as *const T).cast(), size_of::<T>());
+    unsafe fn write_struct<T>(fd: RawFd, value: &T) -> io::Result<()> {
+        let bytes = std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>());
+        write_all(fd, bytes)
     }
 
     fn read_struct<T: Copy>(reader: &mut std::fs::File, value: &mut T) -> io::Result<()> {
@@ -1796,23 +2207,19 @@ mod linux {
         Ok(())
     }
 
-    unsafe fn send_message(fd: RawFd, message: Message) {
-        write_struct(fd, &message);
+    unsafe fn send_message(fd: RawFd, message: Message) -> io::Result<()> {
+        write_struct(fd, &message)
     }
 
-    unsafe fn write_all(fd: RawFd, mut pointer: *const libc::c_void, mut len: usize) -> i32 {
-        while len > 0 {
-            let count = libc::write(fd, pointer, len);
+    unsafe fn write_all(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
+        super::write_all_with(bytes, |remaining| {
+            let count = libc::write(fd, remaining.as_ptr().cast(), remaining.len());
             if count < 0 {
-                return -1;
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
             }
-            if count == 0 {
-                return -1;
-            }
-            pointer = pointer.cast::<u8>().add(count as usize).cast();
-            len -= count as usize;
-        }
-        0
+        })
     }
 
     unsafe fn read_one(fd: RawFd, value: &mut u8) -> isize {
@@ -1846,7 +2253,7 @@ mod linux {
     }
 
     unsafe fn fail_and_exit(report_fd: RawFd, operation: i32, error: i32) -> ! {
-        send_message(
+        if send_message(
             report_fd,
             Message {
                 kind: MSG_ERROR,
@@ -1854,7 +2261,11 @@ mod linux {
                 errno: error,
                 pid: libc::getpid(),
             },
-        );
+        )
+        .is_err()
+        {
+            libc::close(report_fd);
+        }
         libc::_exit(125)
     }
 
@@ -1964,5 +2375,108 @@ mod linux {
 
     fn errno() -> i32 {
         unsafe { *libc::__errno_location() }
+    }
+}
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::io;
+
+    fn identity(inode: u64) -> FileIdentity {
+        FileIdentity { device: 7, inode }
+    }
+
+    fn disjoint_policy_graph() -> PolicyPathIdentityGraph {
+        PolicyPathIdentityGraph {
+            input: identity(10),
+            input_parent_chain: vec![identity(11), identity(1)],
+            task: identity(20),
+            task_ancestors: vec![identity(20), identity(2), identity(1)],
+            tool: identity(30),
+            tool_ancestors: vec![identity(30), identity(3), identity(1)],
+            task_files: HashSet::from([identity(21)]),
+            tool_files: HashSet::from([identity(31)]),
+            has_hard_links: false,
+        }
+    }
+
+    #[test]
+    fn policy_identity_validation_rejects_directory_and_file_aliases() {
+        let graph = disjoint_policy_graph();
+        assert!(validate_policy_path_identities(&graph).is_ok());
+
+        let mut graph = disjoint_policy_graph();
+        graph.tool = graph.task;
+        assert!(validate_policy_path_identities(&graph).is_err());
+
+        let mut graph = disjoint_policy_graph();
+        graph.input_parent_chain.push(graph.task);
+        assert!(validate_policy_path_identities(&graph).is_err());
+
+        let mut graph = disjoint_policy_graph();
+        graph.task_ancestors.push(graph.tool);
+        assert!(validate_policy_path_identities(&graph).is_err());
+
+        let mut graph = disjoint_policy_graph();
+        graph.tool_ancestors.push(graph.task);
+        assert!(validate_policy_path_identities(&graph).is_err());
+
+        let mut graph = disjoint_policy_graph();
+        graph.task_files.insert(graph.input);
+        assert!(validate_policy_path_identities(&graph).is_err());
+
+        let mut graph = disjoint_policy_graph();
+        graph.tool_files = graph.task_files.clone();
+        assert!(validate_policy_path_identities(&graph).is_err());
+
+        let mut graph = disjoint_policy_graph();
+        graph.has_hard_links = true;
+        assert!(validate_policy_path_identities(&graph).is_err());
+    }
+
+    #[test]
+    fn write_all_retries_interruption_and_partial_writes() {
+        let mut interrupted = false;
+        let mut output = Vec::new();
+        write_all_with(b"ready", |remaining| {
+            if !interrupted {
+                interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let count = remaining.len().min(2);
+            output.extend_from_slice(&remaining[..count]);
+            Ok(count)
+        })
+        .expect("retry EINTR and complete partial writes");
+
+        assert_eq!(output, b"ready");
+    }
+
+    #[test]
+    fn write_all_propagates_closed_pipe_without_retrying_forever() {
+        let mut attempts = 0;
+        let error = write_all_with(b"ready", |_| {
+            attempts += 1;
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        })
+        .expect_err("closed pipe must be surfaced");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn unsupported_seccomp_architectures_have_no_audit_arch_fallback() {
+        assert_eq!(seccomp_audit_arch(SeccompArchitecture::Unsupported), None);
+        assert_eq!(
+            seccomp_audit_arch(SeccompArchitecture::X86_64),
+            Some(0xc000_003e)
+        );
+        assert_eq!(
+            seccomp_audit_arch(SeccompArchitecture::Aarch64),
+            Some(0xc000_00b7)
+        );
     }
 }
