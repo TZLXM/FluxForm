@@ -4,6 +4,178 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+fn probe_ipv4_socket_denial(port: u16) -> bool {
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+    }
+
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    unsafe {
+        libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_in).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        );
+        libc::close(socket);
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn probe_ipv6_socket_denial(port: u16) -> bool {
+    let socket = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+    }
+
+    let address = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr {
+            s6_addr: std::net::Ipv6Addr::LOCALHOST.octets(),
+        },
+        sin6_scope_id: 0,
+    };
+    unsafe {
+        libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_in6).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        );
+        libc::close(socket);
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn probe_packet_socket_denial() -> bool {
+    let socket = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+    }
+    unsafe { libc::close(socket) };
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn probe_unix_socket_escape(path: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(path.as_bytes()) else {
+        return false;
+    };
+    let socket = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return false;
+    }
+
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = path.as_bytes_with_nul();
+    if path_bytes.len() > address.sun_path.len() {
+        unsafe { libc::close(socket) };
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast(),
+            path_bytes.len(),
+        );
+    }
+    let address_len =
+        (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len()) as libc::socklen_t;
+    let connected = unsafe {
+        libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_un).cast(),
+            address_len,
+        )
+    };
+    let error = std::io::Error::last_os_error().raw_os_error();
+    unsafe { libc::close(socket) };
+    connected < 0 && error == Some(libc::ENOENT)
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct ProbeCloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn clone_probe_exit(_argument: *mut libc::c_void) -> libc::c_int {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn probe_namespace_creation_denial() -> bool {
+    let unshare_denied = unsafe { libc::unshare(libc::CLONE_NEWNET) } < 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    let setns_denied = unsafe { libc::setns(-1, libc::CLONE_NEWNET) } < 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    let clone_args = ProbeCloneArgs {
+        flags: libc::CLONE_NEWNET as u64,
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: libc::SIGCHLD as u64,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: 0,
+    };
+    let clone3_denied = unsafe {
+        let result = libc::syscall(
+            libc::SYS_clone3,
+            &clone_args,
+            std::mem::size_of::<ProbeCloneArgs>(),
+        );
+        result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    let mut stack = vec![0_u8; 64 * 1024];
+    let stack_top = unsafe { stack.as_mut_ptr().add(stack.len()) };
+    let stack_top = ((stack_top as usize) & !0xf) as *mut libc::c_void;
+    let clone_denied = unsafe {
+        let result = libc::clone(
+            clone_probe_exit,
+            stack_top,
+            libc::CLONE_NEWNET | libc::SIGCHLD,
+            std::ptr::null_mut(),
+        );
+        if result < 0 {
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        } else {
+            let mut status = 0;
+            let _ = libc::waitpid(result, &mut status, 0);
+            false
+        }
+    };
+    unshare_denied && setns_denied && clone3_denied && clone_denied
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     use std::fs::{self, File, OpenOptions};
     use std::io::Write;
@@ -110,6 +282,27 @@ fn main() {
                     }
                 }
                 _ => 120,
+            }
+        }
+        "probe-network" => {
+            let ipv4_port = arguments
+                .next()
+                .and_then(|raw| raw.to_string_lossy().parse::<u16>().ok());
+            let ipv6_port = arguments
+                .next()
+                .and_then(|raw| raw.to_string_lossy().parse::<u16>().ok());
+            let unix_socket_path = arguments.next();
+            match (ipv4_port, ipv6_port, unix_socket_path) {
+                (Some(ipv4_port), Some(ipv6_port), Some(unix_socket_path))
+                    if probe_ipv4_socket_denial(ipv4_port)
+                        && probe_ipv6_socket_denial(ipv6_port)
+                        && probe_packet_socket_denial()
+                        && probe_unix_socket_escape(&unix_socket_path)
+                        && probe_namespace_creation_denial() =>
+                {
+                    0
+                }
+                _ => 70,
             }
         }
         _ => 120,

@@ -241,8 +241,10 @@ dependencies = [
 name = "fluxform-sandbox-probe"
 version = "0.1.0"
 dependencies = [
+ "fluxform-ffmpeg-profile",
  "libc",
  "serde",
+ "sha2",
  "serde_json",
  "tempfile",
  "thiserror",

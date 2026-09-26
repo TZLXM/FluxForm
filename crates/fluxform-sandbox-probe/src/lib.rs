@@ -2,9 +2,9 @@
 //!
 //! The public API is deliberately fail-closed. On non-Linux targets the probe
 //! remains buildable but cannot create a sandbox. On Linux, `spawn_blocked`
-//! creates the user/mount/PID namespaces and a minimal root before signaling
-//! the parent-side placement barrier. The tool is forked only after placement
-//! is confirmed and is executed directly, without a shell.
+//! creates the user/mount/PID/network namespaces and a minimal root before
+//! signaling the parent-side placement barrier. The tool is forked only after
+//! placement is confirmed and is executed directly, without a shell.
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -85,6 +85,72 @@ pub struct FilesystemEvidence {
     pub capability_drop: ProbeEvidence,
     pub descriptor_closure: ProbeEvidence,
     pub temporary_root: ProbeEvidence,
+}
+
+/// A socket domain listed by the sandbox network policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkSocketDomain {
+    Unix,
+    Ipv4,
+    Ipv6,
+    Packet,
+}
+
+/// Declarative socket policy consumed by the Linux seccomp filter.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkPolicy {
+    pub allowed_socket_domains: [NetworkSocketDomain; 1],
+    pub denied_socket_domains: [NetworkSocketDomain; 3],
+}
+
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self {
+            allowed_socket_domains: [NetworkSocketDomain::Unix],
+            denied_socket_domains: [
+                NetworkSocketDomain::Ipv4,
+                NetworkSocketDomain::Ipv6,
+                NetworkSocketDomain::Packet,
+            ],
+        }
+    }
+}
+
+/// Fixed protocol policy used by FFprobe invocations.
+///
+/// This policy is intentionally separate from `NetworkEvidence`: protocol
+/// filtering does not prove operating-system network isolation.
+pub const FFPROBE_PROTOCOL_WHITELIST: &str = "file,pipe";
+
+/// Active evidence for the Linux network isolation boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkEvidence {
+    pub private_namespace_created: ProbeEvidence,
+    pub ipv4_socket_denial: ProbeEvidence,
+    pub ipv6_socket_denial: ProbeEvidence,
+    pub packet_socket_denial: ProbeEvidence,
+    pub ipv4_listener_isolated: ProbeEvidence,
+    pub ipv6_listener_isolated: ProbeEvidence,
+    pub unix_socket_escape: ProbeEvidence,
+    pub namespace_creation_denied: ProbeEvidence,
+}
+
+impl NetworkEvidence {
+    pub fn all_passed(&self) -> bool {
+        [
+            &self.private_namespace_created,
+            &self.ipv4_socket_denial,
+            &self.ipv6_socket_denial,
+            &self.packet_socket_denial,
+            &self.ipv4_listener_isolated,
+            &self.ipv6_listener_isolated,
+            &self.unix_socket_escape,
+            &self.namespace_creation_denied,
+        ]
+        .into_iter()
+        .all(|item| item.status == ProbeStatus::Passed)
+    }
 }
 
 impl FilesystemEvidence {
@@ -179,6 +245,8 @@ pub enum SandboxError {
     UnsupportedPlatform,
     #[error("required Linux filesystem prerequisites failed: {0:?}")]
     Prerequisites(Box<FilesystemEvidence>),
+    #[error("required Linux network prerequisites failed: {0:?}")]
+    NetworkPrerequisitesFailed(Box<NetworkEvidence>),
     #[error("invalid sandbox policy: {0}")]
     InvalidPolicy(String),
     #[error("sandbox operation {operation} failed: {source}")]
@@ -485,6 +553,30 @@ impl FilesystemPrerequisites {
     }
 }
 
+/// Performs active controlled-listener and namespace checks for Linux
+/// networking isolation.
+pub struct NetworkPrerequisites;
+
+impl NetworkPrerequisites {
+    pub fn inspect() -> Result<NetworkEvidence, SandboxError> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            linux::inspect_network_prerequisites()
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            Err(SandboxError::UnsupportedPlatform)
+        }
+    }
+}
+
 /// The sandbox launcher. `spawn_blocked` returns only after setup is complete;
 /// a parent-attach child remains blocked until its controller releases it.
 pub struct Sandbox;
@@ -600,6 +692,7 @@ impl Drop for SandboxChild {
 mod linux {
     use super::{
         FileIdentity, FilesystemEvidence, FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES,
+        NetworkEvidence, NetworkPolicy, NetworkPrerequisites, NetworkSocketDomain,
         PolicyPathIdentityGraph, ProbeEvidence, SandboxChild, SandboxError, SandboxLimits,
         SandboxPolicy, SpawnPlacement, ToolEntryEvidence, ToolInventory, validate_open_files_limit,
         validate_policy_path_identities, validate_tool_inventory,
@@ -609,8 +702,10 @@ mod linux {
     use std::fs;
     use std::io;
     use std::mem::{size_of, zeroed};
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixListener;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
@@ -655,6 +750,10 @@ mod linux {
     const STAGE_SECCOMP: i32 = 27;
     const STAGE_TASK_CWD: i32 = 28;
     const STAGE_PID_NAMESPACE: i32 = 29;
+    const STAGE_NETWORK_NAMESPACE: i32 = 30;
+    const STAGE_NETWORK_SOCKET: i32 = 31;
+    const STAGE_NETWORK_UNIX_SOCKET: i32 = 32;
+    const STAGE_NETWORK_ESCAPE: i32 = 33;
     const CLONE_INTO_CGROUP: u64 = 1 << 33;
     const SECCOMP_DATA_NR_OFFSET: u32 = 0;
     const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
@@ -706,6 +805,10 @@ mod linux {
         set_tid: u64,
         set_tid_size: u64,
         cgroup: u64,
+    }
+
+    extern "C" fn namespace_probe_child(_argument: *mut libc::c_void) -> libc::c_int {
+        0
     }
 
     struct TempRoot(PathBuf);
@@ -940,6 +1043,205 @@ mod linux {
         }
     }
 
+    pub(super) fn inspect_network_prerequisites() -> Result<NetworkEvidence, SandboxError> {
+        let probe_root = TempRoot::create().ok();
+        let ipv4_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).and_then(|listener| {
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        });
+        let ipv6_listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).and_then(|listener| {
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        });
+        let unix_listener = probe_root.as_ref().and_then(|root| {
+            let path = root.path().join("outside.sock");
+            UnixListener::bind(path)
+                .and_then(|listener| {
+                    listener.set_nonblocking(true)?;
+                    Ok(listener)
+                })
+                .ok()
+        });
+        let host_uid = unsafe { libc::geteuid() };
+        let host_gid = unsafe { libc::getegid() };
+        let private_namespace_created = probe_root.as_ref().map_or_else(
+            || ProbeEvidence::failed("private network namespace probe root unavailable"),
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkNamespaceCreated,
+                    host_uid,
+                    host_gid,
+                    "created a distinct network namespace (nsfs identity changed)",
+                )
+            },
+        );
+
+        let ipv4_socket_denial = match (&probe_root, &ipv4_listener) {
+            (Some(root), Ok(listener)) => {
+                let port = listener.local_addr().map(|address| address.port());
+                match port {
+                    Ok(port) => network_probe(
+                        root,
+                        ProbeKind::NetworkIpv4(port),
+                        host_uid,
+                        host_gid,
+                        "AF_INET socket creation returned the network seccomp denial",
+                    ),
+                    Err(error) => ProbeEvidence::failed(format!(
+                        "could not inspect controlled IPv4 listener: {error}"
+                    )),
+                }
+            }
+            (None, _) => ProbeEvidence::failed(
+                "IPv4 socket probe could not run: private probe root unavailable",
+            ),
+            (_, Err(error)) => {
+                ProbeEvidence::failed(format!("could not bind controlled IPv4 listener: {error}"))
+            }
+        };
+        let ipv6_socket_denial = match (&probe_root, &ipv6_listener) {
+            (Some(root), Ok(listener)) => {
+                let port = listener.local_addr().map(|address| address.port());
+                match port {
+                    Ok(port) => network_probe(
+                        root,
+                        ProbeKind::NetworkIpv6(port),
+                        host_uid,
+                        host_gid,
+                        "AF_INET6 socket creation returned the network seccomp denial",
+                    ),
+                    Err(error) => ProbeEvidence::failed(format!(
+                        "could not inspect controlled IPv6 listener: {error}"
+                    )),
+                }
+            }
+            (None, _) => ProbeEvidence::failed(
+                "IPv6 socket probe could not run: private probe root unavailable",
+            ),
+            (_, Err(error)) => {
+                ProbeEvidence::failed(format!("could not bind controlled IPv6 listener: {error}"))
+            }
+        };
+        let packet_socket_denial = probe_root.as_ref().map_or_else(
+            || {
+                ProbeEvidence::failed(
+                    "packet socket probe could not run: private probe root unavailable",
+                )
+            },
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkPacket,
+                    host_uid,
+                    host_gid,
+                    "AF_PACKET socket creation returned the network seccomp denial",
+                )
+            },
+        );
+        let ipv4_listener_isolated = match &ipv4_listener {
+            Ok(listener) => controlled_listener_isolated(listener, "IPv4"),
+            Err(error) => {
+                ProbeEvidence::failed(format!("IPv4 controlled listener was unavailable: {error}"))
+            }
+        };
+        let ipv6_listener_isolated = match &ipv6_listener {
+            Ok(listener) => controlled_listener_isolated(listener, "IPv6"),
+            Err(error) => {
+                ProbeEvidence::failed(format!("IPv6 controlled listener was unavailable: {error}"))
+            }
+        };
+        let unix_socket_escape = match (&probe_root, &unix_listener) {
+            (Some(root), Some(listener)) => {
+                let result = network_probe(
+                    root,
+                    ProbeKind::NetworkUnixEscape,
+                    host_uid,
+                    host_gid,
+                    "host Unix socket path was not reachable outside the sandbox root",
+                );
+                match listener.accept() {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => result,
+                    Ok((stream, address)) => {
+                        drop(stream);
+                        ProbeEvidence::failed(format!(
+                            "sandbox reached host Unix socket from {address:?}"
+                        ))
+                    }
+                    Err(error) => ProbeEvidence::failed(format!(
+                        "could not inspect controlled Unix listener: {error}"
+                    )),
+                }
+            }
+            (None, _) => ProbeEvidence::failed(
+                "Unix socket escape probe could not run: private probe root unavailable",
+            ),
+            (_, None) => ProbeEvidence::failed("could not bind controlled host Unix socket"),
+        };
+        let namespace_creation_denied = probe_root.as_ref().map_or_else(
+            || {
+                ProbeEvidence::failed(
+                    "namespace creation probe could not run: private probe root unavailable",
+                )
+            },
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkNamespaceEscape,
+                    host_uid,
+                    host_gid,
+                    "network namespace creation and entry syscalls were denied after setup",
+                )
+            },
+        );
+
+        let evidence = NetworkEvidence {
+            private_namespace_created,
+            ipv4_socket_denial,
+            ipv6_socket_denial,
+            packet_socket_denial,
+            ipv4_listener_isolated,
+            ipv6_listener_isolated,
+            unix_socket_escape,
+            namespace_creation_denied,
+        };
+        if evidence.all_passed() {
+            Ok(evidence)
+        } else {
+            Err(SandboxError::NetworkPrerequisitesFailed(Box::new(evidence)))
+        }
+    }
+
+    fn network_probe(
+        root: &TempRoot,
+        kind: ProbeKind,
+        host_uid: libc::uid_t,
+        host_gid: libc::gid_t,
+        success: &str,
+    ) -> ProbeEvidence {
+        probe_result(
+            run_probe(kind, Some(root.path()), host_uid, host_gid),
+            success,
+        )
+    }
+
+    fn controlled_listener_isolated(listener: &TcpListener, family: &str) -> ProbeEvidence {
+        match listener.accept() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => ProbeEvidence::passed(
+                format!("controlled {family} listener accepted zero connections"),
+            ),
+            Ok((stream, address)) => {
+                drop(stream);
+                ProbeEvidence::failed(format!(
+                    "controlled {family} listener accepted a sandbox connection from {address}"
+                ))
+            }
+            Err(error) => ProbeEvidence::failed(format!(
+                "could not inspect controlled {family} listener: {error}"
+            )),
+        }
+    }
+
     fn probe_result(result: io::Result<ProbeResult>, success: &str) -> ProbeEvidence {
         match result {
             Ok(ProbeResult {
@@ -961,6 +1263,12 @@ mod linux {
         MountIsolation,
         PivotRoot,
         CapabilityDrop,
+        NetworkIpv4(u16),
+        NetworkIpv6(u16),
+        NetworkNamespaceCreated,
+        NetworkPacket,
+        NetworkUnixEscape,
+        NetworkNamespaceEscape,
     }
 
     fn run_probe(
@@ -987,7 +1295,7 @@ mod linux {
         if pid == 0 {
             unsafe {
                 libc::close(pipe[0]);
-                let result = run_probe_child(kind, scratch.as_ref(), &uid_map, &gid_map);
+                let result = run_probe_child(kind, scratch.as_ref(), &uid_map, &gid_map, pipe[1]);
                 if write_struct(pipe[1], &result).is_err() {
                     libc::_exit(125);
                 }
@@ -1133,6 +1441,7 @@ mod linux {
         scratch: Option<&CString>,
         uid_map: &CString,
         gid_map: &CString,
+        report_fd: RawFd,
     ) -> ProbeResult {
         match kind {
             ProbeKind::UserNamespace => match enter_user_namespace_from_maps(uid_map, gid_map) {
@@ -1250,7 +1559,302 @@ mod linux {
                 Ok(()) => drop_capabilities_and_set_no_new_privs(),
                 Err(result) => result,
             },
+            ProbeKind::NetworkIpv4(_)
+            | ProbeKind::NetworkIpv6(_)
+            | ProbeKind::NetworkNamespaceCreated
+            | ProbeKind::NetworkPacket
+            | ProbeKind::NetworkUnixEscape
+            | ProbeKind::NetworkNamespaceEscape => {
+                run_network_probe_child(kind, scratch, uid_map, gid_map, report_fd)
+            }
         }
+    }
+
+    unsafe fn run_network_probe_child(
+        kind: ProbeKind,
+        scratch: Option<&CString>,
+        uid_map: &CString,
+        gid_map: &CString,
+        report_fd: RawFd,
+    ) -> ProbeResult {
+        if close_range_except(&[report_fd]) != 0 {
+            return failed(STAGE_FD_CLOSE);
+        }
+        if let Err(result) = enter_user_namespace_from_maps(uid_map, gid_map) {
+            return result;
+        }
+        let original_network_namespace = match network_namespace_identity() {
+            Ok(identity) => identity,
+            Err(_) => return failed(STAGE_NETWORK_NAMESPACE),
+        };
+        if libc::unshare(libc::CLONE_NEWNET) != 0 {
+            return failed(STAGE_NETWORK_NAMESPACE);
+        }
+        let isolated_network_namespace = match network_namespace_identity() {
+            Ok(identity) => identity,
+            Err(_) => return failed(STAGE_NETWORK_NAMESPACE),
+        };
+        if isolated_network_namespace == original_network_namespace {
+            return failed_with_errno(STAGE_NETWORK_NAMESPACE, libc::ESTALE);
+        }
+        if matches!(kind, ProbeKind::NetworkNamespaceCreated) {
+            return success();
+        }
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            return failed(STAGE_MOUNTNS);
+        }
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            return failed(STAGE_PRIVATE_MOUNTS);
+        }
+        let Some(scratch) = scratch else {
+            return failed_with_errno(STAGE_TMPFS, libc::EINVAL);
+        };
+        let scratch_path = Path::new(std::ffi::OsStr::from_bytes(scratch.to_bytes()));
+        let root = match RootPaths::new(scratch_path) {
+            Ok(root) => root,
+            Err(_) => return failed_with_errno(STAGE_TMPFS, libc::EINVAL),
+        };
+        if mount_tmpfs(&root.base, b"mode=755,size=4m\0") != 0
+            || make_root_layout(&root) != 0
+            || mount_tmpfs(&root.tmp, b"mode=1777,size=4m\0") != 0
+        {
+            return failed(STAGE_TMPFS);
+        }
+        if pivot_to_root(&root.base) != 0 {
+            return failed(STAGE_PIVOT_ROOT);
+        }
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        ) != 0
+        {
+            return failed(STAGE_BIND_RO);
+        }
+        if libc::chdir(c"/task".as_ptr()) != 0 {
+            return failed(STAGE_TASK_CWD);
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return failed(STAGE_NO_NEW_PRIVS);
+        }
+        if drop_capabilities() != 0 {
+            return failed(STAGE_CAP_DROP);
+        }
+        if install_seccomp(&build_sandbox_filter()) != 0 {
+            return failed(STAGE_SECCOMP);
+        }
+
+        match kind {
+            ProbeKind::NetworkIpv4(port) => probe_ipv4_socket_denial(port),
+            ProbeKind::NetworkIpv6(port) => probe_ipv6_socket_denial(port),
+            ProbeKind::NetworkNamespaceCreated => success(),
+            ProbeKind::NetworkPacket => probe_packet_socket_denial(),
+            ProbeKind::NetworkUnixEscape => {
+                let mut path = scratch.to_bytes().to_vec();
+                path.extend_from_slice(b"/outside.sock");
+                match CString::new(path) {
+                    Ok(path) => probe_unix_socket_is_outside_root(&path),
+                    Err(_) => failed_with_errno(STAGE_NETWORK_UNIX_SOCKET, libc::EINVAL),
+                }
+            }
+            ProbeKind::NetworkNamespaceEscape => probe_namespace_creation_denial(),
+            _ => failed_with_errno(STAGE_NETWORK_ESCAPE, libc::EINVAL),
+        }
+    }
+
+    fn network_namespace_identity() -> io::Result<FileIdentity> {
+        let fd = unsafe {
+            libc::open(
+                c"/proc/self/ns/net".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut metadata: libc::stat = unsafe { zeroed() };
+        let result = unsafe { libc::fstat(fd, &mut metadata) };
+        let error = (result != 0).then(io::Error::last_os_error);
+        unsafe { libc::close(fd) };
+        if let Some(error) = error {
+            Err(error)
+        } else {
+            Ok(identity_from_stat(&metadata))
+        }
+    }
+
+    unsafe fn probe_ipv4_socket_denial(port: u16) -> ProbeResult {
+        let socket = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return if errno() == libc::EACCES {
+                success()
+            } else {
+                failed(STAGE_NETWORK_SOCKET)
+            };
+        }
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        let connected = libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_in).cast(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        let connect_errno = errno();
+        libc::close(socket);
+        failed_with_errno(
+            STAGE_NETWORK_SOCKET,
+            if connected == 0 { 0 } else { connect_errno },
+        )
+    }
+
+    unsafe fn probe_ipv6_socket_denial(port: u16) -> ProbeResult {
+        let socket = libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return if errno() == libc::EACCES {
+                success()
+            } else {
+                failed(STAGE_NETWORK_SOCKET)
+            };
+        }
+        let address = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: port.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: libc::in6_addr {
+                s6_addr: Ipv6Addr::LOCALHOST.octets(),
+            },
+            sin6_scope_id: 0,
+        };
+        let connected = libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_in6).cast(),
+            size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        );
+        let connect_errno = errno();
+        libc::close(socket);
+        failed_with_errno(
+            STAGE_NETWORK_SOCKET,
+            if connected == 0 { 0 } else { connect_errno },
+        )
+    }
+
+    unsafe fn probe_packet_socket_denial() -> ProbeResult {
+        let socket = libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 && errno() == libc::EACCES {
+            return success();
+        }
+        if socket >= 0 {
+            libc::close(socket);
+        }
+        failed(STAGE_NETWORK_SOCKET)
+    }
+
+    unsafe fn probe_unix_socket_is_outside_root(path: &CString) -> ProbeResult {
+        let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return failed(STAGE_NETWORK_UNIX_SOCKET);
+        }
+        let mut address: libc::sockaddr_un = zeroed();
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path_bytes = path.as_bytes_with_nul();
+        if path_bytes.len() > address.sun_path.len() {
+            libc::close(socket);
+            return failed_with_errno(STAGE_NETWORK_UNIX_SOCKET, libc::ENAMETOOLONG);
+        }
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast(),
+            path_bytes.len(),
+        );
+        let address_len = (size_of::<libc::sa_family_t>() + path_bytes.len()) as libc::socklen_t;
+        let connected = libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_un).cast(),
+            address_len,
+        );
+        let connect_errno = errno();
+        libc::close(socket);
+        if connected < 0 && connect_errno == libc::ENOENT {
+            success()
+        } else {
+            failed_with_errno(
+                STAGE_NETWORK_UNIX_SOCKET,
+                if connected == 0 { 0 } else { connect_errno },
+            )
+        }
+    }
+
+    unsafe fn probe_namespace_creation_denial() -> ProbeResult {
+        if libc::unshare(libc::CLONE_NEWNET) == 0 || errno() != libc::EPERM {
+            return failed(STAGE_NETWORK_ESCAPE);
+        }
+        if libc::setns(-1, libc::CLONE_NEWNET) == 0 || errno() != libc::EPERM {
+            return failed(STAGE_NETWORK_ESCAPE);
+        }
+        let clone_args = CloneArgs {
+            flags: libc::CLONE_NEWNET as u64,
+            pidfd: 0,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: libc::SIGCHLD as u64,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+        };
+        if libc::syscall(libc::SYS_clone3, &clone_args, size_of::<CloneArgs>()) >= 0
+            || errno() != libc::EPERM
+        {
+            return failed(STAGE_NETWORK_ESCAPE);
+        }
+
+        let mut stack = vec![0_u8; 64 * 1024];
+        let stack_top = stack.as_mut_ptr().add(stack.len());
+        let stack_top = ((stack_top as usize) & !0xf) as *mut libc::c_void;
+        let clone_result = libc::clone(
+            namespace_probe_child,
+            stack_top,
+            libc::CLONE_NEWNET | libc::SIGCHLD,
+            std::ptr::null_mut(),
+        );
+        if clone_result < 0 {
+            if errno() != libc::EPERM {
+                return failed(STAGE_NETWORK_ESCAPE);
+            }
+        } else if clone_result == 0 {
+            libc::_exit(126);
+        } else {
+            let mut status = 0;
+            loop {
+                let waited = libc::waitpid(clone_result, &mut status, 0);
+                if waited == clone_result {
+                    break;
+                }
+                if waited < 0 && errno() == libc::EINTR {
+                    continue;
+                }
+                return failed(STAGE_NETWORK_ESCAPE);
+            }
+            return failed(STAGE_NETWORK_ESCAPE);
+        }
+        success()
     }
 
     fn map_line(id: u32) -> Vec<u8> {
@@ -1400,6 +2004,7 @@ mod linux {
         )
         .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
         FilesystemPrerequisites::inspect()?;
+        NetworkPrerequisites::inspect()?;
         let virtual_program = Path::new("/tool").join(relative_program);
         let program_c = c_path(&virtual_program)?;
         let exec_strings = prepare_exec_strings(&program_c, args)?;
@@ -1473,7 +2078,7 @@ mod linux {
                 pipe[index] = duplicate;
             }
         }
-        let seccomp = build_filesystem_filter();
+        let seccomp = build_sandbox_filter();
         let policy_fds = build_policy_fd_list(
             input.fd.as_raw_fd(),
             task.fd.as_raw_fd(),
@@ -2333,6 +2938,9 @@ mod linux {
         if libc::unshare(libc::CLONE_NEWPID) != 0 {
             fail_and_exit(spec.report_fd, STAGE_MOUNTNS, errno());
         }
+        if libc::unshare(libc::CLONE_NEWNET) != 0 {
+            fail_and_exit(spec.report_fd, STAGE_NETWORK_NAMESPACE, errno());
+        }
         if libc::mount(
             std::ptr::null(),
             c"/".as_ptr(),
@@ -2680,7 +3288,7 @@ mod linux {
         0
     }
 
-    fn build_filesystem_filter() -> Vec<libc::sock_filter> {
+    fn build_sandbox_filter() -> Vec<libc::sock_filter> {
         let denied = [
             libc::SYS_mount as u32,
             libc::SYS_umount2 as u32,
@@ -2697,8 +3305,14 @@ mod linux {
             libc::SYS_chroot as u32,
             libc::SYS_setpgid as u32,
             libc::SYS_setsid as u32,
+            libc::SYS_io_uring_setup as u32,
         ];
-        let mut filter = Vec::with_capacity(3 + denied.len() * 2 + 5);
+        let network_policy = NetworkPolicy::default();
+        let socket_filter_len = 1
+            + 2 * network_policy.denied_socket_domains.len()
+            + 2 * network_policy.allowed_socket_domains.len()
+            + 1;
+        let mut filter = Vec::with_capacity(3 + denied.len() * 2 + socket_filter_len + 5);
         filter.push(bpf_stmt(
             libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
             SECCOMP_DATA_ARCH_OFFSET,
@@ -2744,6 +3358,44 @@ mod linux {
         }
         filter.push(bpf_jump(
             libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            libc::SYS_socket as u32,
+            0,
+            socket_filter_len as u8,
+        ));
+        filter.push(bpf_stmt(
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            SECCOMP_DATA_ARGS_OFFSET,
+        ));
+        for domain in network_policy.denied_socket_domains {
+            filter.push(bpf_jump(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                socket_domain_number(domain),
+                0,
+                1,
+            ));
+            filter.push(bpf_stmt(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+            ));
+        }
+        for domain in network_policy.allowed_socket_domains {
+            filter.push(bpf_jump(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                socket_domain_number(domain),
+                0,
+                1,
+            ));
+            filter.push(bpf_stmt(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ALLOW,
+            ));
+        }
+        filter.push(bpf_stmt(
+            libc::BPF_RET | libc::BPF_K,
+            libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+        ));
+        filter.push(bpf_jump(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
             libc::SYS_clone as u32,
             0,
             3,
@@ -2767,6 +3419,15 @@ mod linux {
             libc::SECCOMP_RET_ALLOW,
         ));
         filter
+    }
+
+    fn socket_domain_number(domain: NetworkSocketDomain) -> u32 {
+        match domain {
+            NetworkSocketDomain::Unix => libc::AF_UNIX as u32,
+            NetworkSocketDomain::Ipv4 => libc::AF_INET as u32,
+            NetworkSocketDomain::Ipv6 => libc::AF_INET6 as u32,
+            NetworkSocketDomain::Packet => libc::AF_PACKET as u32,
+        }
     }
 
     fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
@@ -2984,7 +3645,11 @@ mod linux {
             STAGE_CLONE3 => "clone3 cgroup placement",
             STAGE_REPORT_WRITE => "child status report",
             STAGE_TOOL_WAIT => "tool wait",
-            STAGE_SECCOMP => "filesystem seccomp policy",
+            STAGE_SECCOMP => "filesystem and network seccomp policy",
+            STAGE_NETWORK_NAMESPACE => "private network namespace creation",
+            STAGE_NETWORK_SOCKET => "network socket seccomp policy",
+            STAGE_NETWORK_UNIX_SOCKET => "Unix socket host-path isolation",
+            STAGE_NETWORK_ESCAPE => "network namespace escape denial",
             STAGE_TASK_CWD => "task-directory working directory",
             STAGE_PID_NAMESPACE => "PID namespace creation",
             _ => "unknown operation",
@@ -3557,5 +4222,69 @@ mod review_regression_tests {
             seccomp_audit_arch(SeccompArchitecture::Aarch64),
             Some(0xc000_00b7)
         );
+    }
+
+    #[test]
+    fn network_evidence_portable_serialization_uses_synthetic_records_only() {
+        let fixture = |status| {
+            let item = ProbeEvidence {
+                status,
+                detail: "synthetic serialization fixture; no OS probe executed".into(),
+            };
+            NetworkEvidence {
+                private_namespace_created: item.clone(),
+                ipv4_socket_denial: item.clone(),
+                ipv6_socket_denial: item.clone(),
+                packet_socket_denial: item.clone(),
+                ipv4_listener_isolated: item.clone(),
+                ipv6_listener_isolated: item.clone(),
+                unix_socket_escape: item.clone(),
+                namespace_creation_denied: item,
+            }
+        };
+        let evidence = fixture(ProbeStatus::Failed);
+
+        assert!(!evidence.all_passed());
+        assert!(fixture(ProbeStatus::Passed).all_passed());
+        assert_eq!(
+            serde_json::to_value(evidence).expect("serialize network evidence"),
+            serde_json::json!({
+                "private_namespace_created": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "ipv4_socket_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "ipv6_socket_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "packet_socket_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "ipv4_listener_isolated": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "ipv6_listener_isolated": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "unix_socket_escape": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "namespace_creation_denied": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" }
+            })
+        );
+    }
+
+    #[test]
+    fn network_policy_allows_unix_and_denies_inet_and_packet_families() {
+        let policy = NetworkPolicy::default();
+        assert_eq!(policy.allowed_socket_domains, [NetworkSocketDomain::Unix]);
+        assert_eq!(
+            policy.denied_socket_domains,
+            [
+                NetworkSocketDomain::Ipv4,
+                NetworkSocketDomain::Ipv6,
+                NetworkSocketDomain::Packet,
+            ]
+        );
+        assert_eq!(FFPROBE_PROTOCOL_WHITELIST, "file,pipe");
+    }
+
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    #[test]
+    fn network_inspection_reports_unsupported_platform_without_fabricating_evidence() {
+        assert!(matches!(
+            NetworkPrerequisites::inspect(),
+            Err(SandboxError::UnsupportedPlatform)
+        ));
     }
 }
