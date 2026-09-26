@@ -7,6 +7,8 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Child;
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +18,15 @@ use std::time::{Duration, Instant};
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 128 * 1024;
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(test)]
+type BeforeFfprobeSpawnHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_FFPROBE_SPAWN: std::cell::RefCell<Option<BeforeFfprobeSpawnHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Validates a partial output against the media contract derived from the
 /// approved manifest edge and sample catalog.
@@ -32,6 +43,7 @@ pub struct FfprobeOutputValidator {
     ffprobe_path: PathBuf,
     protocol_whitelist: &'static str,
     fingerprint: ExecutableFingerprint,
+    approved_file: std::sync::Mutex<File>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,20 +68,54 @@ impl FfprobeOutputValidator {
             ));
         }
         let ffprobe_path = ffprobe_path.as_ref();
-        let fingerprint = executable_fingerprint(ffprobe_path).map_err(|error| {
+        let approved_file = open_executable_candidate(ffprobe_path).map_err(|error| {
             ValidationError::Rejected(format!("cannot approve FFprobe candidate: {error}"))
+        })?;
+        let fingerprint = executable_fingerprint(&approved_file).map_err(|error| {
+            ValidationError::Rejected(format!("cannot fingerprint FFprobe candidate: {error}"))
         })?;
         Ok(Self {
             ffprobe_path: ffprobe_path.to_path_buf(),
             protocol_whitelist: "file,pipe",
             fingerprint,
+            approved_file: std::sync::Mutex::new(approved_file),
         })
     }
 
-    fn verify_candidate(&self) -> Result<(), ValidationError> {
-        match executable_fingerprint(&self.ffprobe_path) {
+    fn verify_candidate(&self, approved_file: &File) -> Result<(), ValidationError> {
+        match executable_fingerprint(approved_file) {
             Ok(current) if current == self.fingerprint => Ok(()),
             _ => Err(ValidationError::ExecutableChanged),
+        }
+    }
+
+    fn spawn_candidate(&self, arguments: Vec<String>) -> Result<Child, ValidationError> {
+        let approved_file = self
+            .approved_file
+            .lock()
+            .expect("approved FFprobe file mutex poisoned");
+        self.verify_candidate(&approved_file)?;
+        #[cfg(test)]
+        BEFORE_FFPROBE_SPAWN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&self.ffprobe_path);
+            }
+        });
+
+        #[cfg(windows)]
+        {
+            Command::new(&self.ffprobe_path)
+                .args(arguments)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| ValidationError::Ffprobe(error.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (approved_file, arguments);
+            Err(ValidationError::PlatformBlocked)
         }
     }
 
@@ -90,14 +136,7 @@ impl FfprobeOutputValidator {
     }
 
     fn probe(&self, partial_path: &Path) -> Result<Value, ValidationError> {
-        self.verify_candidate()?;
-        let mut child = Command::new(&self.ffprobe_path)
-            .args(self.arguments(partial_path))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| ValidationError::Ffprobe(error.to_string()))?;
+        let mut child = self.spawn_candidate(self.arguments(partial_path))?;
         let stdout = child
             .stdout
             .take()
@@ -174,7 +213,7 @@ impl FfprobeOutputValidator {
     }
 }
 
-fn executable_fingerprint(path: &Path) -> io::Result<ExecutableFingerprint> {
+fn open_executable_candidate(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -185,8 +224,12 @@ fn executable_fingerprint(path: &Path) -> io::Result<ExecutableFingerprint> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        // Leave read sharing enabled for CreateProcess image loading; denying
+        // write/delete sharing pins the approved path through spawn.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        options.share_mode(FILE_SHARE_READ);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         let file = options.open(path)?;
         let metadata = file.metadata()?;
@@ -196,22 +239,24 @@ fn executable_fingerprint(path: &Path) -> io::Result<ExecutableFingerprint> {
                 "FFprobe candidate must be a regular non-reparse file",
             ));
         }
-        hash_executable(file)
+        Ok(file)
     }
     #[cfg(not(windows))]
     {
-        hash_executable(options.open(path)?)
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FFprobe candidate must be a regular file",
+            ));
+        }
+        Ok(file)
     }
 }
 
-fn hash_executable(mut file: File) -> io::Result<ExecutableFingerprint> {
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "FFprobe candidate must be a regular file",
-        ));
-    }
-    let identity = file_identity(&file)?;
+fn executable_fingerprint(file: &File) -> io::Result<ExecutableFingerprint> {
+    let identity = file_identity(file)?;
+    let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -653,32 +698,98 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn replacing_ffprobe_candidate_after_construction_is_rejected_before_spawn() {
+    fn replacing_ffprobe_candidate_before_validation_is_denied_by_retained_handle() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let candidate = temporary.path().join("ffprobe-candidate.exe");
         let original = temporary.path().join("approved-original.exe");
+        fs::copy(
+            std::env::current_exe().expect("test executable"),
+            &candidate,
+        )
+        .expect("create candidate executable");
+        let validator =
+            FfprobeOutputValidator::new(&candidate, "file,pipe").expect("approved candidate");
+
+        let replacement = fs::rename(&candidate, &original);
+        assert!(
+            replacement.is_err(),
+            "the retained FFprobe handle must deny replacement"
+        );
+        assert!(candidate.exists(), "approved executable path must remain");
+        assert_eq!(validator.ffprobe_path, candidate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffprobe_execution_is_blocked_without_handle_bound_process_creation() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let executable = std::env::current_exe().expect("test executable");
+        let validator =
+            FfprobeOutputValidator::new(&executable, "file,pipe").expect("candidate handle");
+        let partial = temporary.path().join("input.png");
+        fs::write(&partial, b"input bytes").expect("input file");
+
+        assert!(matches!(
+            validator.validate(&partial, &expectation()),
+            Err(ValidationError::PlatformBlocked)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_after_fingerprint_before_spawn_is_denied_and_approved_image_runs() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let candidate = temporary.path().join("ffprobe-candidate.exe");
+        let moved = temporary.path().join("attacker-moved-approved.exe");
         let partial = temporary.path().join("input.png");
         fs::copy(
             std::env::current_exe().expect("test executable"),
             &candidate,
         )
         .expect("create candidate executable");
-        fs::write(
-            &partial,
-            b"input is not read when executable identity changes",
-        )
-        .expect("input file");
+        fs::write(&partial, b"input bytes").expect("input file");
         let validator =
             FfprobeOutputValidator::new(&candidate, "file,pipe").expect("approved candidate");
+        let hook_entered = Arc::new(AtomicBool::new(false));
+        let replacement_succeeded = Arc::new(AtomicBool::new(false));
+        let hook_entered_from_hook = hook_entered.clone();
+        let replacement_succeeded_from_hook = replacement_succeeded.clone();
+        let moved_from_hook = moved.clone();
+        BEFORE_FFPROBE_SPAWN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |verified_path| {
+                hook_entered_from_hook.store(true, Ordering::Release);
+                replacement_succeeded_from_hook.store(
+                    fs::rename(verified_path, &moved_from_hook).is_ok(),
+                    Ordering::Release,
+                );
+            }));
+        });
 
-        fs::rename(&candidate, &original).expect("move approved candidate away");
-        fs::write(&candidate, b"replacement executable").expect("install unapproved replacement");
-
-        assert!(matches!(
-            validator.validate(&partial, &expectation()),
-            Err(ValidationError::ExecutableChanged)
-        ));
+        let result = validator.validate(&partial, &expectation());
+        assert!(hook_entered.load(Ordering::Acquire));
+        assert!(
+            !replacement_succeeded.load(Ordering::Acquire),
+            "replacement in the verify-to-spawn window must be denied by the retained handle"
+        );
+        assert!(
+            !moved.exists(),
+            "the attacker must not acquire the approved name"
+        );
+        assert!(candidate.exists(), "approved image must retain its path");
+        let approved_file = validator
+            .approved_file
+            .lock()
+            .expect("approved FFprobe file mutex");
+        assert_eq!(
+            executable_fingerprint(&approved_file).expect("retained image fingerprint"),
+            validator.fingerprint
+        );
+        assert!(
+            matches!(&result, Err(ValidationError::Ffprobe(message)) if message.starts_with("exit status")),
+            "the approved test executable should be the image that was spawned: {result:?}"
+        );
     }
 
     #[test]
