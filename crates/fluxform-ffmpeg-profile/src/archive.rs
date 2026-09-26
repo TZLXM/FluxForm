@@ -1,44 +1,29 @@
-use super::{ArtifactRecord, ProfileError};
+use super::{ArchiveFormat, ArtifactRecord, ProfileError};
 use sha2::{Digest, Sha256};
-#[cfg(any(windows, test))]
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 #[cfg(windows)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::{Command, Stdio};
-#[cfg(windows)]
 use std::thread;
-#[cfg(windows)]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-#[cfg(any(windows, test))]
 const EOCD_SIGNATURE: u32 = 0x0605_4b50;
-#[cfg(any(windows, test))]
 const ZIP64_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
-#[cfg(any(windows, test))]
 const CENTRAL_SIGNATURE: u32 = 0x0201_4b50;
-#[cfg(any(windows, test))]
 const LOCAL_SIGNATURE: u32 = 0x0403_4b50;
-#[cfg(any(windows, test))]
 const DATA_DESCRIPTOR_SIGNATURE: u32 = 0x0807_4b50;
-#[cfg(any(windows, test))]
 const MAX_ZIP_ENTRIES: usize = 4096;
-#[cfg(any(windows, test))]
 const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
-#[cfg(any(windows, test))]
 pub(super) const MAX_ENTRY_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
-#[cfg(any(windows, test))]
 const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
-#[cfg(windows)]
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(windows)]
-const SYSTEM_TAR: &str = r"C:\Windows\System32\tar.exe";
+const SYSTEM_UNZIP: &str = "/usr/bin/unzip";
 
-#[cfg(any(windows, test))]
 #[derive(Debug, Clone)]
 pub(super) struct ZipEntry {
     pub(super) name: String,
@@ -51,7 +36,6 @@ pub(super) struct ZipEntry {
     crc32: u32,
 }
 
-#[cfg(any(windows, test))]
 #[derive(Debug)]
 struct LocalRange {
     start: u64,
@@ -81,7 +65,7 @@ impl VerifiedArchive {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 impl VerifiedArchive {
     pub(super) fn temp_root(&self) -> &Path {
         self._temp_dir.path()
@@ -113,22 +97,10 @@ pub(crate) fn extract_and_verify(
     archive_path: &Path,
 ) -> Result<VerifiedArchive, ProfileError> {
     verify_archive_identity(artifact, archive_path)?;
-    #[cfg(not(windows))]
-    {
-        let _ = (artifact, archive_path);
-        return Err(ProfileError::UnsafeArchive(
-            "the checked-in archive extractor is supported only on native Windows".to_owned(),
-        ));
-    }
-
-    #[cfg(windows)]
-    {
-        extract_and_verify_windows(artifact, archive_path)
-    }
+    extract_and_verify_native(artifact, archive_path)
 }
 
-#[cfg(windows)]
-fn extract_and_verify_windows(
+fn extract_and_verify_native(
     artifact: &ArtifactRecord,
     archive_path: &Path,
 ) -> Result<VerifiedArchive, ProfileError> {
@@ -152,12 +124,11 @@ fn extract_and_verify_windows(
     }
 
     let entries = inspect_zip_archive(&mut archive_file, artifact_size_bytes)?;
-    let ffmpeg_entry = unique_executable_entry(&entries, "ffmpeg.exe")?;
-    let ffprobe_entry = unique_executable_entry(&entries, "ffprobe.exe")?;
+    let (ffmpeg_name, ffprobe_name) = executable_names(&artifact.target_triple)?;
+    let ffmpeg_entry = unique_executable_entry(&entries, ffmpeg_name)?;
+    let ffprobe_entry = unique_executable_entry(&entries, ffprobe_name)?;
     if parent_entry(&ffmpeg_entry.name) != parent_entry(&ffprobe_entry.name) {
-        return Err(unsafe_archive(
-            "ffmpeg.exe and ffprobe.exe must be sibling entries",
-        ));
+        return Err(unsafe_archive("ffmpeg and ffprobe must be sibling entries"));
     }
     let license_entry = entries
         .iter()
@@ -166,39 +137,81 @@ fn extract_and_verify_windows(
     validate_entry_name(&artifact.license_text_path, false)?;
 
     let temp_dir = TempDir::new().map_err(|source| io_error(Path::new("system temp"), source))?;
-    extract_with_system_tar(&resolved_path, temp_dir.path())?;
+    let extracted = (|| {
+        let extractor = extractor_spec(
+            std::env::consts::OS,
+            artifact.archive_format,
+            &resolved_path,
+            temp_dir.path(),
+        )?;
+        extract_with_trusted_program(&extractor)?;
 
-    let ffmpeg_path = verified_extracted_file(temp_dir.path(), &ffmpeg_entry.name)?;
-    let ffprobe_path = verified_extracted_file(temp_dir.path(), &ffprobe_entry.name)?;
-    let license_path = verified_extracted_file(temp_dir.path(), &license_entry.name)?;
-    let (ffmpeg_sha256, ffmpeg_size_bytes) = fingerprint_verified_file(&ffmpeg_path)?;
-    let (ffprobe_sha256, ffprobe_size_bytes) = fingerprint_verified_file(&ffprobe_path)?;
-    let (license_text_sha256, license_text_size_bytes) = fingerprint_verified_file(&license_path)?;
+        let ffmpeg_path = verified_extracted_file(temp_dir.path(), &ffmpeg_entry.name)?;
+        let ffprobe_path = verified_extracted_file(temp_dir.path(), &ffprobe_entry.name)?;
+        let license_path = verified_extracted_file(temp_dir.path(), &license_entry.name)?;
+        let (ffmpeg_sha256, ffmpeg_size_bytes) = fingerprint_verified_file(&ffmpeg_path)?;
+        let (ffprobe_sha256, ffprobe_size_bytes) = fingerprint_verified_file(&ffprobe_path)?;
+        let (license_text_sha256, license_text_size_bytes) =
+            fingerprint_verified_file(&license_path)?;
 
-    verify_expected_file(
-        "ffmpeg.exe",
-        &ffmpeg_sha256,
-        ffmpeg_size_bytes,
-        &artifact.ffmpeg_sha256,
-        artifact.ffmpeg_size_bytes,
-    )?;
-    verify_expected_file(
-        "ffprobe.exe",
-        &ffprobe_sha256,
-        ffprobe_size_bytes,
-        &artifact.ffprobe_sha256,
-        artifact.ffprobe_size_bytes,
-    )?;
-    verify_expected_file(
-        "license text",
-        &license_text_sha256,
-        license_text_size_bytes,
-        &artifact.license_text_sha256,
-        artifact.license_text_size_bytes,
-    )?;
+        verify_expected_file(
+            ffmpeg_name,
+            &ffmpeg_sha256,
+            ffmpeg_size_bytes,
+            &artifact.ffmpeg_sha256,
+            artifact.ffmpeg_size_bytes,
+        )?;
+        verify_expected_file(
+            ffprobe_name,
+            &ffprobe_sha256,
+            ffprobe_size_bytes,
+            &artifact.ffprobe_sha256,
+            artifact.ffprobe_size_bytes,
+        )?;
+        verify_expected_file(
+            "license text",
+            &license_text_sha256,
+            license_text_size_bytes,
+            &artifact.license_text_sha256,
+            artifact.license_text_size_bytes,
+        )?;
+
+        Ok::<_, ProfileError>((
+            ffmpeg_path,
+            ffprobe_path,
+            ffmpeg_sha256,
+            ffmpeg_size_bytes,
+            ffprobe_sha256,
+            ffprobe_size_bytes,
+            license_text_sha256,
+            license_text_size_bytes,
+        ))
+    })();
 
     drop(archive_file);
     drop(original_archive);
+    let (
+        ffmpeg_path,
+        ffprobe_path,
+        ffmpeg_sha256,
+        ffmpeg_size_bytes,
+        ffprobe_sha256,
+        ffprobe_size_bytes,
+        license_text_sha256,
+        license_text_size_bytes,
+    ) = match extracted {
+        Ok(measurements) => measurements,
+        Err(error) => {
+            let temp_path = temp_dir.path().to_path_buf();
+            return match temp_dir.close() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(unsafe_archive(format!(
+                    "{error}; temporary archive cleanup also failed: {}",
+                    io_error(&temp_path, cleanup_error)
+                ))),
+            };
+        }
+    };
     Ok(VerifiedArchive {
         _temp_dir: temp_dir,
         ffmpeg_path,
@@ -214,7 +227,6 @@ fn extract_and_verify_windows(
     })
 }
 
-#[cfg(windows)]
 fn unique_executable_entry<'a>(
     entries: &'a [ZipEntry],
     executable_name: &str,
@@ -238,26 +250,80 @@ fn unique_executable_entry<'a>(
     Ok(entry)
 }
 
-#[cfg(windows)]
 fn parent_entry(name: &str) -> &str {
     name.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-#[cfg(windows)]
-fn extract_with_system_tar(archive_path: &Path, destination: &Path) -> Result<(), ProfileError> {
-    let extractor = Path::new(SYSTEM_TAR);
-    let metadata = fs::symlink_metadata(extractor).map_err(|source| io_error(extractor, source))?;
+fn extractor_spec(
+    os: &str,
+    archive_format: ArchiveFormat,
+    archive_path: &Path,
+    destination: &Path,
+) -> Result<ExtractorSpec, ProfileError> {
+    let (program, fixed_arguments, destination_flag) = match (os, archive_format) {
+        ("windows", ArchiveFormat::Zip32) => (
+            r"C:\Windows\System32\tar.exe",
+            vec!["-x", "-k", "-m", "-f"],
+            "-C",
+        ),
+        ("macos" | "linux", ArchiveFormat::Zip32) => (SYSTEM_UNZIP, vec!["-qq", "-o"], "-d"),
+        _ => {
+            return Err(unsafe_archive(format!(
+                "no trusted extractor is configured for {archive_format:?} on {os}"
+            )));
+        }
+    };
+    let mut arguments = fixed_arguments
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    arguments.push(archive_path.as_os_str().to_owned());
+    arguments.push(OsString::from(destination_flag));
+    arguments.push(destination.as_os_str().to_owned());
+    Ok(ExtractorSpec {
+        program: PathBuf::from(program),
+        arguments,
+    })
+}
+
+#[derive(Debug)]
+struct ExtractorSpec {
+    program: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+fn executable_names(target_triple: &str) -> Result<(&'static str, &'static str), ProfileError> {
+    if target_triple.contains("-windows-") {
+        Ok(("ffmpeg.exe", "ffprobe.exe"))
+    } else if target_triple.contains("-apple-darwin") || target_triple.contains("-linux-") {
+        Ok(("ffmpeg", "ffprobe"))
+    } else {
+        Err(unsafe_archive(format!(
+            "native archive executable names are unsupported for target {target_triple}"
+        )))
+    }
+}
+
+fn extract_with_trusted_program(spec: &ExtractorSpec) -> Result<(), ProfileError> {
+    let extractor = &spec.program;
+    let metadata = fs::symlink_metadata(extractor).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            unsafe_archive(format!(
+                "trusted extractor is unavailable at {}",
+                extractor.display()
+            ))
+        } else {
+            io_error(extractor, source)
+        }
+    })?;
     if !metadata.is_file() || is_reparse_point(&metadata) {
         return Err(unsafe_archive(
-            "trusted Windows tar extractor is unavailable",
+            "trusted archive extractor is not a regular file",
         ));
     }
 
     let mut child = Command::new(extractor)
-        .args(["-x", "-k", "-m", "-f"])
-        .arg(archive_path)
-        .arg("-C")
-        .arg(destination)
+        .args(&spec.arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -271,7 +337,7 @@ fn extract_with_system_tar(archive_path: &Path, destination: &Path) -> Result<()
         {
             if !status.success() {
                 return Err(unsafe_archive(format!(
-                    "trusted Windows tar extractor exited with {status}"
+                    "trusted archive extractor exited with {status}"
                 )));
             }
             return Ok(());
@@ -285,7 +351,6 @@ fn extract_with_system_tar(archive_path: &Path, destination: &Path) -> Result<()
     }
 }
 
-#[cfg(windows)]
 fn verified_extracted_file(root: &Path, relative_name: &str) -> Result<PathBuf, ProfileError> {
     validate_entry_name(relative_name, false)?;
     let mut candidate = root.to_path_buf();
@@ -318,7 +383,6 @@ fn verified_extracted_file(root: &Path, relative_name: &str) -> Result<PathBuf, 
     Ok(candidate)
 }
 
-#[cfg(windows)]
 fn fingerprint_verified_file(path: &Path) -> Result<(String, u64), ProfileError> {
     let mut file = open_regular_file_without_reparse(path)?;
     let metadata = file.metadata().map_err(|source| io_error(path, source))?;
@@ -392,7 +456,6 @@ fn fingerprint_handle(file: &mut File) -> Result<(String, u64), ProfileError> {
     Ok((format!("{:x}", hasher.finalize()), bytes_read))
 }
 
-#[cfg(windows)]
 fn verify_expected_file(
     name: &str,
     observed_sha256: &str,
@@ -410,7 +473,7 @@ fn verify_expected_file(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 pub(super) fn inspect_zip_archive<R: Read + Seek>(
     archive: &mut R,
     archive_size: u64,
@@ -627,7 +690,7 @@ pub(super) fn inspect_zip_archive<R: Read + Seek>(
     Ok(entries)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn inspect_local_header<R: Read + Seek>(
     archive: &mut R,
     entry: &ZipEntry,
@@ -696,7 +759,7 @@ fn inspect_local_header<R: Read + Seek>(
     Ok(end)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn inspect_data_descriptor<R: Read + Seek>(
     archive: &mut R,
     offset: u64,
@@ -727,7 +790,7 @@ fn inspect_data_descriptor<R: Read + Seek>(
     Ok(descriptor_end)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn inspect_extra_fields(extra: &[u8]) -> Result<(), ProfileError> {
     let mut cursor = 0_usize;
     while cursor < extra.len() {
@@ -753,7 +816,7 @@ fn inspect_extra_fields(extra: &[u8]) -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn validate_entry_name(name: &str, is_directory: bool) -> Result<String, ProfileError> {
     if name.is_empty() || name.len() > 180 || !name.is_ascii() {
         return Err(unsafe_archive(
@@ -809,7 +872,7 @@ fn validate_entry_name(name: &str, is_directory: bool) -> Result<String, Profile
     Ok(name.to_owned())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn validate_path_prefixes(entries: &[ZipEntry]) -> Result<(), ProfileError> {
     let mut files = BTreeSet::new();
     for entry in entries {
@@ -833,7 +896,7 @@ fn validate_path_prefixes(entries: &[ZipEntry]) -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn read_region<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -856,24 +919,24 @@ fn read_region<R: Read + Seek>(
     Ok(bytes)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let value = bytes.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_le_bytes([value[0], value[1]]))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let value = bytes.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn required_u16(bytes: &[u8], offset: usize, label: &str) -> Result<u16, ProfileError> {
     read_u16(bytes, offset).ok_or_else(|| unsafe_archive(format!("truncated {label}")))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(unix, windows, test))]
 fn required_u32(bytes: &[u8], offset: usize, label: &str) -> Result<u32, ProfileError> {
     read_u32(bytes, offset).ok_or_else(|| unsafe_archive(format!("truncated {label}")))
 }
@@ -886,5 +949,93 @@ fn io_error(path: &Path, source: io::Error) -> ProfileError {
     ProfileError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod extractor_spec_tests {
+    use super::{ArchiveFormat, extractor_spec};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn declared_zip32_format_has_fixed_native_extractors_and_argument_vectors() {
+        let cases = [
+            (
+                "windows",
+                r"C:\Windows\System32\tar.exe",
+                vec![
+                    "-x",
+                    "-k",
+                    "-m",
+                    "-f",
+                    r"C:\stage\candidate archive.zip",
+                    "-C",
+                    r"C:\stage\extracted",
+                ],
+            ),
+            (
+                "macos",
+                "/usr/bin/unzip",
+                vec![
+                    "-qq",
+                    "-o",
+                    "/stage/candidate archive.zip",
+                    "-d",
+                    "/stage/extracted",
+                ],
+            ),
+            (
+                "linux",
+                "/usr/bin/unzip",
+                vec![
+                    "-qq",
+                    "-o",
+                    "/stage/candidate archive.zip",
+                    "-d",
+                    "/stage/extracted",
+                ],
+            ),
+        ];
+
+        for (os, expected_program, expected_arguments) in cases {
+            let (archive, destination) = if os == "windows" {
+                (
+                    PathBuf::from(r"C:\stage\candidate archive.zip"),
+                    PathBuf::from(r"C:\stage\extracted"),
+                )
+            } else {
+                (
+                    PathBuf::from("/stage/candidate archive.zip"),
+                    PathBuf::from("/stage/extracted"),
+                )
+            };
+            let spec = extractor_spec(os, ArchiveFormat::Zip32, &archive, &destination)
+                .expect("required native extractor");
+
+            assert_eq!(spec.program, PathBuf::from(expected_program));
+            let program_text = spec.program.to_string_lossy();
+            assert!(program_text.starts_with('/') || program_text.as_bytes().get(1) == Some(&b':'));
+            assert_eq!(
+                spec.arguments,
+                expected_arguments
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_extractor_platform_fails_closed() {
+        assert!(
+            extractor_spec(
+                "freebsd",
+                ArchiveFormat::Zip32,
+                Path::new("a.zip"),
+                Path::new("out")
+            )
+            .is_err()
+        );
     }
 }

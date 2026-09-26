@@ -28,6 +28,7 @@ codec = "h264"
 artifact_id = "windows-x86_64-gyan-8.1.1-essentials"
 status = "candidate"
 target_triple = "x86_64-pc-windows-msvc"
+archive_format = "zip32"
 artifact_uri = "local:tools-cache/ffmpeg-release-essentials.zip@sha256:47b1cc6e4ff1a8b1a661799f22e70bfb48ba16b3dffa04ff0871683ea5d20d73"
 artifact_sha256 = "47b1cc6e4ff1a8b1a661799f22e70bfb48ba16b3dffa04ff0871683ea5d20d73"
 artifact_size_bytes = 109982658

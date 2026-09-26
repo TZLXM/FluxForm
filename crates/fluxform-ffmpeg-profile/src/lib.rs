@@ -111,12 +111,19 @@ pub enum ArtifactStatus {
     Approved,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveFormat {
+    Zip32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRecord {
     artifact_id: String,
     status: ArtifactStatus,
     target_triple: String,
+    archive_format: ArchiveFormat,
     artifact_uri: String,
     artifact_sha256: String,
     artifact_size_bytes: u64,
@@ -222,6 +229,7 @@ pub struct ProbeReport {
     pub distribution_gate_status: String,
     pub artifact_id: String,
     pub artifact_status: ArtifactStatus,
+    pub archive_format: ArchiveFormat,
     pub artifact_uri: String,
     pub artifact_sha256: String,
     pub artifact_size_bytes: u64,
@@ -233,6 +241,7 @@ pub struct ProbeReport {
     pub version: String,
     pub ffprobe_version: String,
     pub source_revision: String,
+    pub source_offer_url: String,
     pub source_revision_reported_by_binary: Option<String>,
     pub build_configuration: String,
     pub license_declaration: String,
@@ -524,6 +533,7 @@ impl ProbeReport {
             || self.distribution_gate_status != gate_status
             || self.artifact_id != artifact.artifact_id
             || self.artifact_status != artifact.status
+            || self.archive_format != artifact.archive_format
             || self.target_triple != artifact.target_triple
             || self.artifact_uri != artifact.artifact_uri
             || self.artifact_sha256 != artifact.artifact_sha256
@@ -533,6 +543,7 @@ impl ProbeReport {
             || self.ffprobe_sha256 != artifact.ffprobe_sha256
             || self.ffprobe_size_bytes != artifact.ffprobe_size_bytes
             || self.source_revision != artifact.source_revision
+            || self.source_offer_url != artifact.source_offer_url
             || self
                 .source_revision_reported_by_binary
                 .as_deref()
@@ -584,6 +595,7 @@ impl ProbeReport {
             distribution_gate_status: "blocked".to_owned(),
             artifact_id: String::new(),
             artifact_status: ArtifactStatus::Candidate,
+            archive_format: ArchiveFormat::Zip32,
             artifact_uri: String::new(),
             artifact_sha256: String::new(),
             artifact_size_bytes: 0,
@@ -595,6 +607,7 @@ impl ProbeReport {
             version: ffmpeg_info.version,
             ffprobe_version: ffprobe_info.version,
             source_revision: String::new(),
+            source_offer_url: String::new(),
             source_revision_reported_by_binary: ffmpeg_info
                 .source_revision
                 .or(ffprobe_info.source_revision),
@@ -622,9 +635,11 @@ impl ProbeReport {
         };
         self.artifact_id = artifact.artifact_id.clone();
         self.artifact_status = artifact.status;
+        self.archive_format = artifact.archive_format;
         self.artifact_uri = artifact.artifact_uri.clone();
         self.target_triple = artifact.target_triple.clone();
         self.source_revision = artifact.source_revision.clone();
+        self.source_offer_url = artifact.source_offer_url.clone();
         self.license_declaration = profile.document.license_declaration.clone();
         self.license_text_path = artifact.license_text_path.clone();
         self.approval_record_id = artifact.approval_record_id.clone();
@@ -1180,7 +1195,7 @@ mod zip_inventory_tests {
         inspect_zip_archive(&mut Cursor::new(bytes), bytes.len() as u64)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn test_artifact(
         bytes: &[u8],
         ffmpeg: &[u8],
@@ -1191,6 +1206,7 @@ mod zip_inventory_tests {
             artifact_id: "test-windows-candidate".to_owned(),
             status: ArtifactStatus::Candidate,
             target_triple: current_target_triple(),
+            archive_format: ArchiveFormat::Zip32,
             artifact_uri: "https://artifacts.example.invalid/test.zip".to_owned(),
             artifact_sha256: hex_digest(bytes),
             artifact_size_bytes: bytes.len() as u64,
@@ -1209,14 +1225,15 @@ mod zip_inventory_tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn small_candidate_zip(ffmpeg: &[u8], ffprobe: &[u8], license: &[u8]) -> Vec<u8> {
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
         test_zip(
             &[
                 TestEntry::directory("bundle/"),
                 TestEntry::directory("bundle/bin/"),
-                TestEntry::with_payload("bundle/bin/ffmpeg.exe", ffmpeg),
-                TestEntry::with_payload("bundle/bin/ffprobe.exe", ffprobe),
+                TestEntry::with_payload(&format!("bundle/bin/ffmpeg{suffix}"), ffmpeg),
+                TestEntry::with_payload(&format!("bundle/bin/ffprobe{suffix}"), ffprobe),
                 TestEntry::with_payload("bundle/LICENSE.txt", license),
             ],
             0,
@@ -1237,7 +1254,7 @@ mod zip_inventory_tests {
         assert_eq!(entries[1].name, "bundle/bin/ffmpeg.exe");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn verified_extraction_measures_archive_executables_and_license_then_cleans_temp() {
         let ffmpeg = b"non-executable ffmpeg fixture";
@@ -1269,7 +1286,7 @@ mod zip_inventory_tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn extracted_executable_or_license_mismatch_fails_before_probe_invocation() {
         let ffmpeg = b"non-executable ffmpeg fixture";
@@ -1285,7 +1302,16 @@ mod zip_inventory_tests {
         let error = archive::extract_and_verify(&wrong_ffmpeg, &archive_path)
             .err()
             .expect("unverified executable must not be returned for probing");
-        assert!(error.to_string().contains("ffmpeg.exe identity mismatch"));
+        let executable_name = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{executable_name} identity mismatch"))
+        );
 
         let mut wrong_license = test_artifact(&bytes, ffmpeg, ffprobe, license);
         wrong_license.license_text_sha256 = hex_digest(b"substituted license");

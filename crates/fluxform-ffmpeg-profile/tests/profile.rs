@@ -51,6 +51,7 @@ codec = "h264"
 artifact_id = "windows-x86_64-8.1.1"
 status = "approved"
 target_triple = "x86_64-pc-windows-msvc"
+archive_format = "zip32"
 artifact_uri = "https://artifacts.example.invalid/ffmpeg.zip"
 artifact_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 artifact_size_bytes = 1024
@@ -238,6 +239,7 @@ fn rejects_distribution_records_with_mandatory_identity_fields_omitted() {
         "ffprobe_sha256 = ",
         "ffprobe_size_bytes = ",
         "target_triple = ",
+        "archive_format = ",
         "artifact_uri = ",
         "license_text_path = ",
         "license_text_sha256 = ",
@@ -314,6 +316,9 @@ fn exact_approved_identity_is_required() {
     });
     assert_identity_mutation_is_rejected(&report, &approved, "artifact_uri", |r| {
         r.artifact_uri = "https://artifacts.example.invalid/other.zip".to_owned();
+    });
+    assert_identity_mutation_is_rejected(&report, &approved, "source_offer_url", |r| {
+        r.source_offer_url = "https://artifacts.example.invalid/different-source".to_owned();
     });
     assert_identity_mutation_is_rejected(&report, &approved, "artifact_sha256", |r| {
         r.artifact_sha256 = "f".repeat(64);
