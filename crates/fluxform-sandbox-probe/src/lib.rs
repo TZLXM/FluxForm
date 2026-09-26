@@ -97,11 +97,26 @@ pub enum NetworkSocketDomain {
     Packet,
 }
 
-/// Declarative socket policy consumed by the Linux seccomp filter.
+/// A syscall denied after sandbox setup by the Linux seccomp filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkSyscall {
+    Connect,
+    SocketPair,
+    Bpf,
+    Userfaultfd,
+}
+
+/// Declarative socket and syscall policy consumed by the Linux seccomp filter.
+///
+/// AF_UNIX socket creation is retained for local-only consumers, but `connect`
+/// is denied for every address family after setup. Task 8 has no network
+/// exception for media tools.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NetworkPolicy {
     pub allowed_socket_domains: [NetworkSocketDomain; 1],
     pub denied_socket_domains: [NetworkSocketDomain; 3],
+    pub denied_syscalls: [NetworkSyscall; 4],
 }
 
 impl Default for NetworkPolicy {
@@ -112,6 +127,12 @@ impl Default for NetworkPolicy {
                 NetworkSocketDomain::Ipv4,
                 NetworkSocketDomain::Ipv6,
                 NetworkSocketDomain::Packet,
+            ],
+            denied_syscalls: [
+                NetworkSyscall::Connect,
+                NetworkSyscall::SocketPair,
+                NetworkSyscall::Bpf,
+                NetworkSyscall::Userfaultfd,
             ],
         }
     }
@@ -133,6 +154,10 @@ pub struct NetworkEvidence {
     pub ipv4_listener_isolated: ProbeEvidence,
     pub ipv6_listener_isolated: ProbeEvidence,
     pub unix_socket_escape: ProbeEvidence,
+    pub connect_denial: ProbeEvidence,
+    pub socketpair_denial: ProbeEvidence,
+    pub bpf_denial: ProbeEvidence,
+    pub userfaultfd_denial: ProbeEvidence,
     pub namespace_creation_denied: ProbeEvidence,
 }
 
@@ -146,6 +171,10 @@ impl NetworkEvidence {
             &self.ipv4_listener_isolated,
             &self.ipv6_listener_isolated,
             &self.unix_socket_escape,
+            &self.connect_denial,
+            &self.socketpair_denial,
+            &self.bpf_denial,
+            &self.userfaultfd_denial,
             &self.namespace_creation_denied,
         ]
         .into_iter()
@@ -270,6 +299,21 @@ pub enum SandboxError {
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn network_namespace_is_private(host: FileIdentity, reported: Option<FileIdentity>) -> bool {
+    host.device != 0
+        && host.inode != 0
+        && reported.is_some_and(|candidate| {
+            candidate.device != 0 && candidate.inode != 0 && candidate != host
+        })
 }
 
 #[cfg(any(
@@ -692,10 +736,11 @@ impl Drop for SandboxChild {
 mod linux {
     use super::{
         FileIdentity, FilesystemEvidence, FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES,
-        NetworkEvidence, NetworkPolicy, NetworkPrerequisites, NetworkSocketDomain,
+        NetworkEvidence, NetworkPolicy, NetworkPrerequisites, NetworkSocketDomain, NetworkSyscall,
         PolicyPathIdentityGraph, ProbeEvidence, SandboxChild, SandboxError, SandboxLimits,
-        SandboxPolicy, SpawnPlacement, ToolEntryEvidence, ToolInventory, validate_open_files_limit,
-        validate_policy_path_identities, validate_tool_inventory,
+        SandboxPolicy, SpawnPlacement, ToolEntryEvidence, ToolInventory,
+        network_namespace_is_private, validate_open_files_limit, validate_policy_path_identities,
+        validate_tool_inventory,
     };
     use std::collections::{BTreeMap, HashSet};
     use std::ffi::CString;
@@ -710,7 +755,7 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const MSG_READY: u32 = 1;
     const MSG_ERROR: u32 = 2;
@@ -754,11 +799,13 @@ mod linux {
     const STAGE_NETWORK_SOCKET: i32 = 31;
     const STAGE_NETWORK_UNIX_SOCKET: i32 = 32;
     const STAGE_NETWORK_ESCAPE: i32 = 33;
+    const STAGE_NETWORK_SYSCALL: i32 = 34;
     const CLONE_INTO_CGROUP: u64 = 1 << 33;
     const SECCOMP_DATA_NR_OFFSET: u32 = 0;
     const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
     const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
     const CAP_VERSION_3: u32 = 0x2008_0522;
+    const ACTIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -769,6 +816,8 @@ mod linux {
         operation: i32,
         errno: i32,
         pid: i32,
+        network_namespace_device: u64,
+        network_namespace_inode: u64,
     }
 
     #[repr(C)]
@@ -920,6 +969,7 @@ mod linux {
         argv: Vec<usize>,
         envp: [usize; 1],
         seccomp: Vec<libc::sock_filter>,
+        host_network_namespace: FileIdentity,
     }
 
     struct PinnedPath {
@@ -1178,6 +1228,62 @@ mod linux {
             ),
             (_, None) => ProbeEvidence::failed("could not bind controlled host Unix socket"),
         };
+        let connect_denial = probe_root.as_ref().map_or_else(
+            || ProbeEvidence::failed("connect probe could not run: private probe root unavailable"),
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkConnect,
+                    host_uid,
+                    host_gid,
+                    "AF_UNIX socket creation remained allowed while connect returned the seccomp denial",
+                )
+            },
+        );
+        let socketpair_denial = probe_root.as_ref().map_or_else(
+            || {
+                ProbeEvidence::failed(
+                    "socketpair probe could not run: private probe root unavailable",
+                )
+            },
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkSocketPair,
+                    host_uid,
+                    host_gid,
+                    "socketpair returned the network seccomp denial",
+                )
+            },
+        );
+        let bpf_denial = probe_root.as_ref().map_or_else(
+            || ProbeEvidence::failed("bpf probe could not run: private probe root unavailable"),
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkBpf,
+                    host_uid,
+                    host_gid,
+                    "bpf returned the network seccomp denial",
+                )
+            },
+        );
+        let userfaultfd_denial = probe_root.as_ref().map_or_else(
+            || {
+                ProbeEvidence::failed(
+                    "userfaultfd probe could not run: private probe root unavailable",
+                )
+            },
+            |root| {
+                network_probe(
+                    root,
+                    ProbeKind::NetworkUserfaultfd,
+                    host_uid,
+                    host_gid,
+                    "userfaultfd returned the network seccomp denial",
+                )
+            },
+        );
         let namespace_creation_denied = probe_root.as_ref().map_or_else(
             || {
                 ProbeEvidence::failed(
@@ -1203,6 +1309,10 @@ mod linux {
             ipv4_listener_isolated,
             ipv6_listener_isolated,
             unix_socket_escape,
+            connect_denial,
+            socketpair_denial,
+            bpf_denial,
+            userfaultfd_denial,
             namespace_creation_denied,
         };
         if evidence.all_passed() {
@@ -1268,6 +1378,10 @@ mod linux {
         NetworkNamespaceCreated,
         NetworkPacket,
         NetworkUnixEscape,
+        NetworkConnect,
+        NetworkSocketPair,
+        NetworkBpf,
+        NetworkUserfaultfd,
         NetworkNamespaceEscape,
     }
 
@@ -1305,15 +1419,24 @@ mod linux {
 
         unsafe { libc::close(pipe[1]) };
         let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let deadline = Instant::now() + ACTIVE_PROBE_TIMEOUT;
         let mut result = ProbeResult {
             operation: STAGE_FORK,
             errno: libc::ECHILD,
         };
-        if let Err(error) = read_struct(&mut reader, &mut result) {
+        if let Err(error) =
+            read_struct_until(reader.as_raw_fd(), &mut reader, &mut result, deadline)
+        {
             abort_probe(pid);
             return Err(error);
         }
-        let status = reap_probe(pid)?;
+        let status = match reap_probe_until(pid, deadline) {
+            Ok(status) => status,
+            Err(error) => {
+                abort_probe(pid);
+                return Err(error);
+            }
+        };
         if !libc::WIFEXITED(status)
             || (result.operation == PROBE_OK && libc::WEXITSTATUS(status) != 0)
         {
@@ -1393,15 +1516,19 @@ mod linux {
             libc::close(sentinel);
         }
         let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let deadline = Instant::now() + ACTIVE_PROBE_TIMEOUT;
         let mut result = ProbeResult {
             operation: STAGE_FD_CLOSE,
             errno: libc::ECHILD,
         };
-        if let Err(error) = read_struct(&mut reader, &mut result) {
+        if let Err(error) =
+            read_struct_until(reader.as_raw_fd(), &mut reader, &mut result, deadline)
+        {
             abort_probe(pid);
             return ProbeEvidence::failed(format!("descriptor-closure probe failed: {error}"));
         }
-        if let Err(error) = reap_probe(pid) {
+        if let Err(error) = reap_probe_until(pid, deadline) {
+            abort_probe(pid);
             return ProbeEvidence::failed(format!(
                 "could not reap descriptor-closure probe: {error}"
             ));
@@ -1427,6 +1554,38 @@ mod linux {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
+            }
+        }
+    }
+
+    fn reap_probe_until(pid: libc::pid_t, deadline: Instant) -> io::Result<i32> {
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if result == pid {
+                return Ok(status);
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "active probe exit deadline expired",
+                ));
+            }
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let waited = unsafe { libc::poll(std::ptr::null_mut(), 0, timeout_ms) };
+            if waited < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         }
     }
@@ -1564,6 +1723,10 @@ mod linux {
             | ProbeKind::NetworkNamespaceCreated
             | ProbeKind::NetworkPacket
             | ProbeKind::NetworkUnixEscape
+            | ProbeKind::NetworkConnect
+            | ProbeKind::NetworkSocketPair
+            | ProbeKind::NetworkBpf
+            | ProbeKind::NetworkUserfaultfd
             | ProbeKind::NetworkNamespaceEscape => {
                 run_network_probe_child(kind, scratch, uid_map, gid_map, report_fd)
             }
@@ -1649,6 +1812,14 @@ mod linux {
         if drop_capabilities() != 0 {
             return failed(STAGE_CAP_DROP);
         }
+        if matches!(kind, ProbeKind::NetworkUnixEscape) {
+            let mut path = scratch.to_bytes().to_vec();
+            path.extend_from_slice(b"/outside.sock");
+            return match CString::new(path) {
+                Ok(path) => probe_unix_socket_is_outside_root(&path),
+                Err(_) => failed_with_errno(STAGE_NETWORK_UNIX_SOCKET, libc::EINVAL),
+            };
+        }
         if install_seccomp(&build_sandbox_filter()) != 0 {
             return failed(STAGE_SECCOMP);
         }
@@ -1658,14 +1829,11 @@ mod linux {
             ProbeKind::NetworkIpv6(port) => probe_ipv6_socket_denial(port),
             ProbeKind::NetworkNamespaceCreated => success(),
             ProbeKind::NetworkPacket => probe_packet_socket_denial(),
-            ProbeKind::NetworkUnixEscape => {
-                let mut path = scratch.to_bytes().to_vec();
-                path.extend_from_slice(b"/outside.sock");
-                match CString::new(path) {
-                    Ok(path) => probe_unix_socket_is_outside_root(&path),
-                    Err(_) => failed_with_errno(STAGE_NETWORK_UNIX_SOCKET, libc::EINVAL),
-                }
-            }
+            ProbeKind::NetworkUnixEscape => unreachable!(),
+            ProbeKind::NetworkConnect => probe_connect_denial(),
+            ProbeKind::NetworkSocketPair => probe_socketpair_denial(),
+            ProbeKind::NetworkBpf => probe_bpf_denial(),
+            ProbeKind::NetworkUserfaultfd => probe_userfaultfd_denial(),
             ProbeKind::NetworkNamespaceEscape => probe_namespace_creation_denial(),
             _ => failed_with_errno(STAGE_NETWORK_ESCAPE, libc::EINVAL),
         }
@@ -1762,6 +1930,83 @@ mod linux {
             libc::close(socket);
         }
         failed(STAGE_NETWORK_SOCKET)
+    }
+
+    unsafe fn probe_connect_denial() -> ProbeResult {
+        let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return failed(STAGE_NETWORK_SYSCALL);
+        }
+        let mut address: libc::sockaddr_un = zeroed();
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let abstract_name = b"fluxform-connect-denial";
+        for (target, source) in address.sun_path[1..1 + abstract_name.len()]
+            .iter_mut()
+            .zip(abstract_name)
+        {
+            *target = *source as libc::c_char;
+        }
+        let address_len =
+            (size_of::<libc::sa_family_t>() + 1 + abstract_name.len()) as libc::socklen_t;
+        let connected = libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_un).cast(),
+            address_len,
+        );
+        let connect_errno = errno();
+        libc::close(socket);
+        if connected < 0 && connect_errno == libc::EACCES {
+            success()
+        } else {
+            failed_with_errno(
+                STAGE_NETWORK_SYSCALL,
+                if connected == 0 { 0 } else { connect_errno },
+            )
+        }
+    }
+
+    unsafe fn probe_socketpair_denial() -> ProbeResult {
+        let mut pair = [-1; 2];
+        let result = libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        );
+        if result < 0 && errno() == libc::EACCES {
+            return success();
+        }
+        if result == 0 {
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+        }
+        failed(STAGE_NETWORK_SYSCALL)
+    }
+
+    unsafe fn probe_bpf_denial() -> ProbeResult {
+        let result = libc::syscall(
+            libc::SYS_bpf,
+            0_u32,
+            std::ptr::null_mut::<libc::c_void>(),
+            0_u32,
+        );
+        if result < 0 && errno() == libc::EACCES {
+            success()
+        } else {
+            failed(STAGE_NETWORK_SYSCALL)
+        }
+    }
+
+    unsafe fn probe_userfaultfd_denial() -> ProbeResult {
+        let result = libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK);
+        if result < 0 && errno() == libc::EACCES {
+            success()
+        } else {
+            if result >= 0 {
+                libc::close(result as RawFd);
+            }
+            failed(STAGE_NETWORK_SYSCALL)
+        }
     }
 
     unsafe fn probe_unix_socket_is_outside_root(path: &CString) -> ProbeResult {
@@ -2005,6 +2250,20 @@ mod linux {
         .map_err(|reason| SandboxError::InvalidPolicy(reason.into()))?;
         FilesystemPrerequisites::inspect()?;
         NetworkPrerequisites::inspect()?;
+        let host_network_namespace =
+            network_namespace_identity().map_err(|source| SandboxError::Io {
+                operation: "capture host network namespace identity",
+                source,
+            })?;
+        if host_network_namespace.device == 0 || host_network_namespace.inode == 0 {
+            return Err(SandboxError::Io {
+                operation: "validate host network namespace identity",
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "host network namespace identity was incomplete",
+                ),
+            });
+        }
         let virtual_program = Path::new("/tool").join(relative_program);
         let program_c = c_path(&virtual_program)?;
         let exec_strings = prepare_exec_strings(&program_c, args)?;
@@ -2113,6 +2372,7 @@ mod linux {
             argv,
             envp: [0],
             seccomp,
+            host_network_namespace,
         };
 
         let pid = unsafe { libc::fork() };
@@ -2145,6 +2405,8 @@ mod linux {
             operation: STAGE_FORK,
             errno: libc::ECHILD,
             pid,
+            network_namespace_device: 0,
+            network_namespace_inode: 0,
         };
         if let Err(source) = read_struct(&mut report, &mut message) {
             let _ = kill_process_group(pid);
@@ -2170,6 +2432,25 @@ mod linux {
                     io::ErrorKind::InvalidData,
                     "invalid child readiness message",
                 ),
+            });
+        }
+        let reported_network_namespace = (message.network_namespace_device != 0
+            && message.network_namespace_inode != 0)
+            .then_some(FileIdentity {
+                device: message.network_namespace_device,
+                inode: message.network_namespace_inode,
+            });
+        if !network_namespace_is_private(host_network_namespace, reported_network_namespace) {
+            let error = if reported_network_namespace.is_some() {
+                libc::ESTALE
+            } else {
+                libc::EPROTO
+            };
+            let _ = kill_process_group(pid);
+            let _ = wait_for_child(pid);
+            return Err(SandboxError::ChildSetup {
+                operation: "network namespace identity attestation",
+                errno: error,
             });
         }
         Ok(SandboxChild {
@@ -2941,6 +3222,17 @@ mod linux {
         if libc::unshare(libc::CLONE_NEWNET) != 0 {
             fail_and_exit(spec.report_fd, STAGE_NETWORK_NAMESPACE, errno());
         }
+        let network_namespace = match network_namespace_identity() {
+            Ok(identity) => identity,
+            Err(error) => fail_and_exit(
+                spec.report_fd,
+                STAGE_NETWORK_NAMESPACE,
+                error.raw_os_error().unwrap_or(libc::EIO),
+            ),
+        };
+        if !network_namespace_is_private(spec.host_network_namespace, Some(network_namespace)) {
+            fail_and_exit(spec.report_fd, STAGE_NETWORK_NAMESPACE, libc::ESTALE);
+        }
         if libc::mount(
             std::ptr::null(),
             c"/".as_ptr(),
@@ -3037,6 +3329,8 @@ mod linux {
                         operation: PROBE_OK,
                         errno: 0,
                         pid,
+                        network_namespace_device: network_namespace.device,
+                        network_namespace_inode: network_namespace.inode,
                     },
                 )
                 .is_err()
@@ -3129,6 +3423,8 @@ mod linux {
                         operation: PROBE_OK,
                         errno: 0,
                         pid: libc::getpid(),
+                        network_namespace_device: network_namespace.device,
+                        network_namespace_inode: network_namespace.inode,
                     },
                 )
                 .is_err()
@@ -3289,7 +3585,7 @@ mod linux {
     }
 
     fn build_sandbox_filter() -> Vec<libc::sock_filter> {
-        let denied = [
+        let setup_denied = [
             libc::SYS_mount as u32,
             libc::SYS_umount2 as u32,
             libc::SYS_pivot_root as u32,
@@ -3312,7 +3608,11 @@ mod linux {
             + 2 * network_policy.denied_socket_domains.len()
             + 2 * network_policy.allowed_socket_domains.len()
             + 1;
-        let mut filter = Vec::with_capacity(3 + denied.len() * 2 + socket_filter_len + 5);
+        let mut filter = Vec::with_capacity(
+            3 + (setup_denied.len() + network_policy.denied_syscalls.len()) * 2
+                + socket_filter_len
+                + 5,
+        );
         filter.push(bpf_stmt(
             libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
             SECCOMP_DATA_ARCH_OFFSET,
@@ -3344,7 +3644,7 @@ mod linux {
                 libc::SECCOMP_RET_KILL_PROCESS,
             ));
         }
-        for syscall_number in denied {
+        for syscall_number in setup_denied {
             filter.push(bpf_jump(
                 libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
                 syscall_number,
@@ -3354,6 +3654,18 @@ mod linux {
             filter.push(bpf_stmt(
                 libc::BPF_RET | libc::BPF_K,
                 libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ));
+        }
+        for syscall in network_policy.denied_syscalls {
+            filter.push(bpf_jump(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                network_syscall_number(syscall),
+                0,
+                1,
+            ));
+            filter.push(bpf_stmt(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
             ));
         }
         filter.push(bpf_jump(
@@ -3427,6 +3739,15 @@ mod linux {
             NetworkSocketDomain::Ipv4 => libc::AF_INET as u32,
             NetworkSocketDomain::Ipv6 => libc::AF_INET6 as u32,
             NetworkSocketDomain::Packet => libc::AF_PACKET as u32,
+        }
+    }
+
+    fn network_syscall_number(syscall: NetworkSyscall) -> u32 {
+        match syscall {
+            NetworkSyscall::Connect => libc::SYS_connect as u32,
+            NetworkSyscall::SocketPair => libc::SYS_socketpair as u32,
+            NetworkSyscall::Bpf => libc::SYS_bpf as u32,
+            NetworkSyscall::Userfaultfd => libc::SYS_userfaultfd as u32,
         }
     }
 
@@ -3555,6 +3876,64 @@ mod linux {
         Ok(())
     }
 
+    fn read_struct_until<T: Copy>(
+        fd: RawFd,
+        reader: &mut std::fs::File,
+        value: &mut T,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let mut bytes = unsafe {
+            std::slice::from_raw_parts_mut((value as *mut T).cast::<u8>(), size_of::<T>())
+        };
+        while !bytes.is_empty() {
+            poll_readable_until(fd, deadline)?;
+            match std::io::Read::read(reader, bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "report pipe closed",
+                    ));
+                }
+                Ok(count) => bytes = &mut bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_readable_until(fd: RawFd, deadline: Instant) -> io::Result<()> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "active probe report deadline expired",
+                ));
+            }
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if ready > 0
+                && descriptor.revents
+                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                    != 0
+            {
+                return Ok(());
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     unsafe fn send_message(fd: RawFd, message: Message) -> io::Result<()> {
         write_struct(fd, &message)
     }
@@ -3608,6 +3987,8 @@ mod linux {
                 operation,
                 errno: error,
                 pid: libc::getpid(),
+                network_namespace_device: 0,
+                network_namespace_inode: 0,
             },
         )
         .is_err()
@@ -3648,6 +4029,7 @@ mod linux {
             STAGE_SECCOMP => "filesystem and network seccomp policy",
             STAGE_NETWORK_NAMESPACE => "private network namespace creation",
             STAGE_NETWORK_SOCKET => "network socket seccomp policy",
+            STAGE_NETWORK_SYSCALL => "network escape syscall policy",
             STAGE_NETWORK_UNIX_SOCKET => "Unix socket host-path isolation",
             STAGE_NETWORK_ESCAPE => "network namespace escape denial",
             STAGE_TASK_CWD => "task-directory working directory",
@@ -3734,6 +4116,129 @@ mod linux {
         use super::*;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn stalled_active_probe_report_read_is_bounded_and_child_is_reaped() {
+            let mut pipe = [0; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork stalled probe child");
+            if pid == 0 {
+                unsafe {
+                    libc::close(pipe[0]);
+                    loop {
+                        libc::pause();
+                    }
+                }
+            }
+
+            unsafe { libc::close(pipe[1]) };
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+            let mut result = ProbeResult {
+                operation: STAGE_FORK,
+                errno: libc::ECHILD,
+            };
+            let fd = reader.as_raw_fd();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let outcome = read_struct_until(
+                    fd,
+                    &mut reader,
+                    &mut result,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .map(|()| result);
+                let _ = sender.send(outcome);
+            });
+            let timed_out = match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(error)) => error.kind() == io::ErrorKind::TimedOut,
+                Ok(Ok(_)) => false,
+                Err(_) => {
+                    abort_probe(pid);
+                    let _ = receiver.recv_timeout(Duration::from_secs(5));
+                    let _ = worker.join();
+                    assert_probe_child_reaped(pid);
+                    panic!("report read exceeded the parent-side watchdog");
+                }
+            };
+            worker.join().expect("join bounded report reader");
+
+            abort_probe(pid);
+            assert_probe_child_reaped(pid);
+            assert!(timed_out, "a probe child which never reports must time out");
+        }
+
+        #[test]
+        fn stalled_active_probe_exit_wait_is_bounded_and_child_is_reaped() {
+            let mut pipe = [0; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork stalled probe child");
+            if pid == 0 {
+                unsafe {
+                    libc::close(pipe[0]);
+                    let result = ProbeResult {
+                        operation: PROBE_OK,
+                        errno: 0,
+                    };
+                    let bytes = std::slice::from_raw_parts(
+                        (&result as *const ProbeResult).cast::<u8>(),
+                        size_of::<ProbeResult>(),
+                    );
+                    libc::write(pipe[1], bytes.as_ptr().cast(), bytes.len());
+                    loop {
+                        libc::pause();
+                    }
+                }
+            }
+
+            unsafe { libc::close(pipe[1]) };
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+            let mut result = ProbeResult {
+                operation: STAGE_FORK,
+                errno: libc::ECHILD,
+            };
+            let deadline = Instant::now() + Duration::from_millis(100);
+            read_struct_until(reader.as_raw_fd(), &mut reader, &mut result, deadline)
+                .expect("read the completed probe report");
+            assert_eq!(result.operation, PROBE_OK);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = sender.send(reap_probe_until(pid, deadline));
+            });
+            let timed_out = match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(error)) => error.kind() == io::ErrorKind::TimedOut,
+                Ok(Ok(_)) => false,
+                Err(_) => {
+                    abort_probe(pid);
+                    let _ = receiver.recv_timeout(Duration::from_secs(5));
+                    let _ = worker.join();
+                    assert_probe_child_reaped(pid);
+                    panic!("probe exit wait exceeded the parent-side watchdog");
+                }
+            };
+            worker.join().expect("join bounded probe waiter");
+
+            abort_probe(pid);
+            assert_probe_child_reaped(pid);
+            assert!(timed_out, "a probe child which does not exit must time out");
+        }
+
+        fn assert_probe_child_reaped(pid: libc::pid_t) {
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(errno(), libc::ECHILD);
+        }
 
         #[test]
         fn tool_entry_replacement_between_prepare_and_bind_fails_closed() {
@@ -4239,6 +4744,10 @@ mod review_regression_tests {
                 ipv4_listener_isolated: item.clone(),
                 ipv6_listener_isolated: item.clone(),
                 unix_socket_escape: item.clone(),
+                connect_denial: item.clone(),
+                socketpair_denial: item.clone(),
+                bpf_denial: item.clone(),
+                userfaultfd_denial: item.clone(),
                 namespace_creation_denied: item,
             }
         };
@@ -4256,13 +4765,17 @@ mod review_regression_tests {
                 "ipv4_listener_isolated": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
                 "ipv6_listener_isolated": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
                 "unix_socket_escape": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "connect_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "socketpair_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "bpf_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
+                "userfaultfd_denial": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" },
                 "namespace_creation_denied": { "status": "failed", "detail": "synthetic serialization fixture; no OS probe executed" }
             })
         );
     }
 
     #[test]
-    fn network_policy_allows_unix_and_denies_inet_and_packet_families() {
+    fn network_policy_allows_unix_socket_creation_but_denies_escape_syscalls() {
         let policy = NetworkPolicy::default();
         assert_eq!(policy.allowed_socket_domains, [NetworkSocketDomain::Unix]);
         assert_eq!(
@@ -4273,7 +4786,33 @@ mod review_regression_tests {
                 NetworkSocketDomain::Packet,
             ]
         );
+        assert_eq!(
+            policy.denied_syscalls,
+            [
+                NetworkSyscall::Connect,
+                NetworkSyscall::SocketPair,
+                NetworkSyscall::Bpf,
+                NetworkSyscall::Userfaultfd,
+            ]
+        );
         assert_eq!(FFPROBE_PROTOCOL_WHITELIST, "file,pipe");
+    }
+
+    #[test]
+    fn production_network_namespace_attestation_rejects_missing_or_host_identity() {
+        let host = FileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        assert!(!network_namespace_is_private(host, None));
+        assert!(!network_namespace_is_private(host, Some(host)));
+        assert!(network_namespace_is_private(
+            host,
+            Some(FileIdentity {
+                device: 7,
+                inode: 12,
+            })
+        ));
     }
 
     #[cfg(not(all(

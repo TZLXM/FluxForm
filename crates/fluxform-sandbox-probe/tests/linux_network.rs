@@ -5,8 +5,8 @@
 
 use fluxform_ffmpeg_profile::BuildProfile;
 use fluxform_sandbox_probe::{
-    FFPROBE_PROTOCOL_WHITELIST, NetworkPrerequisites, Sandbox, SandboxError, SandboxLimits,
-    SandboxPolicy, SpawnPlacement,
+    FFPROBE_PROTOCOL_WHITELIST, NetworkPrerequisites, ProbeStatus, Sandbox, SandboxError,
+    SandboxLimits, SandboxPolicy, SpawnPlacement,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -166,6 +166,30 @@ fn network_prerequisites_collect_active_controlled_probe_evidence() {
         .unwrap_or_else(|error| panic!("active Linux network probes failed: {error:?}"));
 
     assert!(evidence.all_passed(), "network evidence: {evidence:#?}");
+    assert_eq!(
+        evidence.connect_denial.status,
+        ProbeStatus::Passed,
+        "connect denial evidence: {:#?}",
+        evidence.connect_denial
+    );
+    assert_eq!(
+        evidence.socketpair_denial.status,
+        ProbeStatus::Passed,
+        "socketpair denial evidence: {:#?}",
+        evidence.socketpair_denial
+    );
+    assert_eq!(
+        evidence.bpf_denial.status,
+        ProbeStatus::Passed,
+        "bpf denial evidence: {:#?}",
+        evidence.bpf_denial
+    );
+    assert_eq!(
+        evidence.userfaultfd_denial.status,
+        ProbeStatus::Passed,
+        "userfaultfd denial evidence: {:#?}",
+        evidence.userfaultfd_denial
+    );
     assert!(
         evidence
             .private_namespace_created
@@ -217,7 +241,39 @@ fn sandbox_denies_inet_packet_and_namespace_escape_and_hides_host_unix_socket() 
 }
 
 #[test]
-#[ignore = "BLOCKED: no approved Linux FFprobe artifact or native Linux runner is available"]
+fn production_supervisor_attests_private_network_namespace_before_release() {
+    let fixture = Fixture::new();
+    let (placement, mut ready, mut release) = barrier();
+    let mut child = Sandbox::spawn_blocked(
+        &fixture.child,
+        &[OsString::from("read-input")],
+        &fixture.policy(),
+        placement,
+    )
+    .expect("production supervisor must attest a distinct network namespace");
+
+    let mut pid_bytes = [0; std::mem::size_of::<libc::pid_t>()];
+    ready
+        .read_exact(&mut pid_bytes)
+        .expect("receive placement-ready pid after identity validation");
+    assert_eq!(
+        libc::pid_t::from_ne_bytes(pid_bytes) as u32,
+        child.id(),
+        "ready signal belongs to the attested production supervisor"
+    );
+    release
+        .write_all(&[1])
+        .expect("release only after network namespace attestation");
+    assert_eq!(
+        child
+            .wait()
+            .expect("wait for attested sandbox process")
+            .code(),
+        Some(0)
+    );
+}
+
+#[test]
 fn ffprobe_protocol_policy_rejects_urls() {
     let candidate =
         approved_linux_ffprobe_candidate().unwrap_or_else(|reason| panic!("BLOCKED: {reason}"));

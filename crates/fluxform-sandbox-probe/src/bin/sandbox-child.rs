@@ -67,6 +67,81 @@ fn probe_packet_socket_denial() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn probe_connect_denial() -> bool {
+    let socket = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return false;
+    }
+
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let abstract_name = b"fluxform-connect-denial";
+    for (target, source) in address.sun_path[1..1 + abstract_name.len()]
+        .iter_mut()
+        .zip(abstract_name)
+    {
+        *target = *source as libc::c_char;
+    }
+    let address_len =
+        (std::mem::size_of::<libc::sa_family_t>() + 1 + abstract_name.len()) as libc::socklen_t;
+    let result = unsafe {
+        libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_un).cast(),
+            address_len,
+        )
+    };
+    let error = std::io::Error::last_os_error().raw_os_error();
+    unsafe { libc::close(socket) };
+    result < 0 && error == Some(libc::EACCES)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_socketpair_denial() -> bool {
+    let mut pair = [-1; 2];
+    let result = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    };
+    if result < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+    }
+    unsafe {
+        libc::close(pair[0]);
+        libc::close(pair[1]);
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn probe_bpf_denial() -> bool {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            0_u32,
+            std::ptr::null_mut::<libc::c_void>(),
+            0_u32,
+        )
+    };
+    result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_userfaultfd_denial() -> bool {
+    let result =
+        unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if result < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+    }
+    unsafe { libc::close(result as libc::c_int) };
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn probe_unix_socket_escape(path: &std::ffi::OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
@@ -297,6 +372,10 @@ fn main() {
                     if probe_ipv4_socket_denial(ipv4_port)
                         && probe_ipv6_socket_denial(ipv6_port)
                         && probe_packet_socket_denial()
+                        && probe_connect_denial()
+                        && probe_socketpair_denial()
+                        && probe_bpf_denial()
+                        && probe_userfaultfd_denial()
                         && probe_unix_socket_escape(&unix_socket_path)
                         && probe_namespace_creation_denial() =>
                 {
