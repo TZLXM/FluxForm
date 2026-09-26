@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -47,6 +47,16 @@ impl CapabilityStore {
         Ok(connection)
     }
 
+    pub(crate) fn shares_database_with(&self, path: &Path) -> bool {
+        match (
+            std::fs::canonicalize(&self.database_path),
+            std::fs::canonicalize(path),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+
     fn store(
         &self,
         token_hash: &[u8; TOKEN_BYTES],
@@ -66,15 +76,6 @@ impl CapabilityStore {
             params![token_hash.as_slice(), subject, scope_set, expires_at],
         )?;
         transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn revoke(&self, token: &str) -> Result<(), CapabilityError> {
-        let token_hash = hash_presented_token(token)?;
-        self.connect()?.execute(
-            "DELETE FROM capabilities WHERE token_hash = ?1",
-            [token_hash.as_slice()],
-        )?;
         Ok(())
     }
 
@@ -161,6 +162,22 @@ impl Capability {
         scopes: impl IntoIterator<Item = Scope>,
         expires_at: SystemTime,
     ) -> Result<Self, CapabilityError> {
+        let capability = Self::prepare(subject, scopes, expires_at)?;
+        let token_hash = hash_presented_token(&capability.token)?;
+        store.store(
+            &token_hash,
+            &capability.subject,
+            &capability.scopes,
+            capability.expires_at,
+        )?;
+        Ok(capability)
+    }
+
+    pub(crate) fn prepare(
+        subject: impl Into<String>,
+        scopes: impl IntoIterator<Item = Scope>,
+        expires_at: SystemTime,
+    ) -> Result<Self, CapabilityError> {
         let subject = subject.into();
         if subject.is_empty()
             || subject.len() > MAX_SUBJECT_BYTES
@@ -183,14 +200,30 @@ impl Capability {
         }
 
         let token = generate_random_token()?;
-        let token_hash = hash_presented_token(&token)?;
-        store.store(&token_hash, &subject, &scopes, expires_at)?;
         Ok(Self {
             token,
             subject,
             scopes,
             expires_at,
         })
+    }
+
+    pub(crate) fn insert_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> rusqlite::Result<()> {
+        let token_hash: [u8; TOKEN_BYTES] = Sha256::digest(self.token.as_bytes()).into();
+        let scope_set = self
+            .scopes
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        transaction.execute(
+            "INSERT INTO capabilities(token_hash, subject, scopes, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![token_hash.as_slice(), self.subject, scope_set, self.expires_at],
+        )?;
+        Ok(())
     }
 
     pub fn verify(

@@ -1,12 +1,17 @@
+use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxform_server_probe::auth::{Capability, CapabilityStore, Scope};
 use fluxform_server_probe::routes::{HttpBody, ServerState, TransportPeer, router};
 use fluxform_server_probe::{LedgerLimits, SessionToken, UploadLedger, UploadState};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Body, Bytes, Frame};
 use hyper::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, ORIGIN};
 use hyper::{Method, Request, Response, StatusCode};
 use rusqlite::{Connection, params};
@@ -28,6 +33,18 @@ struct Harness {
 
 impl Harness {
     fn new(max_sessions_per_ip: u32, trusted_proxies: Vec<String>) -> Self {
+        Self::new_with_ttl(
+            max_sessions_per_ip,
+            trusted_proxies,
+            Duration::from_secs(3600),
+        )
+    }
+
+    fn new_with_ttl(
+        max_sessions_per_ip: u32,
+        trusted_proxies: Vec<String>,
+        capability_ttl: Duration,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let database_path = temp.path().join("server.sqlite3");
         let upload_root = temp.path().join("uploads");
@@ -51,7 +68,7 @@ impl Harness {
             capabilities.clone(),
             PUBLIC_ORIGIN,
             trusted_proxies,
-            Duration::from_secs(3600),
+            capability_ttl,
         )
         .unwrap();
 
@@ -161,6 +178,54 @@ impl Harness {
             .query_row("SELECT COUNT(*) FROM uploads", [], |row| row.get(0))
             .unwrap()
     }
+
+    fn active_upload_count(&self) -> i64 {
+        Connection::open(&self.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM uploads WHERE state IN ('reserved', 'receiving', 'uploaded', 'probing', 'queued')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn capability_count(&self) -> i64 {
+        Connection::open(&self.database_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM capabilities", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn reservation_file_count(&self) -> usize {
+        std::fs::read_dir(self._temp.path().join("uploads/.fluxform-reservations"))
+            .unwrap()
+            .count()
+    }
+
+    fn inject_sql(&self, sql: &str) {
+        Connection::open(&self.database_path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+}
+
+struct PollCountingBody {
+    polls: Arc<AtomicUsize>,
+}
+
+impl Body for PollCountingBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Some(Err(std::io::Error::other("request body was polled"))))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -236,7 +301,7 @@ impl Endpoint {
 
     fn allowed_status(self) -> StatusCode {
         match self {
-            Self::Upload => StatusCode::NO_CONTENT,
+            Self::Upload => StatusCode::NOT_IMPLEMENTED,
             Self::Status | Self::Events | Self::Download => StatusCode::OK,
             Self::Cancel => StatusCode::ACCEPTED,
         }
@@ -340,6 +405,9 @@ async fn every_protected_route_enforces_scope_subject_and_expiration() {
                 CredentialCase::Valid => {
                     assert_eq!(status, endpoint.allowed_status(), "{endpoint:?}");
                     assert!(headers.get("referrer-policy").is_some(), "{endpoint:?}");
+                    if matches!(endpoint, Endpoint::Upload) {
+                        assert_error_code(&body, "upload_stream_not_implemented");
+                    }
                     if matches!(endpoint, Endpoint::Events) {
                         assert!(String::from_utf8_lossy(&body).contains("event:"));
                     }
@@ -416,23 +484,253 @@ async fn bootstrap_returns_one_hashed_capability_and_upload_content_uses_it() {
             .any(|window| window == token.as_bytes())
     );
 
-    let upload = harness
-        .call(
-            Method::PUT,
-            &format!("/v1/upload-sessions/{session_id}/content"),
-            Some(token),
-            Some(PUBLIC_ORIGIN),
-            DEFAULT_PEER,
-            &[],
-            "data",
-        )
-        .await;
-    let (status, _, _) = response_parts(upload).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let session_token = SessionToken::parse(token).unwrap();
+    let body_polls = Arc::new(AtomicUsize::new(0));
+    let request_body = PollCountingBody {
+        polls: Arc::clone(&body_polls),
+    }
+    .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })
+    .boxed_unsync();
+    let mut request = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/v1/upload-sessions/{session_id}/content"))
+        .body(request_body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(TransportPeer(SocketAddr::new(DEFAULT_PEER, 43123)));
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    request
+        .headers_mut()
+        .insert(ORIGIN, PUBLIC_ORIGIN.parse().unwrap());
+    let upload = router(harness.state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    let (status, _, response_body) = response_parts(upload).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_error_code(&response_body, "upload_stream_not_implemented");
+    assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    let token = SessionToken::parse(token).unwrap();
     assert_eq!(
-        harness.ledger.state(session_id, &session_token).unwrap(),
-        UploadState::Receiving
+        harness.ledger.state(session_id, &token).unwrap(),
+        UploadState::Reserved
+    );
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn capability_insert_failure_rolls_back_even_if_legacy_cleanup_would_fail() {
+    let harness = Harness::new(8, vec![]);
+    harness.inject_sql(
+        "CREATE TRIGGER task11_fail_capability_insert BEFORE INSERT ON capabilities \
+         BEGIN SELECT RAISE(ABORT, 'injected capability insert failure'); END; \
+         CREATE TRIGGER task11_fail_expiration BEFORE UPDATE ON uploads \
+         WHEN NEW.state = 'expired' \
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;",
+    );
+
+    let (status, _, body) = response_parts(
+        harness
+            .call(
+                Method::POST,
+                "/v1/upload-sessions",
+                None,
+                Some(PUBLIC_ORIGIN),
+                DEFAULT_PEER,
+                &[],
+                r#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#,
+            )
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_code(&body, "storage_unavailable");
+    assert_eq!(harness.active_upload_count(), 0);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
+    assert_eq!(harness.capability_count(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+}
+
+#[tokio::test]
+async fn capability_hash_rebind_failure_rolls_back_without_compensation() {
+    let harness = Harness::new(8, vec![]);
+    harness.inject_sql(
+        "CREATE TRIGGER task11_fail_capability_hash_rebind \
+         BEFORE UPDATE OF capability_hash ON uploads \
+         WHEN NEW.capability_hash != OLD.capability_hash \
+         BEGIN SELECT RAISE(ABORT, 'injected capability hash rebind failure'); END; \
+         CREATE TRIGGER task11_fail_capability_delete BEFORE DELETE ON capabilities \
+         BEGIN SELECT RAISE(ABORT, 'injected capability revoke failure'); END; \
+         CREATE TRIGGER task11_fail_expiration BEFORE UPDATE ON uploads \
+         WHEN NEW.state = 'expired' \
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;",
+    );
+
+    let (status, _, body) = response_parts(
+        harness
+            .call(
+                Method::POST,
+                "/v1/upload-sessions",
+                None,
+                Some(PUBLIC_ORIGIN),
+                DEFAULT_PEER,
+                &[],
+                r#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#,
+            )
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_code(&body, "storage_unavailable");
+    assert_eq!(harness.active_upload_count(), 0);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
+    assert_eq!(harness.capability_count(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+}
+
+#[tokio::test]
+async fn upload_insert_failure_rolls_back_file_and_accounting_state() {
+    let harness = Harness::new(8, vec![]);
+    harness.inject_sql(
+        "CREATE TRIGGER task11_fail_upload_insert BEFORE INSERT ON uploads \
+         BEGIN SELECT RAISE(ABORT, 'injected upload insert failure'); END;",
+    );
+
+    let (status, _, body) = response_parts(
+        harness
+            .call(
+                Method::POST,
+                "/v1/upload-sessions",
+                None,
+                Some(PUBLIC_ORIGIN),
+                DEFAULT_PEER,
+                &[],
+                r#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#,
+            )
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_code(&body, "storage_unavailable");
+    assert_eq!(harness.active_upload_count(), 0);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
+    assert_eq!(harness.capability_count(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+}
+
+#[tokio::test]
+async fn global_quota_write_failure_rolls_back_upload_and_capability_together() {
+    let harness = Harness::new(8, vec![]);
+    harness.inject_sql(
+        "CREATE TRIGGER task11_fail_global_budget BEFORE UPDATE ON global_budget \
+         BEGIN SELECT RAISE(ABORT, 'injected global budget write failure'); END;",
+    );
+
+    let (status, _, body) = response_parts(
+        harness
+            .call(
+                Method::POST,
+                "/v1/upload-sessions",
+                None,
+                Some(PUBLIC_ORIGIN),
+                DEFAULT_PEER,
+                &[],
+                r#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#,
+            )
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_code(&body, "storage_unavailable");
+    assert_eq!(harness.active_upload_count(), 0);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
+    assert_eq!(harness.capability_count(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+}
+
+#[tokio::test]
+async fn deferred_commit_failure_rolls_back_upload_and_capability_together() {
+    let harness = Harness::new(8, vec![]);
+    harness.inject_sql(
+        "CREATE TABLE task11_commit_parent (id INTEGER PRIMARY KEY); \
+         CREATE TABLE task11_commit_child (parent_id INTEGER NOT NULL \
+         REFERENCES task11_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); \
+         CREATE TRIGGER task11_fail_deferred_commit AFTER UPDATE ON global_budget \
+         BEGIN INSERT INTO task11_commit_child(parent_id) VALUES (-1); END;",
+    );
+
+    let (status, _, body) = response_parts(
+        harness
+            .call(
+                Method::POST,
+                "/v1/upload-sessions",
+                None,
+                Some(PUBLIC_ORIGIN),
+                DEFAULT_PEER,
+                &[],
+                r#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#,
+            )
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_code(&body, "storage_unavailable");
+    assert_eq!(harness.active_upload_count(), 0);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
+    assert_eq!(harness.capability_count(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+}
+
+#[tokio::test]
+async fn capability_expiry_overflow_is_rejected_before_reservation() {
+    let harness = Harness::new_with_ttl(8, vec![], Duration::MAX);
+
+    let (status, _, body) = response_parts(
+        harness
+            .call(
+                Method::POST,
+                "/v1/upload-sessions",
+                None,
+                Some(PUBLIC_ORIGIN),
+                DEFAULT_PEER,
+                &[],
+                r#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#,
+            )
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_code(&body, "storage_unavailable");
+    assert_eq!(harness.active_upload_count(), 0);
+    assert_eq!(harness.ledger.reserved_bytes().unwrap(), 0);
+    assert_eq!(harness.capability_count(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+}
+
+#[test]
+fn server_state_rejects_ledger_and_capability_stores_with_different_databases() {
+    let harness = Harness::new(8, vec![]);
+    let other_store = CapabilityStore::open(harness._temp.path().join("other.sqlite3")).unwrap();
+
+    let result = ServerState::new(
+        harness.ledger.clone(),
+        other_store,
+        PUBLIC_ORIGIN,
+        vec![],
+        Duration::from_secs(3600),
+    );
+
+    assert!(
+        result.is_err(),
+        "atomic bootstrap requires one canonical database"
     );
 }
 
@@ -492,6 +790,10 @@ async fn state_changing_routes_require_an_exact_origin() {
 
             if allowed {
                 assert_ne!(status, StatusCode::FORBIDDEN, "{method} {label}");
+                if method == Method::PUT {
+                    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{label}");
+                    assert_error_code(&response_body, "upload_stream_not_implemented");
+                }
             } else {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{method} {label}");
                 assert_error_code(&response_body, "origin_denied");
@@ -508,15 +810,7 @@ async fn state_changing_routes_require_an_exact_origin() {
                             &SessionToken::parse(token.as_deref().unwrap()).unwrap(),
                         )
                         .unwrap();
-                    assert_eq!(
-                        current,
-                        if allowed {
-                            UploadState::Receiving
-                        } else {
-                            initial_state
-                        },
-                        "{label}"
-                    );
+                    assert_eq!(current, initial_state, "{label}");
                 }
                 Method::DELETE => {
                     assert_eq!(
@@ -749,17 +1043,29 @@ async fn trusted_ipv6_proxy_cidr_applies_the_same_quota_identity_policy() {
 
 #[tokio::test]
 async fn trusted_forwarding_rejects_ambiguous_malformed_and_oversized_chains_before_quota() {
-    for headers in [
-        vec![
-            ("forwarded", "for=198.51.100.7"),
-            ("x-forwarded-for", "198.51.100.7"),
-        ],
-        vec![("x-forwarded-for", "198.51.100.7,,203.0.113.9")],
-        vec![("forwarded", "for=_hidden")],
-        vec![(
-            "x-forwarded-for",
-            "198.51.100.1,198.51.100.2,198.51.100.3,198.51.100.4,198.51.100.5,198.51.100.6,198.51.100.7,198.51.100.8,198.51.100.9",
-        )],
+    for (headers, expected_code) in [
+        (
+            vec![
+                ("forwarded", "for=198.51.100.7"),
+                ("x-forwarded-for", "198.51.100.7"),
+            ],
+            "invalid_forwarded_chain",
+        ),
+        (
+            vec![("x-forwarded-for", "198.51.100.7,,203.0.113.9")],
+            "invalid_forwarded_chain",
+        ),
+        (
+            vec![("forwarded", "for=_hidden")],
+            "invalid_forwarded_chain",
+        ),
+        (
+            vec![(
+                "x-forwarded-for",
+                "198.51.100.1,198.51.100.2,198.51.100.3,198.51.100.4,198.51.100.5,198.51.100.6,198.51.100.7,198.51.100.8,198.51.100.9",
+            )],
+            "forwarded_chain_too_long",
+        ),
     ] {
         let harness = Harness::new(8, vec!["192.0.2.0/24".to_owned()]);
         let (status, _, body) = response_parts(
@@ -777,7 +1083,59 @@ async fn trusted_forwarding_rejects_ambiguous_malformed_and_oversized_chains_bef
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_error_code(&body, "invalid_forwarded_chain");
+        assert_error_code(&body, expected_code);
+        assert_eq!(harness.upload_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn trusted_forwarding_rejects_oversized_headers_and_excess_hops_before_parsing_fully() {
+    let valid_xff = "198.51.100.7,".repeat(600);
+    let valid_forwarded = "for=198.51.100.7,".repeat(400);
+    let too_many_xff = format!("{}not-an-ip", ["198.51.100.1"; 8].join(",") + ",");
+    let too_many_forwarded = format!("{}for=_hidden", ["for=198.51.100.1"; 8].join(",") + ",");
+    let cases = [
+        (
+            "x-forwarded-for",
+            valid_xff.as_str(),
+            "forwarded_headers_too_large",
+        ),
+        (
+            "forwarded",
+            valid_forwarded.as_str(),
+            "forwarded_headers_too_large",
+        ),
+        (
+            "x-forwarded-for",
+            too_many_xff.as_str(),
+            "forwarded_chain_too_long",
+        ),
+        (
+            "forwarded",
+            too_many_forwarded.as_str(),
+            "forwarded_chain_too_long",
+        ),
+    ];
+
+    for (header, value, expected_code) in cases {
+        let harness = Harness::new(8, vec!["192.0.2.0/24".to_owned()]);
+        let (status, _, body) = response_parts(
+            harness
+                .call(
+                    Method::POST,
+                    "/v1/upload-sessions",
+                    None,
+                    Some(PUBLIC_ORIGIN),
+                    "192.0.2.10".parse().unwrap(),
+                    &[(header, value)],
+                    r#"{"declared_bytes":1,"output_target":{"type":"managed_artifact"}}"#,
+                )
+                .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{header}");
+        assert_error_code(&body, expected_code);
         assert_eq!(harness.upload_count(), 0);
     }
 }

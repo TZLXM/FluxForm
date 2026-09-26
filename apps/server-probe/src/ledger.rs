@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::auth::Capability;
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
@@ -81,6 +83,8 @@ pub enum LimitError {
     Unauthorized,
     #[error("operating system random source failed")]
     RandomUnavailable,
+    #[error("capability could not be created")]
+    CapabilityIssueFailed,
     #[error("invalid upload path")]
     InvalidUploadPath,
     #[error("upload accounting invariant failed")]
@@ -435,6 +439,38 @@ impl UploadLedger {
         ip_key: &str,
         declared_bytes: Option<u64>,
     ) -> Result<UploadReservation, LimitError> {
+        self.reserve_internal(ip_key, declared_bytes, SessionToken::generate()?, None)
+            .map(|(reservation, _)| reservation)
+    }
+
+    pub(crate) fn reserve_with_upload_capability(
+        &self,
+        ip_key: &str,
+        declared_bytes: Option<u64>,
+        expires_at: SystemTime,
+    ) -> Result<(UploadReservation, Capability), LimitError> {
+        let (reservation, capability) = self.reserve_internal(
+            ip_key,
+            declared_bytes,
+            SessionToken::generate()?,
+            Some(expires_at),
+        )?;
+        capability
+            .map(|capability| (reservation, capability))
+            .ok_or(LimitError::AccountingInvariant)
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    fn reserve_internal(
+        &self,
+        ip_key: &str,
+        declared_bytes: Option<u64>,
+        session_token: SessionToken,
+        capability_expiry: Option<SystemTime>,
+    ) -> Result<(UploadReservation, Option<Capability>), LimitError> {
         let requested = declared_bytes.unwrap_or(self.limits.max_file_bytes);
         if requested == 0 {
             return Err(LimitError::InvalidSize);
@@ -444,7 +480,6 @@ impl UploadLedger {
         }
         let canonical_ip = normalize_ip(ip_key)?;
         let day = current_day_bucket();
-        let session_token = SessionToken::generate()?;
         let capability_hash = session_token.hash();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -486,39 +521,50 @@ impl UploadLedger {
             params![identity_id, capability_hash.as_slice(), to_sql_integer(requested)?, day, relative_path],
         )?;
         let session_id = transaction.last_insert_rowid();
+
+        let capability = if let Some(expires_at) = capability_expiry {
+            let capability = Capability::prepare(
+                format!("upload-session:{session_id}"),
+                [crate::auth::Scope::Upload],
+                expires_at,
+            )
+            .map_err(|_| LimitError::CapabilityIssueFailed)?;
+            capability.insert_in_transaction(&transaction)?;
+
+            let replacement = SessionToken::parse(capability.token())?;
+            let changed = transaction.execute(
+                "UPDATE uploads SET capability_hash = ?1 WHERE id = ?2 AND capability_hash = ?3",
+                params![
+                    replacement.hash().as_slice(),
+                    session_id,
+                    session_token.hash().as_slice(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(LimitError::AccountingInvariant);
+            }
+            Some((capability, replacement))
+        } else {
+            None
+        };
+
         write_global_reserved(&transaction, next_reserved)?;
         transaction.commit()?;
         file_reservation.commit();
-        Ok(UploadReservation {
-            session_id,
-            reserved_bytes: requested,
-            state: UploadState::Reserved,
-            session_token,
-            upload_path,
-        })
-    }
-
-    /// Replaces the temporary ledger credential with a separately scoped
-    /// bearer capability after the session subject and expiry are persisted.
-    pub fn bind_session_token(
-        &self,
-        session_id: i64,
-        current: &SessionToken,
-        replacement: &SessionToken,
-    ) -> Result<(), LimitError> {
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, _, _, _) = load_session(&transaction, session_id, current)?;
-        let replacement_hash = replacement.hash();
-        let changed = transaction.execute(
-            "UPDATE uploads SET capability_hash = ?1 WHERE id = ?2 AND state = ?3",
-            params![replacement_hash.as_slice(), session_id, state.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(LimitError::AccountingInvariant);
-        }
-        transaction.commit()?;
-        Ok(())
+        let (capability, session_token) = match capability {
+            Some((capability, session_token)) => (Some(capability), session_token),
+            None => (None, session_token),
+        };
+        Ok((
+            UploadReservation {
+                session_id,
+                reserved_bytes: requested,
+                state: UploadState::Reserved,
+                session_token,
+                upload_path,
+            },
+            capability,
+        ))
     }
 
     pub fn expand(

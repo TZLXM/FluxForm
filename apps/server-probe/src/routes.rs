@@ -22,10 +22,11 @@ use tower::service_fn;
 use uuid::Uuid;
 
 use crate::auth::{Capability, CapabilityError, CapabilityStore, Scope};
-use crate::ledger::{LimitError, SessionToken, UploadLedger};
+use crate::ledger::{LimitError, UploadLedger};
 
 const MAX_BOOTSTRAP_BODY_BYTES: usize = 16 * 1024;
 const MAX_FORWARDED_HOPS: usize = 8;
+const MAX_FORWARDED_HEADER_BYTES: usize = 4 * 1024;
 const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
 const MAX_CIDR_TEXT_BYTES: usize = 64;
 const CSP: &str = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'";
@@ -34,10 +35,25 @@ const PUBLIC_ORIGIN_ERROR: HttpError = HttpError {
     code: "origin_denied",
     message: "The request origin is not allowed.",
 };
+const UPLOAD_STREAM_NOT_IMPLEMENTED: HttpError = HttpError {
+    status: StatusCode::NOT_IMPLEMENTED,
+    code: "upload_stream_not_implemented",
+    message: "Upload streaming is not available yet.",
+};
 const INVALID_FORWARDED_ERROR: HttpError = HttpError {
     status: StatusCode::BAD_REQUEST,
     code: "invalid_forwarded_chain",
     message: "The forwarded client address is invalid.",
+};
+const OVERSIZED_FORWARDING_ERROR: HttpError = HttpError {
+    status: StatusCode::BAD_REQUEST,
+    code: "forwarded_headers_too_large",
+    message: "The forwarded client address headers are too large.",
+};
+const TOO_MANY_FORWARDING_HOPS_ERROR: HttpError = HttpError {
+    status: StatusCode::BAD_REQUEST,
+    code: "forwarded_chain_too_long",
+    message: "The forwarded client address chain is too long.",
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -68,6 +84,9 @@ impl ServerState {
         let public_origin = public_origin.into();
         validate_public_origin(&public_origin)?;
         if capability_ttl.is_zero() {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
+        if !capabilities.shares_database_with(ledger.database_path()) {
             return Err(RouteConfigurationError::InvalidConfiguration);
         }
         if trusted_proxy_cidrs.len() > MAX_TRUSTED_PROXY_CIDRS {
@@ -247,43 +266,13 @@ async fn create_upload_session(
             "The client address could not be verified.",
         ))?;
     let client_ip = resolve_client_ip(peer.0.ip(), &parts.headers, &state.trusted_proxies)?;
-    let reservation = state
+    let expires_at = SystemTime::now()
+        .checked_add(state.capability_ttl)
+        .ok_or_else(HttpError::storage_unavailable)?;
+    let (reservation, capability) = state
         .ledger
-        .reserve(&client_ip.to_string(), declared_bytes)
+        .reserve_with_upload_capability(&client_ip.to_string(), declared_bytes, expires_at)
         .map_err(map_limit_error)?;
-    let subject = format!("upload-session:{}", reservation.session_id);
-    let capability = match Capability::issue(
-        &state.capabilities,
-        subject,
-        [Scope::Upload],
-        SystemTime::now()
-            .checked_add(state.capability_ttl)
-            .ok_or_else(HttpError::storage_unavailable)?,
-    ) {
-        Ok(capability) => capability,
-        Err(_) => {
-            let _ = state
-                .ledger
-                .expire(reservation.session_id, &reservation.session_token);
-            return Err(HttpError::storage_unavailable());
-        }
-    };
-    let replacement = SessionToken::parse(capability.token()).map_err(map_limit_error)?;
-    if state
-        .ledger
-        .bind_session_token(
-            reservation.session_id,
-            &reservation.session_token,
-            &replacement,
-        )
-        .is_err()
-    {
-        let _ = state.capabilities.revoke(capability.token());
-        let _ = state
-            .ledger
-            .expire(reservation.session_id, &reservation.session_token);
-        return Err(HttpError::storage_unavailable());
-    }
 
     Ok(json_response(
         StatusCode::CREATED,
@@ -302,13 +291,8 @@ fn upload_content(
 ) -> Result<Response<HttpBody>, HttpError> {
     let session_id = parse_session_id(session_id)?;
     let subject = format!("upload-session:{session_id}");
-    let token = authorize(request.headers(), state, &subject, Scope::Upload)?;
-    let session_token = SessionToken::parse(&token).map_err(map_limit_error)?;
-    state
-        .ledger
-        .transition(session_id, &session_token, crate::UploadState::Receiving)
-        .map_err(map_limit_error)?;
-    Ok(empty_response(StatusCode::NO_CONTENT))
+    authorize(request.headers(), state, &subject, Scope::Upload)?;
+    Err(UPLOAD_STREAM_NOT_IMPLEMENTED)
 }
 
 fn job_status(
@@ -535,30 +519,35 @@ fn resolve_client_ip(
         return Ok(peer);
     }
 
-    let forwarded = headers.get_all(FORWARDED).iter().collect::<Vec<_>>();
-    let x_forwarded_for = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .collect::<Vec<_>>();
-    if forwarded.is_empty() && x_forwarded_for.is_empty() {
-        return Ok(peer);
-    }
-    if forwarded.len() > 1
-        || x_forwarded_for.len() > 1
-        || (!forwarded.is_empty() && !x_forwarded_for.is_empty())
-    {
+    let mut forwarded_values = headers.get_all(FORWARDED).iter();
+    let forwarded = forwarded_values.next();
+    if forwarded_values.next().is_some() {
         return Err(INVALID_FORWARDED_ERROR);
     }
-    let chain = if let Some(value) = forwarded.first() {
+    let mut x_forwarded_for_values = headers.get_all("x-forwarded-for").iter();
+    let x_forwarded_for = x_forwarded_for_values.next();
+    if x_forwarded_for_values.next().is_some() {
+        return Err(INVALID_FORWARDED_ERROR);
+    }
+    if forwarded.is_none() && x_forwarded_for.is_none() {
+        return Ok(peer);
+    }
+    if forwarded.is_some() && x_forwarded_for.is_some() {
+        return Err(INVALID_FORWARDED_ERROR);
+    }
+    let header_bytes = forwarded
+        .map_or(0, |value| value.as_bytes().len())
+        .saturating_add(x_forwarded_for.map_or(0, |value| value.as_bytes().len()));
+    if header_bytes > MAX_FORWARDED_HEADER_BYTES {
+        return Err(OVERSIZED_FORWARDING_ERROR);
+    }
+    let chain = if let Some(value) = forwarded {
         parse_forwarded(value.to_str().map_err(|_| INVALID_FORWARDED_ERROR)?)?
     } else {
-        parse_x_forwarded_for(
-            x_forwarded_for[0]
-                .to_str()
-                .map_err(|_| INVALID_FORWARDED_ERROR)?,
-        )?
+        let value = x_forwarded_for.ok_or(INVALID_FORWARDED_ERROR)?;
+        parse_x_forwarded_for(value.to_str().map_err(|_| INVALID_FORWARDED_ERROR)?)?
     };
-    if chain.is_empty() || chain.len() > MAX_FORWARDED_HOPS {
+    if chain.is_empty() {
         return Err(INVALID_FORWARDED_ERROR);
     }
 
@@ -574,42 +563,46 @@ fn resolve_client_ip(
 }
 
 fn parse_x_forwarded_for(value: &str) -> Result<Vec<IpAddr>, HttpError> {
-    value
-        .split(',')
-        .map(|address| {
-            let address = address.trim();
-            if address.is_empty() {
-                return Err(INVALID_FORWARDED_ERROR);
-            }
-            address.parse().map_err(|_| INVALID_FORWARDED_ERROR)
-        })
-        .collect()
+    let mut chain = Vec::with_capacity(MAX_FORWARDED_HOPS);
+    for (index, address) in value.split(',').enumerate() {
+        if index == MAX_FORWARDED_HOPS {
+            return Err(TOO_MANY_FORWARDING_HOPS_ERROR);
+        }
+        let address = address.trim();
+        if address.is_empty() {
+            return Err(INVALID_FORWARDED_ERROR);
+        }
+        chain.push(address.parse().map_err(|_| INVALID_FORWARDED_ERROR)?);
+    }
+    Ok(chain)
 }
 
 fn parse_forwarded(value: &str) -> Result<Vec<IpAddr>, HttpError> {
     // Accept only one unquoted `for=IP[:port]` parameter per element; reject
     // proto/by/extensions so each chain has one unambiguous parse.
-    value
-        .split(',')
-        .map(|element| {
-            let mut for_value = None;
-            for parameter in element.split(';') {
-                let (name, value) = parameter
-                    .trim()
-                    .split_once('=')
-                    .ok_or(INVALID_FORWARDED_ERROR)?;
-                if !name.eq_ignore_ascii_case("for") || for_value.is_some() {
-                    return Err(INVALID_FORWARDED_ERROR);
-                }
-                let value = value.trim();
-                if value.is_empty() || value.starts_with('"') || value.ends_with('"') {
-                    return Err(INVALID_FORWARDED_ERROR);
-                }
-                for_value = Some(parse_forwarded_node(value)?);
+    let mut chain = Vec::with_capacity(MAX_FORWARDED_HOPS);
+    for (index, element) in value.split(',').enumerate() {
+        if index == MAX_FORWARDED_HOPS {
+            return Err(TOO_MANY_FORWARDING_HOPS_ERROR);
+        }
+        let mut for_value = None;
+        for parameter in element.split(';') {
+            let (name, value) = parameter
+                .trim()
+                .split_once('=')
+                .ok_or(INVALID_FORWARDED_ERROR)?;
+            if !name.eq_ignore_ascii_case("for") || for_value.is_some() {
+                return Err(INVALID_FORWARDED_ERROR);
             }
-            for_value.ok_or(INVALID_FORWARDED_ERROR)
-        })
-        .collect()
+            let value = value.trim();
+            if value.is_empty() || value.starts_with('"') || value.ends_with('"') {
+                return Err(INVALID_FORWARDED_ERROR);
+            }
+            for_value = Some(parse_forwarded_node(value)?);
+        }
+        chain.push(for_value.ok_or(INVALID_FORWARDED_ERROR)?);
+    }
+    Ok(chain)
 }
 
 fn parse_forwarded_node(value: &str) -> Result<IpAddr, HttpError> {
