@@ -706,6 +706,19 @@ fn sample_catalog_rejects_unreferenced_media_and_manifest_ids_without_bytes() {
         "id = \"video-mov-h264-silent-240p-v1\"",
         "id = \"orphan-media-v1\"",
     );
+    let first_record = first_record.replace(
+        "path = \"files/video-mov-h264-silent-240p-v1.mov\"",
+        "path = \"files/orphan-media-v1.mov\"",
+    );
+    fs::copy(
+        unreferenced_dir
+            .path()
+            .join("testdata/media/v1/files/video-mov-h264-silent-240p-v1.mov"),
+        unreferenced_dir
+            .path()
+            .join("testdata/media/v1/files/orphan-media-v1.mov"),
+    )
+    .expect("write orphan bytes referenced only by the catalog row");
     catalog_text.push_str("\n\n");
     catalog_text.push_str(&first_record);
     fs::write(&catalog_path, catalog_text).expect("write unreferenced catalog copy");
@@ -736,6 +749,144 @@ fn sample_catalog_rejects_changed_bytes_even_when_the_manifest_id_is_unchanged()
     let catalog_path = temporary.path().join("testdata/media/v1/samples.toml");
     let error = SampleCatalogV1::load(catalog_path).expect_err("SHA mismatch must fail closed");
     assert!(error.to_string().contains("SHA-256 mismatch"));
+}
+
+#[test]
+fn sample_catalog_rejects_noncanonical_alpha_orientation_and_metadata_states() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (field, original, replacement) in [
+        ("alpha", "alpha = \"absent\"", "alpha = \"opaque\""),
+        (
+            "orientation",
+            "orientation = \"none\"",
+            "orientation = \"sideways\"",
+        ),
+        (
+            "metadata",
+            "metadata = \"none\"",
+            "metadata = \"proprietary\"",
+        ),
+    ] {
+        let temporary = tempfile::tempdir().expect("temporary corpus");
+        copy_sample_catalog_and_files(&repository, temporary.path());
+        let catalog_path = temporary.path().join("testdata/media/v1/samples.toml");
+        let mut catalog_text = fs::read_to_string(&catalog_path).expect("copied catalog");
+        assert!(catalog_text.contains(original), "catalog contains {field}");
+        catalog_text = catalog_text.replacen(original, replacement, 1);
+        fs::write(&catalog_path, catalog_text).expect("write invalid catalog copy");
+        assert!(
+            SampleCatalogV1::load(catalog_path).is_err(),
+            "noncanonical {field} state must fail closed"
+        );
+    }
+}
+
+#[test]
+fn sample_catalog_rejects_unreferenced_corpus_bytes_and_nonregular_entries() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let temporary = tempfile::tempdir().expect("temporary corpus");
+    copy_sample_catalog_and_files(&repository, temporary.path());
+    let files = temporary.path().join("testdata/media/v1/files");
+    fs::write(files.join("orphan-media.bin"), b"not catalogued").expect("write orphan media bytes");
+    assert!(
+        SampleCatalogV1::load(temporary.path().join("testdata/media/v1/samples.toml")).is_err(),
+        "unreferenced bytes in files/ must be rejected"
+    );
+
+    let nonregular = tempfile::tempdir().expect("temporary nonregular corpus");
+    copy_sample_catalog_and_files(&repository, nonregular.path());
+    fs::create_dir(
+        nonregular
+            .path()
+            .join("testdata/media/v1/files/unexpected-directory"),
+    )
+    .expect("create nonregular corpus entry");
+    assert!(
+        SampleCatalogV1::load(nonregular.path().join("testdata/media/v1/samples.toml")).is_err(),
+        "directories in files/ must be rejected"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sample_catalog_rejects_symlinked_corpus_entries() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+    use std::os::unix::fs::symlink;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let temporary = tempfile::tempdir().expect("temporary corpus");
+    copy_sample_catalog_and_files(&repository, temporary.path());
+    let files = temporary.path().join("testdata/media/v1/files");
+    symlink(
+        files.join("image-jpeg-baseline-rgb-v1.jpg"),
+        files.join("symlinked-media.jpg"),
+    )
+    .expect("create corpus symlink");
+    assert!(
+        SampleCatalogV1::load(temporary.path().join("testdata/media/v1/samples.toml")).is_err(),
+        "symlinked files/ entries must be rejected"
+    );
+
+    let linked_root = tempfile::tempdir().expect("temporary linked-root corpus");
+    copy_sample_catalog_and_files(&repository, linked_root.path());
+    let version_root = linked_root.path().join("testdata/media/v1");
+    let files = version_root.join("files");
+    let real_files = version_root.join("real-files");
+    fs::rename(&files, &real_files).expect("move real files directory for symlink test");
+    symlink(&real_files, &files).expect("replace files directory with symlink");
+    assert!(
+        SampleCatalogV1::load(version_root.join("samples.toml")).is_err(),
+        "the files/ directory itself must not be a symlink"
+    );
+}
+
+#[test]
+fn sample_catalog_enforces_each_file_and_total_corpus_size_limits() {
+    use fluxform_capabilities::samples::SampleCatalogV1;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let oversized_sample = tempfile::tempdir().expect("temporary oversized sample corpus");
+    copy_sample_catalog_and_files(&repository, oversized_sample.path());
+    fs::write(
+        oversized_sample
+            .path()
+            .join("testdata/media/v1/files/video-mov-h264-silent-240p-v1.mov"),
+        vec![0u8; 512 * 1024 + 1],
+    )
+    .expect("write oversized sample bytes");
+    assert!(
+        SampleCatalogV1::load(
+            oversized_sample
+                .path()
+                .join("testdata/media/v1/samples.toml")
+        )
+        .is_err(),
+        "an individual file over 512 KiB must be rejected"
+    );
+
+    let oversized_corpus = tempfile::tempdir().expect("temporary oversized corpus");
+    copy_sample_catalog_and_files(&repository, oversized_corpus.path());
+    let files = oversized_corpus.path().join("testdata/media/v1/files");
+    for index in 0..20 {
+        fs::write(
+            files.join(format!("orphan-limit-{index:02}.bin")),
+            vec![0u8; 512 * 1024],
+        )
+        .expect("write corpus-limit fixture");
+    }
+    assert!(
+        SampleCatalogV1::load(
+            oversized_corpus
+                .path()
+                .join("testdata/media/v1/samples.toml")
+        )
+        .is_err(),
+        "all bytes present in files/, including orphan bytes, count toward 10 MiB"
+    );
 }
 
 fn copy_sample_catalog_and_files(repository: &Path, destination: &Path) {

@@ -90,8 +90,74 @@ impl SampleCatalogV1 {
         }
 
         let corpus_root = catalog_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut ids = BTreeSet::new();
+        let files_root = corpus_root.join("files");
+        let files_metadata =
+            fs::symlink_metadata(&files_root).map_err(|source| SampleCatalogError::Io {
+                path: files_root.clone(),
+                source,
+            })?;
+        if files_metadata.file_type().is_symlink() || !files_metadata.is_dir() {
+            return Err(invalid(
+                catalog_path,
+                "files/ must be a real directory, not a symlink",
+            ));
+        }
+
+        let mut inventory = BTreeMap::new();
         let mut total_size = 0u64;
+        let entries = fs::read_dir(&files_root).map_err(|source| SampleCatalogError::Io {
+            path: files_root.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| SampleCatalogError::Io {
+                path: files_root.clone(),
+                source,
+            })?;
+            let entry_path = entry.path();
+            let file_type = entry.file_type().map_err(|source| SampleCatalogError::Io {
+                path: entry_path.clone(),
+                source,
+            })?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(invalid(
+                    catalog_path,
+                    &format!(
+                        "corpus entry {} is not a regular file",
+                        entry_path.display()
+                    ),
+                ));
+            }
+            let metadata = entry.metadata().map_err(|source| SampleCatalogError::Io {
+                path: entry_path.clone(),
+                source,
+            })?;
+            let size = metadata.len();
+            if size == 0 || size > MAX_SAMPLE_BYTES {
+                return Err(invalid(
+                    catalog_path,
+                    &format!(
+                        "corpus file {} is empty or exceeds 512 KiB",
+                        entry_path.display()
+                    ),
+                ));
+            }
+            total_size = total_size.saturating_add(size);
+            if total_size > MAX_CORPUS_BYTES {
+                return Err(invalid(
+                    catalog_path,
+                    "complete sample corpus exceeds 10 MiB",
+                ));
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            if inventory.insert(name, size).is_some() {
+                return Err(invalid(catalog_path, "duplicate file in corpus directory"));
+            }
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut referenced_files = BTreeSet::new();
         for sample in &mut document.samples {
             if sample.id.trim().is_empty()
                 || sample.provenance.trim().is_empty()
@@ -105,6 +171,22 @@ impl SampleCatalogV1 {
                 return Err(invalid(
                     catalog_path,
                     &format!("sample {} has an empty required field", sample.id),
+                ));
+            }
+            if !matches!(
+                sample.alpha.as_str(),
+                "present" | "absent" | "not_applicable"
+            ) || !matches!(
+                sample.orientation.as_str(),
+                "present" | "none" | "not_applicable"
+            ) || !matches!(sample.metadata.as_str(), "present" | "none")
+            {
+                return Err(invalid(
+                    catalog_path,
+                    &format!(
+                        "sample {} has noncanonical alpha, orientation, or metadata state",
+                        sample.id
+                    ),
                 ));
             }
             if !ids.insert(sample.id.clone()) {
@@ -151,23 +233,29 @@ impl SampleCatalogV1 {
                     &format!("sample {} path must be a direct child of files/", sample.id),
                 ));
             }
+            let file_name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid(catalog_path, "sample filename must be valid UTF-8"))?;
+            if !referenced_files.insert(file_name.to_owned()) {
+                return Err(invalid(
+                    catalog_path,
+                    &format!("corpus file {file_name} is referenced more than once"),
+                ));
+            }
             let sample_path = corpus_root.join(relative);
             let bytes = fs::read(&sample_path).map_err(|source| SampleCatalogError::Io {
                 path: sample_path.clone(),
                 source,
             })?;
             sample.size_bytes = bytes.len() as u64;
-            if sample.size_bytes == 0 || sample.size_bytes > MAX_SAMPLE_BYTES {
+            if inventory.get(file_name) != Some(&sample.size_bytes) {
                 return Err(invalid(
                     catalog_path,
-                    &format!("sample {} is empty or exceeds 512 KiB", sample.id),
-                ));
-            }
-            total_size = total_size.saturating_add(sample.size_bytes);
-            if total_size > MAX_CORPUS_BYTES {
-                return Err(invalid(
-                    catalog_path,
-                    "complete sample corpus exceeds 10 MiB",
+                    &format!(
+                        "sample {} corpus inventory changed while loading",
+                        sample.id
+                    ),
                 ));
             }
             let actual_hash = sha256(&bytes);
@@ -177,6 +265,12 @@ impl SampleCatalogV1 {
                     &format!("sample {} SHA-256 mismatch", sample.id),
                 ));
             }
+        }
+        if inventory.keys().cloned().collect::<BTreeSet<_>>() != referenced_files {
+            return Err(invalid(
+                catalog_path,
+                "files/ must contain exactly the catalog's referenced sample bytes",
+            ));
         }
 
         Ok(Self {

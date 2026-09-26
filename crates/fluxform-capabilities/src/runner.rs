@@ -19,6 +19,8 @@ const ANIMATED_SAMPLE_IDS: &[&str] = &[
     "image-webp-animated-v1",
     "image-tiff-multipage-v1",
 ];
+const INPUT_DURATION_TOLERANCE_MS: u64 = 20;
+const OUTPUT_DURATION_TOLERANCE_MS: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +75,8 @@ pub struct OutputExpectationsV1 {
     pub height: u32,
     pub max_width: u32,
     pub max_height: u32,
+    pub expected_duration_ms: u64,
+    pub duration_tolerance_ms: u64,
     pub max_duration_ms: u64,
     pub alpha_policy: String,
     pub orientation_policy: String,
@@ -124,12 +128,13 @@ pub fn build_ffmpeg_arguments(edge: &ConversionEdgeV1, input: &str, output: &str
         "-y".to_owned(),
     ];
     if edge.category != ConversionCategory::Audio {
-        arguments.push(match edge.orientation_policy {
-            OrientationPolicy::ApplyToPixels => "-autorotate".to_owned(),
-            OrientationPolicy::PreserveTag | OrientationPolicy::Ignore => {
-                "-noautorotate".to_owned()
-            }
-        });
+        arguments.extend([
+            "-autorotate".to_owned(),
+            match edge.orientation_policy {
+                OrientationPolicy::ApplyToPixels => "1".to_owned(),
+                OrientationPolicy::PreserveTag | OrientationPolicy::Ignore => "0".to_owned(),
+            },
+        ]);
     }
     arguments.extend(["-i".to_owned(), input.to_owned()]);
     for mapping in &edge.stream_map {
@@ -187,8 +192,15 @@ pub fn expected_output(edge: &ConversionEdgeV1, sample: &SampleRecordV1) -> Outp
     }
     let width_bound = default_option(&edge.options, "max_width", 4096) as u32;
     let height_bound = default_option(&edge.options, "max_height", 4096) as u32;
-    let duration_bound =
+    let edge_duration_bound =
         (default_option(&edge.options, "max_duration_seconds", 3600) as u64).saturating_mul(1000);
+    let sample_duration_bound = if sample.duration_ms == 0 {
+        edge_duration_bound
+    } else {
+        sample
+            .duration_ms
+            .saturating_add(OUTPUT_DURATION_TOLERANCE_MS)
+    };
     OutputExpectationsV1 {
         container: edge.output_format.clone(),
         codecs,
@@ -197,7 +209,9 @@ pub fn expected_output(edge: &ConversionEdgeV1, sample: &SampleRecordV1) -> Outp
         height: sample.height,
         max_width: width_bound,
         max_height: height_bound,
-        max_duration_ms: duration_bound.min(sample.duration_ms.saturating_add(1500).max(1000)),
+        expected_duration_ms: sample.duration_ms,
+        duration_tolerance_ms: OUTPUT_DURATION_TOLERANCE_MS,
+        max_duration_ms: edge_duration_bound.min(sample_duration_bound),
         alpha_policy: policy_name(edge.alpha_policy).to_owned(),
         orientation_policy: orientation_name(edge.orientation_policy).to_owned(),
         metadata_policy: metadata_name(edge.metadata_policy).to_owned(),
@@ -450,6 +464,34 @@ pub fn validate_run_report_inputs(
                 edge.id, sample.id
             ));
         }
+        let observed_input = result
+            .observed_input
+            .as_ref()
+            .ok_or_else(|| "BLOCKED: sample report omits input observation".to_owned())?;
+        validate_sample_input(sample, edge, observed_input).map_err(|error| {
+            format!(
+                "BLOCKED: invalid input observation for {} / {}: {error}",
+                edge.id, sample.id
+            )
+        })?;
+        if sample.expected_outcome == "success" {
+            let observed_output = result
+                .observed_output
+                .as_ref()
+                .ok_or_else(|| "BLOCKED: sample report omits output observation".to_owned())?;
+            validate_output(
+                &result.output_expectations,
+                observed_output,
+                sample,
+                observed_input,
+            )
+            .map_err(|error| {
+                format!(
+                    "BLOCKED: invalid output observation for {} / {}: {error}",
+                    edge.id, sample.id
+                )
+            })?;
+        }
         let input = root_relative_path(
             repository_root,
             &catalog
@@ -669,7 +711,7 @@ fn execute_one(
         }
     };
     let expectations = expected_output(edge, sample);
-    if let Err(error) = validate_output(&expectations, &observed_output, sample) {
+    if let Err(error) = validate_output(&expectations, &observed_output, sample, &observed_input) {
         return (
             "failed",
             "output_validation_failed",
@@ -713,39 +755,78 @@ fn validate_sample_input(
             sample.container, observed.format_name
         ));
     }
-    if !ANIMATED_SAMPLE_IDS.contains(&sample.id.as_str())
-        && !edge
-            .input_demuxers
-            .iter()
-            .any(|demuxer| format_matches_demuxer(demuxer, &observed.format_name))
-    {
+    let demuxer_matches = edge
+        .input_demuxers
+        .iter()
+        .any(|demuxer| format_matches_demuxer(demuxer, &observed.format_name))
+        || (sample.id == "image-jpeg-truncated-v1"
+            && format_matches_demuxer("image2", &observed.format_name));
+    if !ANIMATED_SAMPLE_IDS.contains(&sample.id.as_str()) && !demuxer_matches {
         return Err(format!(
             "sample demuxer mismatch: expected {:?}, observed {}",
             edge.input_demuxers, observed.format_name
         ));
     }
-    for codec in &sample.codecs {
-        if !(observed
-            .codecs
-            .iter()
-            .any(|actual| actual.eq_ignore_ascii_case(codec))
-            || (sample.id == "image-webp-animated-v1" && observed.codecs.is_empty()))
-        {
-            return Err(format!(
-                "sample codec mismatch: expected {codec}, observed {:?}",
-                observed.codecs
-            ));
-        }
+    let expected_codecs = sample
+        .codecs
+        .iter()
+        .map(|codec| codec.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let observed_codecs = observed
+        .codecs
+        .iter()
+        .map(|codec| codec.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if expected_codecs != observed_codecs {
+        return Err(format!(
+            "sample codec set mismatch: expected {expected_codecs:?}, observed {observed_codecs:?}"
+        ));
+    }
+    if observed.stream_topology != sample.stream_topology {
+        return Err(format!(
+            "sample topology mismatch: expected {}, observed {}",
+            sample.stream_topology, observed.stream_topology
+        ));
+    }
+    if observed.width != sample.width || observed.height != sample.height {
+        return Err(format!(
+            "sample dimensions mismatch: expected {}x{}, observed {}x{}",
+            sample.width, sample.height, observed.width, observed.height
+        ));
+    }
+    if observed.duration_ms.abs_diff(sample.duration_ms) > INPUT_DURATION_TOLERANCE_MS {
+        return Err(format!(
+            "sample duration mismatch: expected {} ms ±{} ms, observed {} ms",
+            sample.duration_ms, INPUT_DURATION_TOLERANCE_MS, observed.duration_ms
+        ));
+    }
+    if sample.alpha != "not_applicable" && observed.alpha_present != (sample.alpha == "present") {
+        return Err(format!(
+            "sample alpha mismatch: expected {}, observed {}",
+            sample.alpha, observed.alpha_present
+        ));
+    }
+    if sample.orientation != "not_applicable"
+        && observed.orientation_present != (sample.orientation == "present")
+    {
+        return Err(format!(
+            "sample orientation mismatch: expected {}, observed {}",
+            sample.orientation, observed.orientation_present
+        ));
+    }
+    let metadata_present = !observed.metadata_keys.is_empty();
+    if metadata_present != (sample.metadata == "present") {
+        return Err(format!(
+            "sample user-metadata mismatch: expected {}, observed keys {:?}",
+            sample.metadata, observed.metadata_keys
+        ));
     }
     if sample.expected_outcome == "success" {
         let expected_topology = topology_for_input(edge.input_topology);
-        if observed.stream_topology != expected_topology
-            || observed.width != sample.width
-            || observed.height != sample.height
-        {
+        if observed.stream_topology != expected_topology {
             return Err(format!(
-                "sample topology or dimensions mismatch: observed {} {}x{}",
-                observed.stream_topology, observed.width, observed.height
+                "sample topology mismatch: edge requires {}, observed {}",
+                expected_topology, observed.stream_topology
             ));
         }
     }
@@ -840,7 +921,7 @@ fn observed_media(probe: &Value) -> Result<ObservedMediaV1, String> {
             (0, 0, false, false)
         };
     let format = &probe["format"];
-    let duration_ms = format["duration"]
+    let reported_duration_ms = format["duration"]
         .as_str()
         .and_then(|value| value.parse::<f64>().ok())
         .map(|seconds| (seconds.max(0.0) * 1000.0).round() as u64)
@@ -848,17 +929,21 @@ fn observed_media(probe: &Value) -> Result<ObservedMediaV1, String> {
     let mut metadata_keys = BTreeSet::new();
     if let Some(tags) = format["tags"].as_object() {
         metadata_keys.extend(
-            tags.keys()
-                .filter(|key| !key.eq_ignore_ascii_case("encoder"))
-                .cloned(),
+            tags.iter()
+                .filter(|(key, value)| {
+                    !is_non_user_metadata_tag(key, value.as_str().unwrap_or_default())
+                })
+                .map(|(key, _)| key.clone()),
         );
     }
     for stream in streams {
         if let Some(tags) = stream["tags"].as_object() {
             metadata_keys.extend(
-                tags.keys()
-                    .filter(|key| !key.eq_ignore_ascii_case("encoder"))
-                    .cloned(),
+                tags.iter()
+                    .filter(|(key, value)| {
+                        !is_non_user_metadata_tag(key, value.as_str().unwrap_or_default())
+                    })
+                    .map(|(key, _)| key.clone()),
             );
         }
     }
@@ -896,6 +981,14 @@ fn observed_media(probe: &Value) -> Result<ObservedMediaV1, String> {
     } else {
         "single_video_stream"
     };
+    // FFprobe invents a one-frame 40 ms duration for some damaged/still-image
+    // demuxer paths. v1 records static-image duration as zero; animations keep
+    // their measured duration and WebP animation duration is read from ANMF.
+    let duration_ms = if still_image_format && frame_count <= 1 && video_streams.len() == 1 {
+        0
+    } else {
+        reported_duration_ms
+    };
     Ok(ObservedMediaV1 {
         format_name: format_name.to_owned(),
         codecs,
@@ -910,10 +1003,25 @@ fn observed_media(probe: &Value) -> Result<ObservedMediaV1, String> {
     })
 }
 
+/// Canonical metadata policy: user-authored/descriptive tags (such as title,
+/// comment, or artist) are the values governed by `strip`/`preserve`/`safe`.
+/// Container identity fields and tool-generated encoder identifiers are
+/// technical output, not user metadata; `und` is FFmpeg's unspecified-language
+/// sentinel. This explicit set is normalized away before applying those policies.
+fn is_non_user_metadata_tag(key: &str, value: &str) -> bool {
+    match key.to_ascii_lowercase().as_str() {
+        "encoder" | "major_brand" | "minor_version" | "compatible_brands" | "handler_name"
+        | "vendor_id" => true,
+        "language" => value.eq_ignore_ascii_case("und"),
+        _ => false,
+    }
+}
+
 fn validate_output(
     expected: &OutputExpectationsV1,
     observed: &ObservedMediaV1,
     sample: &SampleRecordV1,
+    input: &ObservedMediaV1,
 ) -> Result<(), String> {
     if !container_matches(&expected.container, &observed.format_name) {
         return Err(format!(
@@ -921,17 +1029,20 @@ fn validate_output(
             expected.container, observed.format_name
         ));
     }
-    for codec in &expected.codecs {
-        if !observed
-            .codecs
-            .iter()
-            .any(|actual| actual.eq_ignore_ascii_case(codec))
-        {
-            return Err(format!(
-                "output codec {codec} is absent from {:?}",
-                observed.codecs
-            ));
-        }
+    let expected_codecs = expected
+        .codecs
+        .iter()
+        .map(|codec| codec.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let observed_codecs = observed
+        .codecs
+        .iter()
+        .map(|codec| codec.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if observed_codecs != expected_codecs {
+        return Err(format!(
+            "output codec set mismatch: expected {expected_codecs:?}, observed {observed_codecs:?}"
+        ));
     }
     if observed.stream_topology != expected.stream_topology {
         return Err(format!(
@@ -939,9 +1050,7 @@ fn validate_output(
             expected.stream_topology, observed.stream_topology
         ));
     }
-    if expected.width > 0
-        && (observed.width != expected.width || observed.height != expected.height)
-    {
+    if observed.width != expected.width || observed.height != expected.height {
         return Err(format!(
             "output dimensions mismatch: expected {}x{}, observed {}x{}",
             expected.width, expected.height, observed.width, observed.height
@@ -959,30 +1068,54 @@ fn validate_output(
             observed.duration_ms, expected.max_duration_ms
         ));
     }
-    if expected.alpha_policy == "preserve_if_present"
-        && sample.alpha == "present"
-        && !observed.alpha_present
+    if expected.expected_duration_ms > 0
+        && observed.duration_ms.abs_diff(expected.expected_duration_ms)
+            > expected.duration_tolerance_ms
     {
-        return Err("alpha policy requires preserving present alpha".to_owned());
-    }
-    if expected.orientation_policy == "apply_to_pixels" && observed.orientation_present {
-        return Err("orientation display metadata remains after apply-to-pixels policy".to_owned());
-    }
-    if expected.metadata_policy == "strip" && !observed.metadata_keys.is_empty() {
         return Err(format!(
-            "metadata stripping left tags {:?}",
-            observed.metadata_keys
+            "output duration {} ms differs from expected {} ms by more than {} ms",
+            observed.duration_ms, expected.expected_duration_ms, expected.duration_tolerance_ms
         ));
     }
-    if expected.metadata_policy == "safe_image_metadata"
-        && observed
+    if sample.alpha != "not_applicable" {
+        let expected_alpha =
+            expected.alpha_policy == "preserve_if_present" && sample.alpha == "present";
+        if observed.alpha_present != expected_alpha {
+            return Err(format!(
+                "output alpha mismatch: policy/sample require {expected_alpha}, observed {}",
+                observed.alpha_present
+            ));
+        }
+    }
+    if sample.orientation != "not_applicable" {
+        let expected_orientation =
+            expected.orientation_policy == "preserve_tag" && sample.orientation == "present";
+        if observed.orientation_present != expected_orientation {
+            return Err(format!(
+                "output orientation mismatch: policy/sample require {expected_orientation}, observed {}",
+                observed.orientation_present
+            ));
+        }
+    }
+    let expected_metadata = match expected.metadata_policy.as_str() {
+        "strip" => BTreeSet::new(),
+        "preserve" => input.metadata_keys.iter().cloned().collect(),
+        "safe_image_metadata" => input
             .metadata_keys
             .iter()
-            .any(|key| !safe_image_metadata_key(key))
-    {
+            .filter(|key| safe_image_metadata_key(key))
+            .cloned()
+            .collect(),
+        _ => return Err("unknown output metadata policy".to_owned()),
+    };
+    let observed_metadata = observed
+        .metadata_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if observed_metadata != expected_metadata {
         return Err(format!(
-            "unsafe image metadata tags remain: {:?}",
-            observed.metadata_keys
+            "output user-metadata mismatch: policy requires {expected_metadata:?}, observed {observed_metadata:?}"
         ));
     }
     Ok(())
@@ -1011,7 +1144,20 @@ fn augment_multiframe_observation(
 ) -> Result<(), String> {
     let frames = match sample.id.as_str() {
         "image-gif-animated-v1" => gif_frame_count(path)?,
-        "image-webp-animated-v1" => webp_animation_frame_count(path)?,
+        "image-webp-animated-v1" => {
+            let animation = webp_animation_properties(path)?;
+            observed.width = animation.width;
+            observed.height = animation.height;
+            observed.alpha_present = animation.alpha_present;
+            observed.duration_ms = animation.duration_ms;
+            if observed.codecs.is_empty() {
+                // FFprobe versions which cannot decode an animated WebP frame
+                // can omit codec_name. The validated RIFF/VP8X/ANMF structure
+                // still identifies this media codec as WebP.
+                observed.codecs.push("webp".to_owned());
+            }
+            animation.frame_count
+        }
         "image-tiff-multipage-v1" => tiff_page_count(path)?,
         _ => return Ok(()),
     };
@@ -1137,7 +1283,16 @@ fn tiff_page_count(path: &Path) -> Result<usize, String> {
     Ok(seen.len())
 }
 
-fn webp_animation_frame_count(path: &Path) -> Result<usize, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WebpAnimationProperties {
+    frame_count: usize,
+    width: u32,
+    height: u32,
+    alpha_present: bool,
+    duration_ms: u64,
+}
+
+fn webp_animation_properties(path: &Path) -> Result<WebpAnimationProperties, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
         return Err("invalid WebP RIFF header".to_owned());
@@ -1155,6 +1310,11 @@ fn webp_animation_frame_count(path: &Path) -> Result<usize, String> {
     }
     let mut offset = 12usize;
     let mut frame_count = 0;
+    let mut width = 0;
+    let mut height = 0;
+    let mut alpha_present = false;
+    let mut saw_extended_header = false;
+    let mut duration_ms = 0u64;
     while offset + 8 <= limit {
         let chunk = &bytes[offset..offset + 4];
         let length = u32::from_le_bytes(
@@ -1169,15 +1329,44 @@ fn webp_animation_frame_count(path: &Path) -> Result<usize, String> {
         if end > limit {
             return Err("WebP chunk exceeds RIFF length".to_owned());
         }
-        if chunk == b"ANMF" {
+        if chunk == b"VP8X" {
+            if length != 10 {
+                return Err("WebP VP8X header must be exactly 10 bytes".to_owned());
+            }
+            let flags = bytes[data_start];
+            width = webp_u24(&bytes, data_start + 4)?.saturating_add(1);
+            height = webp_u24(&bytes, data_start + 7)?.saturating_add(1);
+            alpha_present = flags & 0x10 != 0;
+            saw_extended_header = true;
+        } else if chunk == b"ANMF" {
+            if length < 16 {
+                return Err("WebP ANMF frame header is truncated".to_owned());
+            }
             frame_count += 1;
+            duration_ms = duration_ms.saturating_add(u64::from(webp_u24(&bytes, data_start + 12)?));
         }
         offset = end + (length & 1);
     }
     if offset != limit {
         return Err("WebP chunk alignment does not equal RIFF length".to_owned());
     }
-    Ok(frame_count)
+    if !saw_extended_header || width == 0 || height == 0 || frame_count == 0 {
+        return Err("animated WebP is missing a valid VP8X canvas or ANMF frames".to_owned());
+    }
+    Ok(WebpAnimationProperties {
+        frame_count,
+        width,
+        height,
+        alpha_present,
+        duration_ms,
+    })
+}
+
+fn webp_u24(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 3)
+        .ok_or_else(|| "truncated WebP 24-bit value".to_owned())?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], 0]))
 }
 
 fn verify_executable_identity(
@@ -1390,7 +1579,13 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{gif_frame_count, tiff_page_count, webp_animation_frame_count};
+    use super::{
+        augment_multiframe_observation, build_ffmpeg_arguments, expected_output, gif_frame_count,
+        observed_media, tiff_page_count, validate_output, validate_sample_input,
+        webp_animation_properties,
+    };
+    use crate::{CapabilityManifestV1, samples::SampleCatalogV1};
+    use serde_json::Value;
     use std::path::Path;
 
     #[test]
@@ -1402,13 +1597,310 @@ mod tests {
             gif_frame_count(&corpus.join("image-gif-animated-v1.gif")).unwrap(),
             2
         );
-        assert_eq!(
-            webp_animation_frame_count(&corpus.join("image-webp-animated-v1.webp")).unwrap(),
-            2
-        );
+        let webp = webp_animation_properties(&corpus.join("image-webp-animated-v1.webp")).unwrap();
+        assert_eq!(webp.frame_count, 2);
+        assert_eq!((webp.width, webp.height), (16, 16));
+        assert!(webp.alpha_present);
+        assert_eq!(webp.duration_ms, 1000);
         assert_eq!(
             tiff_page_count(&corpus.join("image-tiff-multipage-v1.tiff")).unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn real_mp4_and_m4a_outputs_ignore_structural_tags_but_keep_user_metadata() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = CapabilityManifestV1::load(root.join("config/capabilities-v1.toml"))
+            .expect("approved product-scope manifest");
+        let catalog = SampleCatalogV1::load(root.join("testdata/media/v1/samples.toml"))
+            .expect("checked-in sample catalog");
+        let input_fixtures: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real-ffprobe-inputs-v1.json"
+        ))
+        .expect("captured real input observations");
+        for (edge_id, sample_id, probe_json) in [
+            (
+                "video.mov-to-mp4",
+                "video-mov-h264-silent-240p-v1",
+                include_str!("../tests/fixtures/real-ffprobe-mp4-output.json"),
+            ),
+            (
+                "audio.m4a-to-m4a",
+                "audio-m4a-aac-lc-mono-v1",
+                include_str!("../tests/fixtures/real-ffprobe-m4a-output.json"),
+            ),
+        ] {
+            let edge = manifest
+                .edges()
+                .iter()
+                .find(|edge| edge.id == edge_id)
+                .expect("manifest edge");
+            let sample = catalog.find(sample_id).expect("real source sample");
+            let probe: Value = serde_json::from_str(probe_json).expect("captured FFprobe JSON");
+            let observed = observed_media(&probe).expect("normalized FFprobe observation");
+            let observed_input = observed_media(&input_fixtures[sample_id])
+                .expect("normalized real input FFprobe observation");
+            assert!(
+                observed.metadata_keys.is_empty(),
+                "container/stream structural tags are not user metadata: {:?}",
+                observed.metadata_keys
+            );
+            validate_output(
+                &expected_output(edge, sample),
+                &observed,
+                sample,
+                &observed_input,
+            )
+            .expect("real MP4/M4A output satisfies stripped-user-metadata policy");
+
+            let mut user_metadata_probe = probe;
+            user_metadata_probe["format"]["tags"]["title"] = Value::String("TEST-ONLY".into());
+            let with_user_metadata =
+                observed_media(&user_metadata_probe).expect("probe with real user tag added");
+            assert_eq!(with_user_metadata.metadata_keys, ["title"]);
+        }
+    }
+
+    #[test]
+    fn ffmpeg_orientation_boolean_is_passed_as_an_explicit_input_option_value() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = CapabilityManifestV1::load(root.join("config/capabilities-v1.toml"))
+            .expect("approved product-scope manifest");
+        let edge = manifest
+            .edges()
+            .iter()
+            .find(|edge| edge.id == "video.mov-to-mp4")
+            .expect("video edge");
+        let arguments = build_ffmpeg_arguments(edge, "input.mov", "output.mp4");
+        let flag = arguments
+            .iter()
+            .position(|argument| argument == "-autorotate")
+            .expect("FFmpeg autorotate option");
+        assert_eq!(arguments[flag + 1], "1");
+        assert_eq!(arguments[flag + 2], "-i");
+    }
+
+    #[test]
+    fn checked_in_sample_semantics_match_real_ffprobe_observations() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = CapabilityManifestV1::load(root.join("config/capabilities-v1.toml"))
+            .expect("approved product-scope manifest");
+        let catalog = SampleCatalogV1::load(root.join("testdata/media/v1/samples.toml"))
+            .expect("checked-in sample catalog");
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real-ffprobe-inputs-v1.json"
+        ))
+        .expect("captured FFprobe observations");
+        for sample in catalog.samples() {
+            let edge = manifest
+                .edges()
+                .iter()
+                .find(|edge| {
+                    edge.valid_samples.contains(&sample.id)
+                        || edge.invalid_samples.contains(&sample.id)
+                })
+                .expect("sample edge");
+            let probe = &fixtures[&sample.id];
+            let mut observed = observed_media(probe).expect("normalized input observation");
+            augment_multiframe_observation(
+                sample,
+                &catalog.sample_path(&sample.id).expect("sample bytes"),
+                &mut observed,
+            )
+            .expect("multi-frame structure from checked-in bytes");
+            validate_sample_input(sample, edge, &observed).unwrap_or_else(|error| {
+                panic!(
+                    "real sample {} failed its declared semantics: {error}",
+                    sample.id
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn input_sample_declarations_reject_semantic_drift() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = CapabilityManifestV1::load(root.join("config/capabilities-v1.toml"))
+            .expect("approved product-scope manifest");
+        let catalog = SampleCatalogV1::load(root.join("testdata/media/v1/samples.toml"))
+            .expect("checked-in sample catalog");
+        let edge = manifest
+            .edges()
+            .iter()
+            .find(|edge| edge.id == "video.mov-to-mp4")
+            .expect("video edge");
+        let sample = catalog
+            .find("video-mov-h264-silent-240p-v1")
+            .expect("video sample");
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real-ffprobe-inputs-v1.json"
+        ))
+        .expect("captured FFprobe observations");
+        let observed = observed_media(&fixtures[&sample.id]).expect("real FFprobe observation");
+
+        for (field, mutate) in [
+            (
+                "duration",
+                Box::new(|item: &mut super::ObservedMediaV1| item.duration_ms += 500)
+                    as Box<dyn Fn(&mut super::ObservedMediaV1)>,
+            ),
+            (
+                "alpha",
+                Box::new(|item: &mut super::ObservedMediaV1| item.alpha_present = true),
+            ),
+            (
+                "orientation",
+                Box::new(|item: &mut super::ObservedMediaV1| item.orientation_present = true),
+            ),
+            (
+                "metadata",
+                Box::new(|item: &mut super::ObservedMediaV1| {
+                    item.metadata_keys.push("title".to_owned())
+                }),
+            ),
+            (
+                "topology",
+                Box::new(|item: &mut super::ObservedMediaV1| {
+                    item.stream_topology = "multiple_video_frames".to_owned()
+                }),
+            ),
+            (
+                "width",
+                Box::new(|item: &mut super::ObservedMediaV1| item.width = 1),
+            ),
+            (
+                "height",
+                Box::new(|item: &mut super::ObservedMediaV1| item.height = 1),
+            ),
+            (
+                "codec",
+                Box::new(|item: &mut super::ObservedMediaV1| item.codecs.push("hevc".to_owned())),
+            ),
+        ] {
+            let mut changed = observed.clone();
+            mutate(&mut changed);
+            assert!(
+                validate_sample_input(sample, edge, &changed).is_err(),
+                "sample semantic mismatch in {field} must be rejected"
+            );
+        }
+
+        for (field, mutate) in [
+            (
+                "alpha",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| {
+                    item.alpha = "present".to_owned()
+                }) as Box<dyn Fn(&mut crate::samples::SampleRecordV1)>,
+            ),
+            (
+                "orientation",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| {
+                    item.orientation = "present".to_owned()
+                }),
+            ),
+            (
+                "metadata",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| {
+                    item.metadata = "present".to_owned()
+                }),
+            ),
+            (
+                "duration",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| item.duration_ms += 500),
+            ),
+            (
+                "topology",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| {
+                    item.stream_topology = "multiple_video_frames".to_owned()
+                }),
+            ),
+            (
+                "width",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| item.width += 1),
+            ),
+            (
+                "height",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| item.height += 1),
+            ),
+            (
+                "codec",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| {
+                    item.codecs.push("hevc".to_owned())
+                }),
+            ),
+            (
+                "container",
+                Box::new(|item: &mut crate::samples::SampleRecordV1| {
+                    item.container = "avi".to_owned()
+                }),
+            ),
+        ] {
+            let mut changed_sample = sample.clone();
+            mutate(&mut changed_sample);
+            assert!(
+                validate_sample_input(&changed_sample, edge, &observed).is_err(),
+                "declared sample semantic mismatch in {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn real_mp4_output_rejects_duration_alpha_orientation_and_user_metadata_drift() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = CapabilityManifestV1::load(root.join("config/capabilities-v1.toml"))
+            .expect("approved product-scope manifest");
+        let catalog = SampleCatalogV1::load(root.join("testdata/media/v1/samples.toml"))
+            .expect("checked-in sample catalog");
+        let edge = manifest
+            .edges()
+            .iter()
+            .find(|edge| edge.id == "video.mov-to-mp4")
+            .expect("video edge");
+        let sample = catalog
+            .find("video-mov-h264-silent-240p-v1")
+            .expect("video sample");
+        let probe: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real-ffprobe-mp4-output.json"
+        ))
+        .expect("captured real output observation");
+        let observed = observed_media(&probe).expect("normalized output");
+        let input_fixtures: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real-ffprobe-inputs-v1.json"
+        ))
+        .expect("captured real input observations");
+        let observed_input = observed_media(&input_fixtures[&sample.id])
+            .expect("normalized real input FFprobe observation");
+        let expected = expected_output(edge, sample);
+        validate_output(&expected, &observed, sample, &observed_input)
+            .expect("real output baseline");
+        for (field, mutate) in [
+            (
+                "duration",
+                Box::new(|item: &mut super::ObservedMediaV1| item.duration_ms += 500)
+                    as Box<dyn Fn(&mut super::ObservedMediaV1)>,
+            ),
+            (
+                "alpha",
+                Box::new(|item: &mut super::ObservedMediaV1| item.alpha_present = true),
+            ),
+            (
+                "orientation",
+                Box::new(|item: &mut super::ObservedMediaV1| item.orientation_present = true),
+            ),
+            (
+                "metadata",
+                Box::new(|item: &mut super::ObservedMediaV1| {
+                    item.metadata_keys.push("title".to_owned())
+                }),
+            ),
+        ] {
+            let mut changed = observed.clone();
+            mutate(&mut changed);
+            assert!(
+                validate_output(&expected, &changed, sample, &observed_input).is_err(),
+                "output semantic mismatch in {field} must be rejected"
+            );
+        }
     }
 }
