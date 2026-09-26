@@ -4,9 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+http-body-util = "=0.1.5"
+hyper = "=1.11.1"
 rusqlite = { version = "0.39", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "=0.5.3", features = ["util"] }
 uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]

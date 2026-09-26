@@ -79,6 +79,8 @@ pub enum LimitError {
     UnknownSession,
     #[error("upload session capability is invalid")]
     Unauthorized,
+    #[error("operating system random source failed")]
+    RandomUnavailable,
     #[error("invalid upload path")]
     InvalidUploadPath,
     #[error("upload accounting invariant failed")]
@@ -190,13 +192,19 @@ impl SessionToken {
 
     /// Parses a canonical bearer token received from a client.
     pub fn parse(value: &str) -> Result<Self, LimitError> {
-        Uuid::parse_str(value)
-            .map(|uuid| Self(uuid.to_string()))
-            .map_err(|_| LimitError::Unauthorized)
+        if let Ok(uuid) = Uuid::parse_str(value) {
+            return Ok(Self(uuid.to_string()));
+        }
+        if crate::auth::is_canonical_capability_token(value) {
+            return Ok(Self(value.to_owned()));
+        }
+        Err(LimitError::Unauthorized)
     }
 
-    fn generate() -> Self {
-        Self(Uuid::new_v4().to_string())
+    fn generate() -> Result<Self, LimitError> {
+        crate::auth::generate_random_token()
+            .map(Self)
+            .map_err(|_| LimitError::RandomUnavailable)
     }
 
     fn hash(&self) -> [u8; 32] {
@@ -436,7 +444,7 @@ impl UploadLedger {
         }
         let canonical_ip = normalize_ip(ip_key)?;
         let day = current_day_bucket();
-        let session_token = SessionToken::generate();
+        let session_token = SessionToken::generate()?;
         let capability_hash = session_token.hash();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -488,6 +496,29 @@ impl UploadLedger {
             session_token,
             upload_path,
         })
+    }
+
+    /// Replaces the temporary ledger credential with a separately scoped
+    /// bearer capability after the session subject and expiry are persisted.
+    pub fn bind_session_token(
+        &self,
+        session_id: i64,
+        current: &SessionToken,
+        replacement: &SessionToken,
+    ) -> Result<(), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, _, _, _) = load_session(&transaction, session_id, current)?;
+        let replacement_hash = replacement.hash();
+        let changed = transaction.execute(
+            "UPDATE uploads SET capability_hash = ?1 WHERE id = ?2 AND state = ?3",
+            params![replacement_hash.as_slice(), session_id, state.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(LimitError::AccountingInvariant);
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn expand(
