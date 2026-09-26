@@ -1,6 +1,8 @@
 # Build outputs
 /target/
 bin/
+!crates/fluxform-capabilities/src/bin/
+!crates/fluxform-capabilities/src/bin/**
 obj/
 publish/
 out/
