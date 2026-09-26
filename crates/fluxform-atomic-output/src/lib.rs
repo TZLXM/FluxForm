@@ -67,9 +67,12 @@ mod native {
     const ERROR_FILE_EXISTS: i32 = 80;
     const ERROR_ALREADY_EXISTS: i32 = 183;
     const ERROR_NOT_SUPPORTED: i32 = 50;
-    const ERROR_INVALID_FUNCTION: i32 = 1;
     const ERROR_INVALID_PARAMETER: i32 = 87;
     const ERROR_FILENAME_EXCED_RANGE: i32 = 206;
+
+    pub(super) fn lifecycle_blocked() -> bool {
+        false
+    }
 
     #[repr(C)]
     struct UnicodeString {
@@ -543,14 +546,14 @@ mod native {
     }
 
     pub(super) fn is_unsupported(error: &io::Error) -> bool {
+        error
+            .raw_os_error()
+            .is_some_and(|code| code == ERROR_NOT_SUPPORTED)
+    }
+
+    pub(super) fn is_invocation_gate(error: &io::Error) -> bool {
         error.raw_os_error().is_some_and(|code| {
-            [
-                ERROR_NOT_SUPPORTED,
-                ERROR_INVALID_FUNCTION,
-                ERROR_INVALID_PARAMETER,
-                ERROR_FILENAME_EXCED_RANGE,
-            ]
-            .contains(&code)
+            [ERROR_INVALID_PARAMETER, ERROR_FILENAME_EXCED_RANGE].contains(&code)
         })
     }
 
@@ -590,8 +593,6 @@ mod native {
     #[cfg(target_os = "linux")]
     const RESOLVE_BENEATH: u64 = 0x08;
     #[cfg(target_os = "linux")]
-    const RENAME_NOREPLACE: u32 = 1;
-    #[cfg(target_os = "linux")]
     const SYS_OPENAT2: libc::c_long = 437;
 
     #[cfg(target_os = "linux")]
@@ -602,10 +603,9 @@ mod native {
         resolve: u64,
     }
 
-    #[cfg(target_os = "macos")]
-    const RENAME_SWAP: u32 = 0x0000_0002;
-    #[cfg(target_os = "macos")]
-    const RENAME_EXCL: u32 = 0x0000_0004;
+    pub(super) fn lifecycle_blocked() -> bool {
+        true
+    }
 
     pub(super) fn open_trusted_root(path: &Path) -> io::Result<TrustedRootHandle> {
         let path_c = c_path(path)?;
@@ -708,138 +708,40 @@ mod native {
     }
 
     pub(super) fn rename_relative(
-        directory: &File,
+        _directory: &File,
         _source: &File,
-        source_name: &str,
-        destination_name: &str,
-        policy: OverwritePolicyV1,
+        _source_name: &str,
+        _destination_name: &str,
+        _policy: OverwritePolicyV1,
     ) -> io::Result<()> {
-        let source = CString::new(source_name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in source name"))?;
-        let destination = CString::new(destination_name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in destination name"))?;
-        #[cfg(target_os = "linux")]
-        {
-            let flags = if policy == OverwritePolicyV1::Reject {
-                RENAME_NOREPLACE
-            } else {
-                0
-            };
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_renameat2,
-                    directory.as_raw_fd(),
-                    source.as_ptr(),
-                    directory.as_raw_fd(),
-                    destination.as_ptr(),
-                    flags,
-                ) as i32
-            };
-            if result < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let source_id = identity_at(directory, source_name)?;
-            let flags = if policy == OverwritePolicyV1::Reject {
-                RENAME_EXCL
-            } else {
-                RENAME_SWAP
-            };
-            let result = unsafe {
-                libc::renameatx_np(
-                    directory.as_raw_fd(),
-                    source.as_ptr(),
-                    directory.as_raw_fd(),
-                    destination.as_ptr(),
-                    flags,
-                )
-            };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if policy == OverwritePolicyV1::Replace
-                    && error.raw_os_error() == Some(libc::ENOENT)
-                {
-                    let exclusive = unsafe {
-                        libc::renameatx_np(
-                            directory.as_raw_fd(),
-                            source.as_ptr(),
-                            directory.as_raw_fd(),
-                            destination.as_ptr(),
-                            RENAME_EXCL,
-                        )
-                    };
-                    if exclusive == 0 {
-                        return Ok(());
-                    }
-                }
-                return Err(error);
-            }
-            if identity_at(directory, source_name).is_ok()
-                && identity_at(directory, source_name)? == source_id
-            {
-                return Err(io::Error::other(
-                    "rename swap did not move the owned source",
-                ));
-            }
-            Ok(())
-        }
-    }
-
-    pub(super) fn delete_name(directory: &File, name: &str) -> io::Result<()> {
-        let name = CString::new(name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))?;
-        let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-        if result < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix output publication is disabled until validation and rename are bound to one inode",
+        ))
     }
 
     pub(super) fn delete_owned_file(
-        directory: &File,
-        name: &str,
-        expected_file: &File,
+        _directory: &File,
+        _name: &str,
+        _expected_file: &File,
     ) -> io::Result<()> {
-        if file_identity(expected_file)? != identity_at(directory, name)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "relative name no longer identifies the owned file",
-            ));
-        }
-        delete_name(directory, name)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix output cleanup is disabled until name exchange can be excluded",
+        ))
     }
 
     pub(super) fn cleanup_replaced_source(
-        directory: &File,
-        source_name: &str,
-        source: &File,
-        source_identity: FileIdentity,
-        policy: OverwritePolicyV1,
+        _directory: &File,
+        _source_name: &str,
+        _source: &File,
+        _source_identity: FileIdentity,
+        _policy: OverwritePolicyV1,
     ) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
-        if policy == OverwritePolicyV1::Replace {
-            match open_relative_file(directory, source_name, true) {
-                Ok(backup) if file_identity(&backup)? != source_identity => {
-                    delete_owned_file(directory, source_name, &backup)?;
-                }
-                Ok(_) => {
-                    return Err(io::Error::other(
-                        "atomic swap left the owned source under its partial name",
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (directory, source_name, source, source_identity, policy);
-        #[cfg(target_os = "macos")]
-        let _ = source;
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix replacement cleanup is disabled",
+        ))
     }
 
     pub(super) fn sync_directory(directory: &File) -> io::Result<()> {
@@ -907,6 +809,10 @@ mod native {
             .raw_os_error()
             .is_some_and(|code| [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP].contains(&code))
             || error.kind() == io::ErrorKind::Unsupported
+    }
+
+    pub(super) fn is_invocation_gate(_error: &io::Error) -> bool {
+        false
     }
 
     fn c_path(path: &Path) -> io::Result<CString> {
@@ -1008,6 +914,9 @@ impl TaskOutputDir {
     /// Reconciles journals in this task directory. Only strict, identity-bound
     /// records created by this crate authorize deleting their own partials.
     pub fn reconcile(&self) -> Result<ReconciliationReport, ReconcileError> {
+        if native::lifecycle_blocked() {
+            return Err(ReconcileError::PlatformBlocked);
+        }
         self.inner
             .ensure_still_attached()
             .map_err(ReconcileError::Path)?;
@@ -1053,6 +962,9 @@ impl TaskOutputDirInner {
     }
 
     fn partial_path(&self, partial_name: &str) -> Result<PathBuf, PathError> {
+        if native::lifecycle_blocked() {
+            return Err(PathError::PlatformBlocked);
+        }
         self.ensure_still_attached()?;
         Ok(self.path.join(partial_name))
     }
@@ -1364,6 +1276,10 @@ pub enum OverwritePolicyV1 {
 
 #[derive(Debug, Error)]
 pub enum PathError {
+    #[error(
+        "atomic output lifecycle is blocked on this platform until file-handle-bound validation and finalization are available"
+    )]
+    PlatformBlocked,
     #[error("invalid relative name: {0}")]
     InvalidName(String),
     #[error("name is reserved by the output service or operating system")]
@@ -1390,6 +1306,10 @@ pub enum OutputSpecError {
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    #[error("atomic output validation is blocked on this platform")]
+    PlatformBlocked,
+    #[error("FFprobe candidate changed after approval and was not spawned")]
+    ExecutableChanged,
     #[error("output validation rejected the partial file: {0}")]
     Rejected(String),
     #[error("output changed while it was being validated")]
@@ -1408,6 +1328,8 @@ pub enum ValidationError {
 
 #[derive(Debug, Error)]
 pub enum AbortError {
+    #[error("atomic output abort is blocked on this platform")]
+    PlatformBlocked,
     #[error("commit or validation has begun and cannot be aborted")]
     CommitInProgress,
     #[error("reservation is no longer writable")]
@@ -1418,10 +1340,14 @@ pub enum AbortError {
 
 #[derive(Debug, Error)]
 pub enum CommitError {
+    #[error("atomic output commit is blocked on this platform")]
+    PlatformBlocked,
     #[error("destination already exists")]
     DestinationExists,
     #[error("atomic output commit is unsupported by this filesystem or policy")]
     AtomicCommitUnsupported,
+    #[error("handle-relative native rename invocation gate failed: {0}")]
+    NativeRenameInvocationGate(#[source] io::Error),
     #[error("commit is already in progress or reservation was consumed")]
     CommitInProgress,
     #[error("the validated output is no longer owned by this reservation")]
@@ -1434,6 +1360,8 @@ pub enum CommitError {
 
 #[derive(Debug, Error)]
 pub enum ReconcileError {
+    #[error("atomic output reconciliation is blocked on this platform")]
+    PlatformBlocked,
     #[error("task directory is not the originally opened directory: {0}")]
     Path(#[source] PathError),
     #[error("directory enumeration failed: {0}")]
@@ -1450,10 +1378,14 @@ pub struct ReconciliationReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     volume: u64,
     high: u64,
     low: u64,
+}
+
+pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    native::file_identity(file)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1533,6 +1465,9 @@ impl OutputReservation {
         job_id: Uuid,
         extension: &str,
     ) -> Result<Self, PathError> {
+        if native::lifecycle_blocked() {
+            return Err(PathError::PlatformBlocked);
+        }
         validate_extension(extension, name.as_str())?;
         task_dir.inner.ensure_still_attached()?;
         let nonce = Uuid::new_v4();
@@ -1585,6 +1520,9 @@ impl OutputReservation {
     /// Returns the sibling path supplied to the output process. All filesystem
     /// mutation and finalization continues to use retained handles.
     pub fn partial_path(&self) -> Result<PathBuf, PathError> {
+        if native::lifecycle_blocked() {
+            return Err(PathError::PlatformBlocked);
+        }
         self.inner
             .task_dir
             .inner
@@ -1596,6 +1534,9 @@ impl OutputReservation {
     }
 
     pub fn abort(&self) -> Result<(), AbortError> {
+        if native::lifecycle_blocked() {
+            return Err(AbortError::PlatformBlocked);
+        }
         let mut state = self.inner.lock_state();
         match state.phase {
             Phase::Writing => {
@@ -1648,6 +1589,9 @@ impl OutputReservation {
         validator: &dyn OutputValidator,
         expectation: &OutputExpectation,
     ) -> Result<ValidatedOutput, ValidationError> {
+        if native::lifecycle_blocked() {
+            return Err(ValidationError::PlatformBlocked);
+        }
         let mut state = self.inner.lock_state();
         if state.phase != Phase::Writing {
             return Err(ValidationError::Rejected(
@@ -1851,6 +1795,9 @@ fn commit_boundary(boundary: CommitBoundary) -> io::Result<()> {
 impl ValidatedOutput {
     /// Atomically publishes the validated sibling under the selected policy.
     pub fn commit(self, policy: OverwritePolicyV1) -> Result<CommitReceipt, CommitError> {
+        if native::lifecycle_blocked() {
+            return Err(CommitError::PlatformBlocked);
+        }
         let mut state = self.inner.lock_state();
         if state.phase != Phase::Validated
             || state.validated_hash.as_deref() != Some(&self.content_sha256)
@@ -1864,11 +1811,7 @@ impl ValidatedOutput {
         let journal = journal_slot.as_ref().ok_or(CommitError::OwnershipChanged)?;
         commit_boundary(CommitBoundary::BeforeSourceFlush).map_err(CommitError::Native)?;
         if let Err(error) = partial.sync_all() {
-            return Err(if native::is_unsupported(&error) {
-                CommitError::AtomicCommitUnsupported
-            } else {
-                CommitError::Native(error)
-            });
+            return Err(map_native_commit_error(error));
         }
         commit_boundary(CommitBoundary::AfterSourceFlush).map_err(CommitError::Native)?;
         let source_identity = native::file_identity(partial).map_err(CommitError::Native)?;
@@ -1884,11 +1827,7 @@ impl ValidatedOutput {
             if native::is_exists(&error) && policy == OverwritePolicyV1::Reject {
                 return Err(CommitError::DestinationExists);
             }
-            return Err(if native::is_unsupported(&error) {
-                CommitError::AtomicCommitUnsupported
-            } else {
-                CommitError::Native(error)
-            });
+            return Err(map_native_commit_error(error));
         }
         commit_boundary(CommitBoundary::AfterNativeRename)
             .map_err(|error| CommitError::ReconciliationRequired(error.to_string()))?;
@@ -1965,7 +1904,17 @@ enum ReconcileAction {
     NoChange,
 }
 
-#[cfg(test)]
+fn map_native_commit_error(error: io::Error) -> CommitError {
+    if native::is_invocation_gate(&error) {
+        CommitError::NativeRenameInvocationGate(error)
+    } else if native::is_unsupported(&error) {
+        CommitError::AtomicCommitUnsupported
+    } else {
+        CommitError::Native(error)
+    }
+}
+
+#[cfg(all(test, windows))]
 mod native_tests {
     use super::*;
     use std::process::Command;
@@ -2081,7 +2030,7 @@ mod native_tests {
             CommitBoundary::AfterJournalCleanup,
         ];
         let mut injected = 0;
-        let mut blocked_after_rename = 0;
+        let mut blocked_at_rename_gate = 0;
         for boundary in boundaries {
             let (_temporary, root) = fixture();
             let task = task_dir(&root);
@@ -2129,9 +2078,12 @@ mod native_tests {
                     | CommitBoundary::AfterReplacementCleanup
                     | CommitBoundary::BeforeJournalCleanup
                     | CommitBoundary::AfterJournalCleanup,
-                    Err(CommitError::AtomicCommitUnsupported),
+                    Err(
+                        CommitError::AtomicCommitUnsupported
+                        | CommitError::NativeRenameInvocationGate(_),
+                    ),
                 ) => {
-                    blocked_after_rename += 1;
+                    blocked_at_rename_gate += 1;
                     OLD
                 }
                 (
@@ -2175,7 +2127,7 @@ mod native_tests {
             );
         }
         eprintln!(
-            "replacement failure injection: exercised={injected}/14 boundaries; blocked_after_native_rename={blocked_after_rename}/11"
+            "replacement failure injection: exercised={injected}/14 boundaries; blocked_at_native_rename_gate={blocked_at_rename_gate}/11 post-rename boundaries"
         );
     }
 
@@ -2241,11 +2193,11 @@ mod native_tests {
             if mode == "after" && bytes == OLD {
                 let child_output = String::from_utf8_lossy(&output.stderr);
                 assert!(
-                    child_output.contains("AtomicCommitUnsupported"),
+                    child_output.contains("NativeRenameInvocationGate"),
                     "old final after the-rename child exit was not explained by the unsupported gate: {child_output}"
                 );
                 eprintln!(
-                    "BLOCKED: crash-after-rename evidence unavailable; handle-relative native rename returned AtomicCommitUnsupported before the injected crash"
+                    "BLOCKED: crash-after-rename evidence unavailable; handle-relative native rename returned NativeRenameInvocationGate before the injected crash"
                 );
             } else {
                 assert_eq!(bytes, expected_final, "crash mode {mode}");
@@ -2291,7 +2243,7 @@ mod native_tests {
             Err(error) => {
                 let code = error.raw_os_error();
                 assert!(
-                    native::is_unsupported(&error),
+                    native::is_unsupported(&error) || native::is_invocation_gate(&error),
                     "unexpected native error from handle-relative FileRenameInfo: {error:?}"
                 );
                 assert!(
@@ -2311,7 +2263,7 @@ mod native_tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_commit_maps_error_87_to_atomic_unsupported_without_mutation() {
+    fn windows_commit_maps_error_87_to_invocation_gate_without_mutation() {
         let (_temporary, root) = fixture();
         let task = task_dir(&root);
         let validated = validated(&task);
@@ -2324,15 +2276,22 @@ mod native_tests {
             .expect("owned partial path");
 
         match validated.commit(OverwritePolicyV1::Reject) {
-            Err(CommitError::AtomicCommitUnsupported) => {
+            Err(CommitError::NativeRenameInvocationGate(error))
+                if matches!(error.raw_os_error(), Some(87 | 206)) =>
+            {
                 assert!(
                     !final_path.exists(),
                     "unsupported commit created a final name"
                 );
                 assert!(partial_path.exists(), "unsupported commit lost its partial");
                 println!(
-                    "BLOCKED Windows commit result: ERROR_INVALID_PARAMETER (87) mapped to AtomicCommitUnsupported"
+                    "BLOCKED Windows invocation gate: raw rename error {:?}; no final mutation",
+                    error.raw_os_error()
                 );
+            }
+            Err(CommitError::AtomicCommitUnsupported) => {
+                assert!(!final_path.exists());
+                assert!(partial_path.exists());
             }
             Ok(_) => assert_eq!(std::fs::read(final_path).expect("final output"), NEW),
             Err(error) => panic!("unexpected Windows commit error: {error}"),
@@ -2341,8 +2300,71 @@ mod native_tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_relative_rename_name_range_error_is_classified_as_unsupported() {
-        let error = io::Error::from_raw_os_error(206);
-        assert!(native::is_unsupported(&error));
+    fn windows_unresolved_rename_errors_are_not_capability_evidence() {
+        for code in [87, 206] {
+            let error = io::Error::from_raw_os_error(code);
+            assert!(!native::is_unsupported(&error));
+            assert!(native::is_invocation_gate(&error));
+        }
+        assert!(native::is_unsupported(&io::Error::from_raw_os_error(50)));
+        assert!(!native::is_unsupported(&io::Error::from_raw_os_error(1)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_native_tests {
+    use super::*;
+
+    #[test]
+    fn unix_mutators_fail_closed_after_adversarial_name_exchange() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let directory_path = temporary.path().join("task");
+        std::fs::create_dir(&directory_path).expect("task directory");
+        let root = open_trusted_root(temporary.path()).expect("trusted root");
+        let directory =
+            native::open_relative_directory(&root.file, "task").expect("opened task directory");
+        let original_path = directory_path.join("owned.partial");
+        let substituted_path = directory_path.join("substituted");
+        std::fs::write(&original_path, b"validated bytes").expect("original partial");
+        let original = native::open_relative_file(&directory, "owned.partial", false)
+            .expect("owned partial handle");
+        let original_identity = native::file_identity(&original).expect("original identity");
+
+        // Simulate a name exchange after validation but immediately before a
+        // pathname-relative finalization attempt. Disabled native mutations
+        // must neither publish the substitute nor unlink it as an owned file.
+        std::fs::rename(&original_path, &substituted_path).expect("move original name");
+        std::fs::write(&original_path, b"unvalidated replacement")
+            .expect("substitute unvalidated name");
+        let rename = native::rename_relative(
+            &directory,
+            &original,
+            "owned.partial",
+            "result.png",
+            OverwritePolicyV1::Reject,
+        );
+        assert_eq!(
+            rename.expect_err("Unix rename adapter disabled").kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            std::fs::read(&original_path).expect("substituted name"),
+            b"unvalidated replacement"
+        );
+        assert!(!directory_path.join("result.png").exists());
+
+        let delete = native::delete_owned_file(&directory, "owned.partial", &original);
+        assert_eq!(
+            delete.expect_err("Unix deletion adapter disabled").kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            std::fs::read(&original_path).expect("still present"),
+            b"unvalidated replacement"
+        );
+        assert_eq!(
+            native::file_identity(&original).expect("original handle"),
+            original_identity
+        );
     }
 }

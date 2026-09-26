@@ -1,8 +1,11 @@
-use crate::{OutputExpectation, ValidationError};
+use crate::{FileIdentity, OutputExpectation, ValidationError, file_identity};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::fs;
-use std::io::{self, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -28,6 +31,13 @@ pub trait OutputValidator: Send + Sync {
 pub struct FfprobeOutputValidator {
     ffprobe_path: PathBuf,
     protocol_whitelist: &'static str,
+    fingerprint: ExecutableFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecutableFingerprint {
+    identity: FileIdentity,
+    sha256: [u8; 32],
 }
 
 impl FfprobeOutputValidator {
@@ -46,18 +56,21 @@ impl FfprobeOutputValidator {
             ));
         }
         let ffprobe_path = ffprobe_path.as_ref();
-        let metadata = fs::symlink_metadata(ffprobe_path).map_err(|error| {
-            ValidationError::Rejected(format!("cannot inspect FFprobe candidate: {error}"))
+        let fingerprint = executable_fingerprint(ffprobe_path).map_err(|error| {
+            ValidationError::Rejected(format!("cannot approve FFprobe candidate: {error}"))
         })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(ValidationError::Rejected(
-                "FFprobe candidate must be a regular non-symlink file".to_owned(),
-            ));
-        }
         Ok(Self {
             ffprobe_path: ffprobe_path.to_path_buf(),
             protocol_whitelist: "file,pipe",
+            fingerprint,
         })
+    }
+
+    fn verify_candidate(&self) -> Result<(), ValidationError> {
+        match executable_fingerprint(&self.ffprobe_path) {
+            Ok(current) if current == self.fingerprint => Ok(()),
+            _ => Err(ValidationError::ExecutableChanged),
+        }
     }
 
     fn arguments(&self, partial_path: &Path) -> Vec<String> {
@@ -77,6 +90,7 @@ impl FfprobeOutputValidator {
     }
 
     fn probe(&self, partial_path: &Path) -> Result<Value, ValidationError> {
+        self.verify_candidate()?;
         let mut child = Command::new(&self.ffprobe_path)
             .args(self.arguments(partial_path))
             .stdin(Stdio::null())
@@ -158,6 +172,58 @@ impl FfprobeOutputValidator {
         serde_json::from_slice(&stdout)
             .map_err(|error| ValidationError::Ffprobe(format!("invalid FFprobe JSON: {error}")))
     }
+}
+
+fn executable_fingerprint(path: &Path) -> io::Result<ExecutableFingerprint> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FFprobe candidate must be a regular non-reparse file",
+            ));
+        }
+        hash_executable(file)
+    }
+    #[cfg(not(windows))]
+    {
+        hash_executable(options.open(path)?)
+    }
+}
+
+fn hash_executable(mut file: File) -> io::Result<ExecutableFingerprint> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "FFprobe candidate must be a regular file",
+        ));
+    }
+    let identity = file_identity(&file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let sha256 = hasher.finalize().into();
+    Ok(ExecutableFingerprint { identity, sha256 })
 }
 
 impl OutputValidator for FfprobeOutputValidator {
@@ -585,6 +651,34 @@ mod tests {
                 "partial output.png"
             ]
         );
+    }
+
+    #[test]
+    fn replacing_ffprobe_candidate_after_construction_is_rejected_before_spawn() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let candidate = temporary.path().join("ffprobe-candidate.exe");
+        let original = temporary.path().join("approved-original.exe");
+        let partial = temporary.path().join("input.png");
+        fs::copy(
+            std::env::current_exe().expect("test executable"),
+            &candidate,
+        )
+        .expect("create candidate executable");
+        fs::write(
+            &partial,
+            b"input is not read when executable identity changes",
+        )
+        .expect("input file");
+        let validator =
+            FfprobeOutputValidator::new(&candidate, "file,pipe").expect("approved candidate");
+
+        fs::rename(&candidate, &original).expect("move approved candidate away");
+        fs::write(&candidate, b"replacement executable").expect("install unapproved replacement");
+
+        assert!(matches!(
+            validator.validate(&partial, &expectation()),
+            Err(ValidationError::ExecutableChanged)
+        ));
     }
 
     #[test]

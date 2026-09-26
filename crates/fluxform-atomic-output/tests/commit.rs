@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use fluxform_atomic_output::{
     AbortError, CommitError, FfmpegOutputSpec, OutputExpectation, OutputReservation,
     OutputValidator, OverwritePolicyV1, RelativeOutputName, TaskOutputDir, ValidationError,
@@ -193,7 +195,10 @@ fn directory_swap_cannot_redirect_creation_outside_task_handle() {
             let commit = validated.commit(OverwritePolicyV1::Reject);
             match commit {
                 Ok(_) => assert!(moved_task.join("result.png").exists()),
-                Err(CommitError::AtomicCommitUnsupported) => {
+                Err(
+                    CommitError::AtomicCommitUnsupported
+                    | CommitError::NativeRenameInvocationGate(_),
+                ) => {
                     assert!(!moved_task.join("result.png").exists());
                     assert!(
                         fs::read_dir(&moved_task)
@@ -222,7 +227,10 @@ fn directory_swap_cannot_redirect_creation_outside_task_handle() {
             let final_path = output.final_path().to_path_buf();
             match validated.commit(OverwritePolicyV1::Reject) {
                 Ok(_) => assert_eq!(fs::read(final_path).expect("committed output"), NEW_BYTES),
-                Err(CommitError::AtomicCommitUnsupported) => assert!(!final_path.exists()),
+                Err(
+                    CommitError::AtomicCommitUnsupported
+                    | CommitError::NativeRenameInvocationGate(_),
+                ) => assert!(!final_path.exists()),
                 Err(error) => panic!("unexpected handle-relative commit error: {error}"),
             }
             assert!(!outside.join("result.png").exists());
@@ -251,7 +259,9 @@ fn reject_never_replaces_an_existing_destination() {
     assert!(
         matches!(
             &result,
-            Err(CommitError::DestinationExists | CommitError::AtomicCommitUnsupported)
+            Err(CommitError::DestinationExists
+                | CommitError::AtomicCommitUnsupported
+                | CommitError::NativeRenameInvocationGate(_))
         ),
         "reject policy returned an unexpected error: {result:?}"
     );
@@ -277,7 +287,7 @@ fn rename_commits_to_a_unique_sibling_without_race_prone_precheck() {
             fs::read(output.final_path()).expect("final output"),
             NEW_BYTES
         ),
-        Err(CommitError::AtomicCommitUnsupported) => {
+        Err(CommitError::AtomicCommitUnsupported | CommitError::NativeRenameInvocationGate(_)) => {
             assert!(!output.final_path().exists());
             assert!(output.partial_path().expect("partial path").exists());
         }
@@ -341,13 +351,8 @@ fn two_validated_writers_race_for_one_destination_without_clobbering() {
     let first_result = first_commit.join().expect("first writer");
     let second_result = second_commit.join().expect("second writer");
     let successes = usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
-    let unsupported = usize::from(matches!(
-        first_result,
-        Err(CommitError::AtomicCommitUnsupported)
-    )) + usize::from(matches!(
-        second_result,
-        Err(CommitError::AtomicCommitUnsupported)
-    ));
+    let unsupported = usize::from(is_commit_gate_blocked(&first_result))
+        + usize::from(is_commit_gate_blocked(&second_result));
     if unsupported == 2 {
         assert_eq!(successes, 0);
         assert!(!final_path.exists());
@@ -389,7 +394,7 @@ fn replace_atomically_supersedes_an_existing_destination() {
     let result = validated.commit(OverwritePolicyV1::Replace);
     match result {
         Ok(_) => assert_eq!(fs::read(&final_path).expect("final output"), NEW_BYTES),
-        Err(CommitError::AtomicCommitUnsupported) => {
+        Err(CommitError::AtomicCommitUnsupported | CommitError::NativeRenameInvocationGate(_)) => {
             assert_eq!(fs::read(&final_path).expect("old final remains"), OLD_BYTES);
             assert!(output.partial_path().expect("partial path").exists());
         }
@@ -576,6 +581,12 @@ fn concurrent_abort_and_commit_have_only_aborted_or_committed_terminal_states() 
                 {
                     blocked_native_count += 1;
                 }
+                (Err(commit_error), Err(AbortError::CommitInProgress))
+                    if commit_error
+                        .contains("handle-relative native rename invocation gate failed") =>
+                {
+                    blocked_native_count += 1;
+                }
                 other => panic!("invalid abort/commit race outcome: {other:?}"),
             }
         }
@@ -587,4 +598,13 @@ fn concurrent_abort_and_commit_have_only_aborted_or_committed_terminal_states() 
     eprintln!(
         "1,000 abort/commit races: committed={committed_count}, aborted={aborted_count}, blocked_by_native_rename={blocked_native_count}"
     );
+}
+
+fn is_commit_gate_blocked(
+    result: &Result<fluxform_atomic_output::CommitReceipt, CommitError>,
+) -> bool {
+    matches!(
+        result,
+        Err(CommitError::AtomicCommitUnsupported | CommitError::NativeRenameInvocationGate(_))
+    )
 }
