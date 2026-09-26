@@ -298,9 +298,21 @@ fn validate_document(document: &mut ManifestDocument) -> Result<(), ManifestErro
             }
         }
         validate_names("input_extensions", &edge.input_extensions, true)?;
-        validate_names("input_demuxers", &edge.input_demuxers, false)?;
+        validate_names("input_demuxers", &edge.input_demuxers, true)?;
+        if edge.input_demuxers.len() != 1 {
+            return Err(ManifestError::Invalid(format!(
+                "edge {} must declare exactly one input demuxer; use another edge for a different demuxer",
+                edge.id
+            )));
+        }
         validate_names("input_codecs", &edge.input_codecs, true)?;
-        validate_name("output_format", &edge.output_format, false)?;
+        if edge.input_codecs.len() != 1 {
+            return Err(ManifestError::Invalid(format!(
+                "edge {} must declare exactly one input codec; use another edge for a different codec",
+                edge.id
+            )));
+        }
+        validate_name("output_format", &edge.output_format, true)?;
         validate_name("output_muxer", &edge.output_muxer, true)?;
         if let Some(codec) = &edge.video_codec {
             validate_name("video_codec", codec, true)?;
@@ -314,8 +326,8 @@ fn validate_document(document: &mut ManifestDocument) -> Result<(), ManifestErro
                 edge.id
             )));
         }
-        validate_names("stream_map", &edge.stream_map, false)?;
-        validate_names("profile_ids", &edge.profile_ids, false)?;
+        validate_names("stream_map", &edge.stream_map, true)?;
+        validate_names("profile_ids", &edge.profile_ids, true)?;
         for profile_id in &edge.profile_ids {
             if target_for_profile_id(profile_id).is_none() {
                 return Err(ManifestError::Invalid(format!(
@@ -451,15 +463,26 @@ fn normalize_extension(extension: &str) -> String {
         .to_ascii_lowercase()
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PathPart {
     Key(String),
     Index(usize),
 }
 
+/// Parses the deliberately narrow capability-manifest TOML subset.
+///
+/// Supported syntax is UTF-8 text with simple bare keys, `[[edges]]`,
+/// `[edges.options.<name>]`, double-quoted single-line basic strings using
+/// `\"`, `\\`, `\b`, `\t`, `\n`, `\f`, `\r`, or `\uXXXX` escapes,
+/// lowercase booleans, signed base-10 64-bit integers without separators or
+/// leading zeroes, and single-line scalar arrays with an optional trailing
+/// comma. Comments start with `#` outside strings. Other TOML forms (including
+/// JSON `null`, floats, dates, literal or multiline strings, nested arrays,
+/// quoted or dotted keys, and other table headers) are rejected.
 fn parse_toml_subset(input: &str) -> Result<Value, ManifestError> {
     let mut root = Value::Object(Map::new());
     let mut context = Vec::new();
+    let mut declared_tables = BTreeSet::new();
 
     for (line_index, original) in input.lines().enumerate() {
         let line_number = line_index + 1;
@@ -469,30 +492,36 @@ fn parse_toml_subset(input: &str) -> Result<Value, ManifestError> {
         }
         if line.starts_with("[[") && line.ends_with("]]") {
             let path = parse_header(&line[2..line.len() - 2], line_number)?;
-            if path.is_empty() {
-                return Err(toml_error(line_number, "empty array table"));
+            if path.as_slice() != ["edges"] {
+                return Err(toml_error(
+                    line_number,
+                    "only the [[edges]] array table is supported",
+                ));
             }
-            let (last, parents) = path.split_last().expect("non-empty header path");
-            let mut parent_context = ensure_table_path(&mut root, parents, line_number)?;
-            let parent = value_at_path_mut(&mut root, &parent_context)
-                .ok_or_else(|| toml_error(line_number, "invalid array table parent"))?;
-            let object = parent
+            let object = root
                 .as_object_mut()
-                .ok_or_else(|| toml_error(line_number, "array table parent is not a table"))?;
+                .ok_or_else(|| toml_error(line_number, "root is not a table"))?;
             let array = object
-                .entry(last.clone())
+                .entry("edges".to_owned())
                 .or_insert_with(|| Value::Array(Vec::new()));
             let array = array
                 .as_array_mut()
                 .ok_or_else(|| toml_error(line_number, "array table conflicts with a value"))?;
             let index = array.len();
             array.push(Value::Object(Map::new()));
-            parent_context.push(PathPart::Key(last.clone()));
-            parent_context.push(PathPart::Index(index));
-            context = parent_context;
+            context = vec![PathPart::Key("edges".to_owned()), PathPart::Index(index)];
         } else if line.starts_with('[') && line.ends_with(']') {
             let path = parse_header(&line[1..line.len() - 1], line_number)?;
+            if path.len() != 3 || path[0] != "edges" || path[1] != "options" {
+                return Err(toml_error(
+                    line_number,
+                    "only [edges.options.<name>] tables are supported",
+                ));
+            }
             context = ensure_table_path(&mut root, &path, line_number)?;
+            if !declared_tables.insert(context.clone()) {
+                return Err(toml_error(line_number, "duplicate table header"));
+            }
         } else {
             let (key, raw_value) = line
                 .split_once('=')
@@ -571,12 +600,24 @@ fn parse_header(value: &str, line_number: usize) -> Result<Vec<String>, Manifest
 }
 
 fn parse_value(value: &str) -> Result<Value, String> {
-    if value.starts_with('[') && value.ends_with(']') {
+    if value.starts_with('[') || value.ends_with(']') {
+        if !value.starts_with('[') || !value.ends_with(']') {
+            return Err("malformed single-line array".to_owned());
+        }
         let inner = &value[1..value.len() - 1];
+        if inner.trim().is_empty() {
+            return Ok(Value::Array(Vec::new()));
+        }
+        let items = split_array(inner)?;
+        let last_index = items.len() - 1;
+        let has_trailing_comma = inner.trim_end().ends_with(',');
         let mut values = Vec::new();
-        for item in split_array(inner)? {
+        for (index, item) in items.into_iter().enumerate() {
             if item.trim().is_empty() {
-                continue;
+                if has_trailing_comma && index == last_index {
+                    continue;
+                }
+                return Err("empty array element".to_owned());
             }
             values.push(parse_scalar(item.trim())?);
         }
@@ -586,8 +627,63 @@ fn parse_value(value: &str) -> Result<Value, String> {
 }
 
 fn parse_scalar(value: &str) -> Result<Value, String> {
-    serde_json::from_str(value)
-        .map_err(|_| "only JSON-compatible TOML scalar values are supported".to_owned())
+    if value.starts_with('"') {
+        validate_basic_string(value)?;
+        return serde_json::from_str(value)
+            .map_err(|_| "invalid double-quoted TOML basic string".to_owned());
+    }
+    match value {
+        "true" => return Ok(Value::Bool(true)),
+        "false" => return Ok(Value::Bool(false)),
+        _ => {}
+    }
+    if is_decimal_integer(value) {
+        let integer_text = value.strip_prefix('+').unwrap_or(value);
+        let integer = integer_text
+            .parse::<i64>()
+            .map_err(|_| "TOML integer is outside the supported 64-bit range".to_owned())?;
+        return Ok(Value::Number(integer.into()));
+    }
+    Err("expected a quoted string, lowercase boolean, or decimal integer".to_owned())
+}
+
+fn validate_basic_string(value: &str) -> Result<(), String> {
+    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+        return Err("malformed double-quoted TOML basic string".to_owned());
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return Err("unescaped quote in TOML basic string".to_owned()),
+            '\\' => match characters.next() {
+                Some('b' | 't' | 'n' | 'f' | 'r' | '"' | '\\') => {}
+                Some('u') => {
+                    for _ in 0..4 {
+                        if !characters
+                            .next()
+                            .is_some_and(|value| value.is_ascii_hexdigit())
+                        {
+                            return Err("invalid TOML unicode escape".to_owned());
+                        }
+                    }
+                }
+                _ => return Err("unsupported TOML basic string escape".to_owned()),
+            },
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn is_decimal_integer(value: &str) -> bool {
+    let digits = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'))
 }
 
 fn split_array(value: &str) -> Result<Vec<&str>, String> {

@@ -205,6 +205,20 @@ fn complete_manifest_matches_only_a_fully_probed_directed_edge() {
         .expect("fully matching directed edge");
     assert_eq!(edge.id, "image.jpeg-to-png");
     assert_eq!(edge.input_extensions, ["jpg", "jpeg"]);
+    assert!(
+        manifest
+            .find_edge(
+                ConversionCategory::Image,
+                &InputProbeV1 {
+                    extension: "jpeg".to_owned(),
+                    demuxer: "image2".to_owned(),
+                    codec: "png".to_owned(),
+                    topology: "single_video_frame".to_owned(),
+                },
+                "png",
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -223,6 +237,57 @@ fn rejects_duplicate_edge_ids_and_wildcard_or_extension_only_matching() {
         .replace("input_demuxers = [\"image2\"]", "input_demuxers = []")
         .replace("input_codecs = [\"mjpeg\"]", "input_codecs = []");
     assert_manifest_rejected(&extension_only);
+}
+
+#[test]
+fn rejects_multiple_demuxers_that_would_create_input_cross_products() {
+    assert_manifest_rejected(&VALID_MANIFEST.replace(
+        "input_demuxers = [\"image2\"]",
+        "input_demuxers = [\"image2\", \"rawvideo\"]",
+    ));
+}
+
+#[test]
+fn rejects_multiple_codecs_that_would_create_input_cross_products() {
+    assert_manifest_rejected(&VALID_MANIFEST.replace(
+        "input_codecs = [\"mjpeg\"]",
+        "input_codecs = [\"mjpeg\", \"png\"]",
+    ));
+}
+
+#[test]
+fn rejects_wildcards_in_demuxer_selectors() {
+    assert_manifest_rejected(
+        &VALID_MANIFEST.replace("input_demuxers = [\"image2\"]", "input_demuxers = [\"*\"]"),
+    );
+}
+
+#[test]
+fn rejects_wildcards_in_output_format_selectors() {
+    assert_manifest_rejected(
+        &VALID_MANIFEST.replace("output_format = \"png\"", "output_format = \"?\""),
+    );
+}
+
+#[test]
+fn rejects_empty_toml_array_elements() {
+    assert_manifest_rejected(&VALID_MANIFEST.replace(
+        "input_extensions = [\"jpg\", \"jpeg\"]",
+        "input_extensions = [\"jpg\",, \"jpeg\"]",
+    ));
+}
+
+#[test]
+fn rejects_json_null_as_a_toml_value() {
+    assert_manifest_rejected(&VALID_MANIFEST.replace(
+        "video_codec = \"png\"",
+        "video_codec = \"png\"\naudio_codec = null",
+    ));
+}
+
+#[test]
+fn rejects_json_only_escape_in_toml_string() {
+    assert_manifest_rejected(&VALID_MANIFEST.replace("image.jpeg-to-png", r#"image\/jpeg-to-png"#));
 }
 
 #[test]
