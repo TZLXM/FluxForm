@@ -795,6 +795,67 @@ fn populated_legacy_sessions_in_every_state_are_retired_and_their_files_enqueued
 }
 
 #[test]
+fn populated_v0_nested_cleanup_retries_a_link_and_deletes_after_safe_restore() {
+    let temp_dir = TempDir::new().unwrap();
+    let upload_root = temp_dir.path().join("upload-root");
+    let attacker_dir = temp_dir.path().join("attacker-target");
+    fs::create_dir(&upload_root).unwrap();
+    fs::create_dir(&attacker_dir).unwrap();
+    let outside_payload = attacker_dir.join("payload.bin");
+    fs::write(&outside_payload, b"must survive").unwrap();
+    let legacy_directory = upload_root.join("uploads");
+    create_directory_link(&attacker_dir, &legacy_directory);
+
+    let db_path = temp_dir.path().join("ledger.sqlite3");
+    let legacy = Connection::open(&db_path).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE global_budget(singleton INTEGER PRIMARY KEY, reserved_bytes INTEGER NOT NULL);
+             INSERT INTO global_budget(singleton, reserved_bytes) VALUES (1, 0);
+             CREATE TABLE ip_identities(id INTEGER PRIMARY KEY AUTOINCREMENT);
+             INSERT INTO ip_identities(id) VALUES (1);
+             CREATE TABLE ip_hashes(identity_id INTEGER NOT NULL, ip_hash TEXT NOT NULL UNIQUE,
+                 PRIMARY KEY(identity_id, ip_hash));
+             CREATE TABLE daily_usage(identity_id INTEGER NOT NULL, day INTEGER NOT NULL,
+                 used_bytes INTEGER NOT NULL, PRIMARY KEY(identity_id, day));
+             CREATE TABLE uploads(id INTEGER PRIMARY KEY AUTOINCREMENT, identity_id INTEGER NOT NULL,
+                 state TEXT NOT NULL, reserved_bytes INTEGER NOT NULL, actual_bytes INTEGER,
+                 created_day INTEGER NOT NULL, upload_path TEXT);
+             CREATE TABLE cleanup_outbox(session_id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO uploads(identity_id, state, reserved_bytes, actual_bytes, created_day, upload_path)
+                 VALUES (1, 'uploaded', 0, 1, 0, 'uploads/payload.bin');
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    drop(legacy);
+
+    let ledger = UploadLedger::open(&db_path, &upload_root, limits(), vec![SECRET_A])
+        .expect("a populated authentic v0 ledger should migrate");
+
+    let first = ledger.reconcile_cleanup_jobs().unwrap();
+    assert_eq!(first.completed, 0);
+    assert_eq!(
+        first.retryable, 1,
+        "a linked legacy parent must be rejected"
+    );
+    assert_eq!(cleanup_job_attempts_at(&db_path), 1);
+    assert_eq!(fs::read(&outside_payload).unwrap(), b"must survive");
+
+    remove_directory_link(&legacy_directory);
+    fs::create_dir(&legacy_directory).unwrap();
+    let in_root_payload = legacy_directory.join("payload.bin");
+    fs::write(&in_root_payload, b"legacy payload").unwrap();
+
+    let second = ledger.reconcile_cleanup_jobs().unwrap();
+    assert_eq!(second.completed, 1);
+    assert_eq!(second.retryable, 0);
+    assert!(!in_root_payload.exists());
+    assert_eq!(cleanup_job_count_at(&db_path), 0);
+    assert_eq!(fs::read(outside_payload).unwrap(), b"must survive");
+}
+
+#[test]
 fn populated_legacy_quota_is_preserved_with_an_operator_retained_key_id() {
     let temp_dir = TempDir::new().unwrap();
     let mut configured = limits();
@@ -1015,6 +1076,49 @@ fn cleanup_job_count(temp_dir: &TempDir) -> i64 {
     raw_connection(temp_dir)
         .query_row("SELECT COUNT(*) FROM cleanup_outbox", [], |row| row.get(0))
         .unwrap()
+}
+
+fn cleanup_job_count_at(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM cleanup_outbox", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn cleanup_job_attempts_at(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row("SELECT attempts FROM cleanup_outbox", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn create_directory_link(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &Path, link: &Path) {
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "junction creation failed: {output:?}"
+    );
+}
+
+#[cfg(unix)]
+fn remove_directory_link(link: &Path) {
+    fs::remove_file(link).unwrap();
+}
+
+#[cfg(windows)]
+fn remove_directory_link(link: &Path) {
+    fs::remove_dir(link).unwrap();
 }
 
 fn cleanup_job_attempts(temp_dir: &TempDir) -> i64 {

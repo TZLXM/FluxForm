@@ -247,6 +247,7 @@ impl DiskSpaceProvider for SystemDiskSpace {
 pub struct UploadLedger {
     database_path: PathBuf,
     upload_root: PathBuf,
+    upload_root_directory: Arc<SecureReservationDirectory>,
     reservation_directory: Arc<SecureReservationDirectory>,
     limits: LedgerLimits,
     disk_space: Arc<dyn DiskSpaceProvider>,
@@ -342,6 +343,9 @@ impl UploadLedger {
         if !upload_root.is_dir() {
             return Err(LimitError::InvalidConfiguration);
         }
+        let upload_root_directory = Arc::new(
+            SecureReservationDirectory::open(&upload_root).map_err(LimitError::Filesystem)?,
+        );
         let reservations_dir = upload_root.join(".fluxform-reservations");
         match fs::create_dir(&reservations_dir) {
             Ok(()) => {}
@@ -355,6 +359,7 @@ impl UploadLedger {
         let ledger = Self {
             database_path: database_path.as_ref().to_path_buf(),
             upload_root,
+            upload_root_directory,
             reservation_directory,
             limits,
             disk_space,
@@ -987,9 +992,48 @@ impl UploadLedger {
     where
         F: FnOnce(),
     {
-        let leaf = reservation_leaf(relative)?;
+        let normalized = normalize_relative_path(relative).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid upload cleanup path")
+        })?;
+        let relative = Path::new(&normalized);
+        let mut components = Vec::new();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid upload cleanup component",
+                ));
+            };
+            let component = component.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "upload cleanup component is not UTF-8",
+                )
+            })?;
+            if component.is_empty()
+                || component.contains(['/', '\\', '\0'])
+                || cfg!(windows) && component.contains(':')
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid upload cleanup component",
+                ));
+            }
+            components.push(component.to_owned());
+        }
+        if components.len() == 2 && components[0] == ".fluxform-reservations" {
+            before_remove();
+            return self.reservation_directory.remove_file(&components[1]);
+        }
+        let leaf = components.pop().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "empty upload cleanup path")
+        })?;
+        let mut parent = self.upload_root_directory.try_clone()?;
+        for component in components {
+            parent = parent.open_directory_child(&component)?;
+        }
         before_remove();
-        self.reservation_directory.remove_file(&leaf)
+        parent.remove_file(&leaf)
     }
 }
 
@@ -1125,6 +1169,23 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(unix)]
+    fn open_directory_child(&self, leaf: &str) -> io::Result<Self> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let leaf = CString::new(leaf)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(self.handle.as_raw_fd(), leaf.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            handle: unsafe { fs::File::from_raw_fd(fd) },
+        })
+    }
+
+    #[cfg(unix)]
     fn open_file(&self, leaf: &str, create_new: bool) -> io::Result<fs::File> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -1222,6 +1283,11 @@ impl SecureReservationDirectory {
         windows_open_relative_file(&self.handle, leaf, create_new, false)
     }
 
+    #[cfg(windows)]
+    fn open_directory_child(&self, leaf: &str) -> io::Result<Self> {
+        windows_open_relative_directory(&self.handle, leaf).map(|handle| Self { handle })
+    }
+
     #[cfg(not(any(unix, windows)))]
     fn open(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
@@ -1236,6 +1302,20 @@ impl SecureReservationDirectory {
             io::ErrorKind::Unsupported,
             "secure relative file access is unsupported",
         ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open_directory_child(&self, _leaf: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure relative directory access is unsupported",
+        ))
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            handle: self.handle.try_clone()?,
+        })
     }
 
     fn remove_file(&self, leaf: &str) -> io::Result<()> {
@@ -1559,6 +1639,134 @@ fn windows_open_relative_file(
         ));
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_open_relative_directory(directory: &fs::File, leaf: &str) -> io::Result<fs::File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: *mut std::ffi::c_void,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: *mut std::ffi::c_void,
+        information: usize,
+    }
+    #[repr(C)]
+    struct FileAttributeTagInfo {
+        attributes: u32,
+        reparse_tag: u32,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut *mut std::ffi::c_void,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            info_class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    if leaf.is_empty() || leaf.contains(['\\', '/', ':', '\0']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid directory name",
+        ));
+    }
+    let mut name: Vec<u16> = leaf.encode_utf16().collect();
+    let byte_len = u16::try_from(name.len().saturating_mul(2))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "directory name too long"))?;
+    let mut unicode_name = UnicodeString {
+        length: byte_len,
+        maximum_length: byte_len,
+        buffer: name.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: directory.as_raw_handle().cast(),
+        object_name: &mut unicode_name,
+        attributes: 0x40 | 0x1000,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status_block = IoStatusBlock {
+        status: std::ptr::null_mut(),
+        information: 0,
+    };
+    let mut raw_directory = std::ptr::null_mut();
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw_directory,
+            0x0001 | 0x0020 | 0x0080 | 0x0010_0000,
+            &mut attributes,
+            &mut status_block,
+            std::ptr::null_mut(),
+            0x80,
+            0x0001 | 0x0002 | 0x0004,
+            1,
+            0x0001 | 0x0020 | 0x0020_0000,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let handle = unsafe { fs::File::from_raw_handle(raw_directory) };
+    let mut tag_info = FileAttributeTagInfo {
+        attributes: 0,
+        reparse_tag: 0,
+    };
+    let valid = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle().cast(),
+            9,
+            (&mut tag_info as *mut FileAttributeTagInfo).cast(),
+            std::mem::size_of::<FileAttributeTagInfo>() as u32,
+        )
+    } != 0;
+    if !valid {
+        return Err(io::Error::last_os_error());
+    }
+    if tag_info.attributes & 0x10 == 0 || tag_info.attributes & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upload cleanup parent is not a non-reparse directory",
+        ));
+    }
+    Ok(handle)
 }
 
 #[cfg(windows)]
@@ -2228,6 +2436,39 @@ mod cleanup_security_tests {
             })
             .unwrap();
 
+        assert_eq!(fs::read(attacker_file).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn cleanup_does_not_follow_a_legacy_parent_link_swapped_after_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads-root");
+        let legacy_dir = upload_root.join("uploads");
+        let moved_dir = upload_root.join("uploads-pinned");
+        let attacker_dir = temp.path().join("attacker");
+        fs::create_dir(&upload_root).unwrap();
+        fs::create_dir(&legacy_dir).unwrap();
+        fs::create_dir(&attacker_dir).unwrap();
+        let in_root_file = legacy_dir.join("payload.bin");
+        let attacker_file = attacker_dir.join("payload.bin");
+        fs::write(&in_root_file, b"in-root payload").unwrap();
+        fs::write(&attacker_file, b"must survive").unwrap();
+        let ledger = UploadLedger::open(
+            temp.path().join("ledger.sqlite3"),
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+
+        ledger
+            .remove_upload_file_with_hook(Path::new("uploads/payload.bin"), || {
+                fs::rename(&legacy_dir, &moved_dir).unwrap();
+                create_directory_link(&attacker_dir, &legacy_dir);
+            })
+            .unwrap();
+
+        assert!(!moved_dir.join("payload.bin").exists());
         assert_eq!(fs::read(attacker_file).unwrap(), b"must survive");
     }
 
