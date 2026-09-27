@@ -294,6 +294,7 @@ dependencies = [
 name = "fluxform-server-probe"
 version = "0.1.0"
 dependencies = [
+ "fluxform-sandbox-probe",
  "futures-util",
  "http-body-util",
  "hyper",

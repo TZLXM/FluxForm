@@ -1024,7 +1024,35 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    validate_listener_binding(listener.local_addr()?)?;
+    serve_with_authorization(listener, state, false, shutdown).await
+}
+
+/// Public listener serving is reachable only through the opaque authorization
+/// produced by `startup::prepare_server` after the live sandbox gate passes.
+pub(crate) async fn serve_prepared_with_shutdown<F>(
+    listener: TcpListener,
+    state: ServerState,
+    _authorization: &crate::startup::PublicListenerAuthorization,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_with_authorization(listener, state, true, shutdown).await
+}
+
+async fn serve_with_authorization<F>(
+    listener: TcpListener,
+    state: ServerState,
+    public_authorized: bool,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if !public_authorized {
+        validate_listener_binding(listener.local_addr()?)?;
+    }
     let startup_ledger = state.ledger.clone();
     let startup_deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
     let startup = run_storage(&state, startup_deadline, move || {
@@ -2105,6 +2133,12 @@ fn validate_public_origin(value: &str) -> Result<(), RouteConfigurationError> {
     }
     HeaderValue::from_str(value).map_err(|_| RouteConfigurationError::InvalidConfiguration)?;
     Ok(())
+}
+
+pub(crate) fn validate_public_origin_for_startup(
+    value: &str,
+) -> Result<(), RouteConfigurationError> {
+    validate_public_origin(value)
 }
 
 fn parse_session_id(value: &str) -> Result<i64, HttpError> {
