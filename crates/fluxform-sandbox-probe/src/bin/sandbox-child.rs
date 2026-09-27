@@ -500,7 +500,10 @@ fn resource_tree() -> i32 {
         {
             unsafe { libc::_exit(131) };
         }
-        unsafe { libc::_exit(0) };
+        // This PID is part of the fixed-action evidence set. Keep it alive in
+        // the exact job cgroup until the parent proves cgroup.kill terminates
+        // every reported process; exiting here would leave a stale/zombie PID.
+        keepalive();
     }
     if session_child < 0 {
         return 132;

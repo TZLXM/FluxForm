@@ -424,6 +424,7 @@ struct ProcessMembershipEvidence {
     host_pid: u32,
     namespace_pids: Vec<u32>,
     state: char,
+    starttime: u64,
     cgroup_path: String,
 }
 
@@ -478,8 +479,14 @@ fn validate_reported_cgroup_membership(
         if !matches!(process.state, 'R' | 'S' | 'D') {
             return Err("a reported job process is not live");
         }
+        if process.starttime == 0 {
+            return Err("a reported job process has an invalid starttime");
+        }
         if process.cgroup_path != expected_cgroup_path {
             return Err("a reported job process escaped the exact job cgroup");
+        }
+        if process.namespace_pids.first() != Some(&process.host_pid) {
+            return Err("process NSpid chain does not begin with its inspected host PID");
         }
         let namespace_pid = process
             .namespace_pids
@@ -525,24 +532,118 @@ fn validate_reported_cgroup_membership(
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+trait PinnedProcessSource {
+    type Handle;
+
+    fn cgroup_processes(&mut self) -> Result<Vec<u32>, &'static str>;
+    fn pidfd_open(&mut self, host_pid: u32) -> Result<Self::Handle, &'static str>;
+    fn read_process_evidence(
+        &mut self,
+        host_pid: u32,
+        handle: &Self::Handle,
+    ) -> Result<ProcessMembershipEvidence, &'static str>;
+    fn revalidate_process(
+        &mut self,
+        host_pid: u32,
+        handle: &Self::Handle,
+        expected_starttime: u64,
+    ) -> Result<(), &'static str>;
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+struct PinnedProcessProof<Handle> {
+    handles: Vec<Handle>,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn verify_live_cgroup_process_membership<Source: PinnedProcessSource>(
+    reported_namespace_pids: &[u32],
+    supervisor_host_pid: u32,
+    expected_cgroup_path: &str,
+    source: &mut Source,
+) -> Result<PinnedProcessProof<Source::Handle>, &'static str> {
+    let initial_processes = source.cgroup_processes()?;
+    validate_process_id_set(&initial_processes)?;
+    if !initial_processes.contains(&supervisor_host_pid) {
+        return Err("reported supervisor is not present in the exact job cgroup");
+    }
+
+    // Acquire every non-reusable process handle before reading any /proc
+    // identity fields. Unsupported pidfd_open therefore fails closed.
+    let handles = initial_processes
+        .iter()
+        .map(|host_pid| source.pidfd_open(*host_pid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut evidence = Vec::with_capacity(initial_processes.len());
+    for (host_pid, handle) in initial_processes.iter().zip(&handles) {
+        evidence.push(source.read_process_evidence(*host_pid, handle)?);
+    }
+    validate_reported_cgroup_membership(
+        reported_namespace_pids,
+        supervisor_host_pid,
+        &initial_processes,
+        &evidence,
+        expected_cgroup_path,
+    )?;
+
+    let second_processes = source.cgroup_processes()?;
+    validate_process_id_set(&second_processes)?;
+    if initial_processes.iter().copied().collect::<HashSet<_>>()
+        != second_processes.iter().copied().collect::<HashSet<_>>()
+    {
+        return Err("job cgroup membership changed between exact process snapshots");
+    }
+
+    for ((host_pid, handle), process) in initial_processes.iter().zip(&handles).zip(&evidence) {
+        source.revalidate_process(*host_pid, handle, process.starttime)?;
+    }
+    Ok(PinnedProcessProof { handles })
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_process_id_set(processes: &[u32]) -> Result<(), &'static str> {
+    if processes.is_empty()
+        || processes.contains(&0)
+        || processes.iter().collect::<HashSet<_>>().len() != processes.len()
+    {
+        return Err("job cgroup process snapshot is empty, zero, or duplicated");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn parse_process_membership_evidence(
     host_pid: u32,
     status: &str,
+    stat: &str,
     cgroup: &str,
 ) -> Result<ProcessMembershipEvidence, &'static str> {
-    let mut state = None;
     let mut namespace_pids = None;
     for line in status.lines() {
-        if let Some(value) = line.strip_prefix("State:") {
-            let mut fields = value.split_ascii_whitespace();
-            let character = fields
-                .next()
-                .and_then(|field| field.chars().next())
-                .ok_or("process status has a malformed State record")?;
-            if state.replace(character).is_some() {
-                return Err("process status has duplicate State records");
-            }
-        }
         if let Some(value) = line.strip_prefix("NSpid:") {
             let pids = value
                 .split_ascii_whitespace()
@@ -559,12 +660,57 @@ fn parse_process_membership_evidence(
             }
         }
     }
+    let namespace_pids = namespace_pids.ok_or("process status has no NSpid record")?;
+    if namespace_pids.first() != Some(&host_pid) {
+        return Err("process NSpid chain does not begin with the inspected host PID");
+    }
+    let (stat_pid, state, starttime) = parse_process_stat(stat)?;
+    if stat_pid != host_pid {
+        return Err("process stat PID does not match its inspected host PID");
+    }
     Ok(ProcessMembershipEvidence {
         host_pid,
-        namespace_pids: namespace_pids.ok_or("process status has no NSpid record")?,
-        state: state.ok_or("process status has no State record")?,
+        namespace_pids,
+        state,
+        starttime,
         cgroup_path: parse_proc_cgroup_path(cgroup)?,
     })
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_process_stat(contents: &str) -> Result<(u32, char, u64), &'static str> {
+    let open = contents
+        .find('(')
+        .ok_or("process stat record has no command name")?;
+    let close = contents
+        .rfind(')')
+        .filter(|close| *close > open)
+        .ok_or("process stat record has an unterminated command name")?;
+    let host_pid = contents[..open]
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or("process stat record has an invalid host PID")?;
+    let fields = contents[close + 1..]
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|field| field.chars().next())
+        .ok_or("process stat record has no state")?;
+    let starttime = fields
+        .get(19)
+        .and_then(|field| field.parse::<u64>().ok())
+        .filter(|starttime| *starttime > 0)
+        .ok_or("process stat record has an invalid starttime")?;
+    Ok((host_pid, state, starttime))
 }
 
 #[cfg(any(
@@ -945,6 +1091,23 @@ pub struct CgroupV2Job {
     inner: std::sync::Arc<linux::CgroupV2JobInner>,
 }
 
+/// Opaque exact-membership proof that retains one pidfd per inspected live
+/// process. Callers must keep this guard alive through the corresponding
+/// `cgroup.kill` operation and supervisor reap.
+pub struct CgroupProcessProof {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[allow(dead_code)]
+    _pidfds: Vec<std::os::fd::OwnedFd>,
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    _unsupported: (),
+}
+
 impl CgroupV2Job {
     pub fn create(
         delegated_root: impl AsRef<Path>,
@@ -1037,14 +1200,16 @@ impl CgroupV2Job {
         &self,
         reported_namespace_pids: &[u32],
         supervisor_host_pid: u32,
-    ) -> Result<(), SandboxError> {
+    ) -> Result<CgroupProcessProof, SandboxError> {
         #[cfg(all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         {
-            self.inner
-                .verify_reported_processes(reported_namespace_pids, supervisor_host_pid)
+            let pidfds = self
+                .inner
+                .verify_reported_processes(reported_namespace_pids, supervisor_host_pid)?;
+            Ok(CgroupProcessProof { _pidfds: pidfds })
         }
 
         #[cfg(not(all(
@@ -1733,10 +1898,11 @@ mod linux {
     use super::{
         Cgroup2MountInfo, CgroupEvidence, CgroupLimitControls, FileIdentity, FilesystemEvidence,
         FilesystemPrerequisites, MAX_TOOL_INVENTORY_DIRECTORIES, NetworkEvidence, NetworkPolicy,
-        NetworkPrerequisites, NetworkSocketDomain, NetworkSyscall, PolicyPathIdentityGraph,
-        ProbeEvidence, SandboxChild, SandboxError, SandboxLimits, SandboxPolicy, SpawnPlacement,
-        ToolEntryEvidence, ToolInventory, network_namespace_is_private, validate_open_files_limit,
-        validate_policy_path_identities, validate_tool_inventory,
+        NetworkPrerequisites, NetworkSocketDomain, NetworkSyscall, PinnedProcessSource,
+        PolicyPathIdentityGraph, ProbeEvidence, SandboxChild, SandboxError, SandboxLimits,
+        SandboxPolicy, SpawnPlacement, ToolEntryEvidence, ToolInventory,
+        network_namespace_is_private, validate_open_files_limit, validate_policy_path_identities,
+        validate_tool_inventory,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -2145,53 +2311,21 @@ mod linux {
             &self,
             reported_namespace_pids: &[u32],
             supervisor_host_pid: u32,
-        ) -> Result<(), SandboxError> {
-            let cgroup_procs =
-                read_cgroup_file(self.job_fd.as_raw_fd(), "cgroup.procs").map_err(|source| {
-                    SandboxError::Io {
-                        operation: "read pinned job cgroup.procs before cgroup.kill",
-                        source,
-                    }
-                })?;
-            let cgroup_processes =
-                super::parse_cgroup_pids(&cgroup_procs).map_err(|reason| SandboxError::Io {
-                    operation: "parse pinned job cgroup.procs before cgroup.kill",
-                    source: io::Error::new(io::ErrorKind::InvalidData, reason),
-                })?;
-            let mut processes = Vec::with_capacity(cgroup_processes.len());
-            for host_pid in &cgroup_processes {
-                let status_path = format!("/proc/{host_pid}/status");
-                let status =
-                    fs::read_to_string(&status_path).map_err(|source| SandboxError::Io {
-                        operation: "read live job process status before cgroup.kill",
-                        source,
-                    })?;
-                let cgroup_path = format!("/proc/{host_pid}/cgroup");
-                let cgroup =
-                    fs::read_to_string(&cgroup_path).map_err(|source| SandboxError::Io {
-                        operation: "read live job process membership before cgroup.kill",
-                        source,
-                    })?;
-                processes.push(
-                    super::parse_process_membership_evidence(*host_pid, &status, &cgroup).map_err(
-                        |reason| SandboxError::Io {
-                            operation: "parse live job process identity before cgroup.kill",
-                            source: io::Error::new(io::ErrorKind::InvalidData, reason),
-                        },
-                    )?,
-                );
-            }
-            super::validate_reported_cgroup_membership(
+        ) -> Result<Vec<OwnedFd>, SandboxError> {
+            let mut source = JobProcessSource {
+                job_cgroup_fd: self.job_fd.as_raw_fd(),
+            };
+            let proof = super::verify_live_cgroup_process_membership(
                 reported_namespace_pids,
                 supervisor_host_pid,
-                &cgroup_processes,
-                &processes,
                 &self.expected_cgroup_path,
+                &mut source,
             )
             .map_err(|reason| SandboxError::Io {
-                operation: "verify exact reported job process membership before cgroup.kill",
+                operation: "pin and verify exact live job process identities before cgroup.kill",
                 source: io::Error::new(io::ErrorKind::PermissionDenied, reason),
-            })
+            })?;
+            Ok(proof.handles)
         }
 
         pub(super) fn is_empty(&self) -> Result<bool, SandboxError> {
@@ -2806,6 +2940,97 @@ mod linux {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
         Ok(content)
+    }
+
+    struct JobProcessSource {
+        job_cgroup_fd: RawFd,
+    }
+
+    impl PinnedProcessSource for JobProcessSource {
+        type Handle = OwnedFd;
+
+        fn cgroup_processes(&mut self) -> Result<Vec<u32>, &'static str> {
+            let contents = read_cgroup_file(self.job_cgroup_fd, "cgroup.procs")
+                .map_err(|_| "cannot read the pinned job cgroup.procs snapshot")?;
+            super::parse_cgroup_pids(&contents)
+        }
+
+        fn pidfd_open(&mut self, host_pid: u32) -> Result<Self::Handle, &'static str> {
+            let raw =
+                unsafe { libc::syscall(libc::SYS_pidfd_open, host_pid as libc::pid_t, 0_u32) };
+            if raw < 0 {
+                return Err("pidfd_open is unsupported or could not pin a job process");
+            }
+            let raw = libc::c_int::try_from(raw)
+                .map_err(|_| "pidfd_open returned an invalid descriptor")?;
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
+
+        fn read_process_evidence(
+            &mut self,
+            host_pid: u32,
+            handle: &Self::Handle,
+        ) -> Result<super::ProcessMembershipEvidence, &'static str> {
+            if !pidfd_is_live(handle)? {
+                return Err("pidfd reports an exited process before identity inspection");
+            }
+            let status_path = format!("/proc/{host_pid}/status");
+            let status = fs::read_to_string(status_path)
+                .map_err(|_| "cannot read pinned job process NSpid evidence")?;
+            let stat_path = format!("/proc/{host_pid}/stat");
+            let stat = fs::read_to_string(stat_path)
+                .map_err(|_| "cannot read pinned job process stat evidence")?;
+            let cgroup_path = format!("/proc/{host_pid}/cgroup");
+            let cgroup = fs::read_to_string(cgroup_path)
+                .map_err(|_| "cannot read pinned job process cgroup evidence")?;
+            super::parse_process_membership_evidence(host_pid, &status, &stat, &cgroup)
+        }
+
+        fn revalidate_process(
+            &mut self,
+            host_pid: u32,
+            handle: &Self::Handle,
+            expected_starttime: u64,
+        ) -> Result<(), &'static str> {
+            if !pidfd_is_live(handle)? {
+                return Err("pidfd reports a job process exited during membership verification");
+            }
+            let stat_path = format!("/proc/{host_pid}/stat");
+            let stat = fs::read_to_string(stat_path)
+                .map_err(|_| "cannot reread pinned job process stat evidence")?;
+            let (stat_pid, state, starttime) = super::parse_process_stat(&stat)?;
+            if stat_pid != host_pid || starttime != expected_starttime {
+                return Err("pinned job process PID or starttime changed during verification");
+            }
+            if !matches!(state, 'R' | 'S' | 'D') {
+                return Err("pinned job process became dead or a zombie before authorization");
+            }
+            if !pidfd_is_live(handle)? {
+                return Err("pidfd reports a job process exited before authorization");
+            }
+            Ok(())
+        }
+    }
+
+    fn pidfd_is_live(pidfd: &OwnedFd) -> Result<bool, &'static str> {
+        let mut descriptor = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if ready < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err("poll could not validate a pinned job process pidfd");
+            }
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err("pinned job process pidfd became invalid");
+            }
+            return Ok(ready == 0 && descriptor.revents == 0);
+        }
     }
 
     fn write_cgroup_file(dir_fd: RawFd, name: &str, value: &[u8]) -> io::Result<()> {
@@ -7484,6 +7709,7 @@ mod review_regression_tests {
             host_pid: 701,
             namespace_pids: vec![701, 7],
             state: 'S',
+            starttime: 101,
             cgroup_path: expected.to_owned(),
         }];
 
@@ -7505,12 +7731,14 @@ mod review_regression_tests {
                 host_pid: 701,
                 namespace_pids: vec![701, 7],
                 state: 'S',
+                starttime: 101,
                 cgroup_path: expected.to_owned(),
             },
             ProcessMembershipEvidence {
                 host_pid: 702,
                 namespace_pids: vec![702, 8],
                 state: 'Z',
+                starttime: 102,
                 cgroup_path: "/delegated/escaped".to_owned(),
             },
         ];
@@ -7521,23 +7749,33 @@ mod review_regression_tests {
         );
     }
 
+    fn fake_process_stat(host_pid: u32, state: char, starttime: u64) -> String {
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = state.to_string();
+        fields[19] = starttime.to_string();
+        format!("{host_pid} (sandbox-child) {}", fields.join(" "))
+    }
+
     #[test]
-    fn process_membership_parser_requires_state_namespace_pids_and_one_unified_path() {
+    fn process_membership_parser_requires_stat_nspid_and_one_unified_path() {
         let evidence = parse_process_membership_evidence(
             701,
-            "Name:\tsandbox-child\nState:\tS (sleeping)\nNSpid:\t701\t7\n",
+            "Name:\tsandbox-child\nNSpid:\t701\t7\n",
+            &fake_process_stat(701, 'S', 101),
             "12:cpu:/user.slice\n0::/delegated/job-42\n",
         )
         .expect("complete exact process identity");
         assert_eq!(evidence.host_pid, 701);
         assert_eq!(evidence.namespace_pids, [701, 7]);
         assert_eq!(evidence.state, 'S');
+        assert_eq!(evidence.starttime, 101);
         assert_eq!(evidence.cgroup_path, "/delegated/job-42");
 
         assert!(
             parse_process_membership_evidence(
                 701,
-                "State:\tS (sleeping)\n",
+                "Name:\tsandbox-child\n",
+                &fake_process_stat(701, 'S', 101),
                 "0::/delegated/job-42\n",
             )
             .is_err()
@@ -7545,10 +7783,197 @@ mod review_regression_tests {
         assert!(
             parse_process_membership_evidence(
                 701,
-                "State:\tS (sleeping)\nNSpid:\t701\n",
+                "Name:\tsandbox-child\nNSpid:\t999\t7\n",
+                &fake_process_stat(701, 'S', 101),
                 "0::/delegated/job-42\n0::/other\n",
             )
             .is_err()
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakePidfd(u32);
+
+    struct FakeProcIdentitySource {
+        snapshots: Vec<Vec<u32>>,
+        snapshot_index: usize,
+        evidence: BTreeMap<u32, ProcessMembershipEvidence>,
+        final_starttimes: BTreeMap<u32, u64>,
+        pidfd_open_failures: HashSet<u32>,
+        dead_pidfds: HashSet<u32>,
+        call_order: Vec<(u32, &'static str)>,
+    }
+
+    impl PinnedProcessSource for FakeProcIdentitySource {
+        type Handle = FakePidfd;
+
+        fn cgroup_processes(&mut self) -> Result<Vec<u32>, &'static str> {
+            let snapshot = self
+                .snapshots
+                .get(self.snapshot_index)
+                .or_else(|| self.snapshots.last())
+                .cloned()
+                .ok_or("missing fake cgroup snapshot")?;
+            self.snapshot_index += 1;
+            Ok(snapshot)
+        }
+
+        fn pidfd_open(&mut self, host_pid: u32) -> Result<Self::Handle, &'static str> {
+            self.call_order.push((host_pid, "pidfd_open"));
+            if self.pidfd_open_failures.contains(&host_pid) {
+                return Err("fake pidfd_open is unsupported");
+            }
+            Ok(FakePidfd(host_pid))
+        }
+
+        fn read_process_evidence(
+            &mut self,
+            host_pid: u32,
+            handle: &Self::Handle,
+        ) -> Result<ProcessMembershipEvidence, &'static str> {
+            assert_eq!(handle.0, host_pid);
+            self.call_order.push((host_pid, "read_evidence"));
+            self.evidence
+                .get(&host_pid)
+                .cloned()
+                .ok_or("missing fake process evidence")
+        }
+
+        fn revalidate_process(
+            &mut self,
+            host_pid: u32,
+            handle: &Self::Handle,
+            expected_starttime: u64,
+        ) -> Result<(), &'static str> {
+            assert_eq!(handle.0, host_pid);
+            self.call_order.push((host_pid, "revalidate"));
+            if self.dead_pidfds.contains(&host_pid) {
+                return Err("fake pidfd signals an exited process");
+            }
+            if self.final_starttimes.get(&host_pid) != Some(&expected_starttime) {
+                return Err("fake process starttime changed after pidfd acquisition");
+            }
+            Ok(())
+        }
+    }
+
+    fn fake_proc_source() -> FakeProcIdentitySource {
+        FakeProcIdentitySource {
+            snapshots: vec![vec![701, 702, 703], vec![703, 701, 702]],
+            snapshot_index: 0,
+            evidence: BTreeMap::from([
+                (
+                    701,
+                    ProcessMembershipEvidence {
+                        host_pid: 701,
+                        namespace_pids: vec![701, 7],
+                        state: 'S',
+                        starttime: 101,
+                        cgroup_path: "/delegated/job-42".to_owned(),
+                    },
+                ),
+                (
+                    702,
+                    ProcessMembershipEvidence {
+                        host_pid: 702,
+                        namespace_pids: vec![702, 8],
+                        state: 'S',
+                        starttime: 102,
+                        cgroup_path: "/delegated/job-42".to_owned(),
+                    },
+                ),
+                (
+                    703,
+                    ProcessMembershipEvidence {
+                        host_pid: 703,
+                        namespace_pids: vec![703, 9],
+                        state: 'S',
+                        starttime: 103,
+                        cgroup_path: "/delegated/job-42".to_owned(),
+                    },
+                ),
+            ]),
+            final_starttimes: BTreeMap::from([(701, 101), (702, 102), (703, 103)]),
+            pidfd_open_failures: HashSet::new(),
+            dead_pidfds: HashSet::new(),
+            call_order: Vec::new(),
+        }
+    }
+
+    fn verify_fake_proc(
+        source: &mut FakeProcIdentitySource,
+    ) -> Result<PinnedProcessProof<FakePidfd>, &'static str> {
+        verify_live_cgroup_process_membership(&[7, 8, 9], 701, "/delegated/job-42", source)
+    }
+
+    #[test]
+    fn fake_proc_accepts_only_after_pinning_every_member_and_retains_all_pidfds() {
+        let mut source = fake_proc_source();
+        let proof = verify_fake_proc(&mut source).expect("stable complete process identity");
+
+        assert_eq!(proof.handles.len(), 3);
+        assert_eq!(
+            &source.call_order[..3],
+            &[
+                (701, "pidfd_open"),
+                (702, "pidfd_open"),
+                (703, "pidfd_open")
+            ]
+        );
+        assert!(
+            source.call_order[3..]
+                .iter()
+                .all(|(_, operation)| *operation != "pidfd_open")
+        );
+    }
+
+    #[test]
+    fn fake_proc_rejects_namespace_pid_chain_with_wrong_host_pid_first() {
+        let mut source = fake_proc_source();
+        source
+            .evidence
+            .get_mut(&702)
+            .expect("fixture process")
+            .namespace_pids[0] = 999;
+
+        assert!(verify_fake_proc(&mut source).is_err());
+    }
+
+    #[test]
+    fn fake_proc_rejects_starttime_change_after_pidfd_was_pinned() {
+        let mut source = fake_proc_source();
+        source.final_starttimes.insert(702, 202);
+
+        assert!(verify_fake_proc(&mut source).is_err());
+    }
+
+    #[test]
+    fn fake_proc_rejects_second_cgroup_snapshot_churn() {
+        let mut source = fake_proc_source();
+        source.snapshots[1] = vec![701, 702];
+
+        assert!(verify_fake_proc(&mut source).is_err());
+    }
+
+    #[test]
+    fn fake_proc_rejects_pidfd_that_signals_a_dead_process() {
+        let mut source = fake_proc_source();
+        source.dead_pidfds.insert(703);
+
+        assert!(verify_fake_proc(&mut source).is_err());
+    }
+
+    #[test]
+    fn fake_proc_fails_closed_when_pidfd_open_is_unsupported() {
+        let mut source = fake_proc_source();
+        source.pidfd_open_failures.insert(702);
+
+        assert!(verify_fake_proc(&mut source).is_err());
+        assert!(
+            source
+                .call_order
+                .iter()
+                .all(|(_, operation)| *operation != "read_evidence")
         );
     }
 

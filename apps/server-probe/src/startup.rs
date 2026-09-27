@@ -109,6 +109,7 @@ mod startup_authorization_tests {
     fn fixed_action_pid_report_requires_complete_distinct_positive_ids() {
         assert_eq!(parse_reported_tree_pids("7\n8\n9\n"), Ok(vec![7, 8, 9]));
         assert!(parse_reported_tree_pids("7\n8\n").is_err());
+        assert!(parse_reported_tree_pids("7\n8\n9\n10\n").is_err());
         assert!(parse_reported_tree_pids("7\n8\n8\n").is_err());
         assert!(parse_reported_tree_pids("7\n0\n9\n").is_err());
         assert!(parse_reported_tree_pids("7\nnot-a-pid\n9\n").is_err());
@@ -802,7 +803,7 @@ fn run_placement_probe(
             .is_empty()
             .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
         if let Some(reported) = reported_namespace_pids
-            && reported.len() >= 3
+            && reported.len() == 3
             && populated
         {
             break reported;
@@ -828,7 +829,8 @@ fn run_placement_probe(
             "startup resource-tree process set became empty or its supervisor exited before membership verification",
         ));
     }
-    job.verify_reported_processes(&reported_namespace_pids, child.id())
+    let process_proof = job
+        .verify_reported_processes(&reported_namespace_pids, child.id())
         .map_err(|error| {
             StartupError::sandbox_check_failed(
                 SandboxCheck::CgroupKill,
@@ -861,6 +863,9 @@ fn run_placement_probe(
     let empty_after_kill = job
         .is_empty()
         .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+    // Keep the pidfds alive across cgroup.kill and supervisor reap so the
+    // process identities used by the authorization proof cannot be recycled.
+    drop(process_proof);
 
     Ok(KillProbeEvidence {
         action_started: true,
@@ -892,8 +897,10 @@ fn parse_reported_tree_pids(contents: &str) -> Result<Vec<u32>, &'static str> {
         }
         pids.push(pid);
     }
-    if pids.len() < 3 {
-        return Err("fixed action PID report omits its supervisor or descendants");
+    if pids.len() != 3 {
+        return Err(
+            "fixed action PID report must contain exactly supervisor, session child, and grandchild",
+        );
     }
     Ok(pids)
 }

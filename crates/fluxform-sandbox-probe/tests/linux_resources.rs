@@ -192,13 +192,47 @@ mod linux {
         .collect::<Vec<_>>();
         assert_eq!(reported.len(), 3, "worker and double-fork tree report PIDs");
         let members = read_members(fixture);
-        assert!(
-            members.len() >= 2,
-            "setsid tree must leave live cgroup members"
+        assert_reported_tree_live(fixture, &reported, &members);
+        members
+    }
+
+    fn assert_reported_tree_live(fixture: &Fixture, reported: &[u32], members: &[u32]) {
+        assert_eq!(
+            reported.len(),
+            3,
+            "the fixed action's supervisor, session child, and grandchild are all required"
         );
+        assert_eq!(
+            members.len(),
+            3,
+            "every reported supervisor/session-child/grandchild must remain in the job cgroup"
+        );
+        let mut observed_namespace_pids = Vec::new();
         for host_pid in &members {
             let status = fs::read_to_string(format!("/proc/{host_pid}/status"))
                 .expect("read cgroup member status");
+            let state = status
+                .lines()
+                .find_map(|line| line.strip_prefix("State:"))
+                .and_then(|state| state.split_ascii_whitespace().next())
+                .and_then(|state| state.chars().next())
+                .expect("process state");
+            assert!(
+                matches!(state, 'R' | 'S' | 'D'),
+                "reported cgroup PID {host_pid} must remain alive, not state {state}"
+            );
+            let namespace_pids = status
+                .lines()
+                .find_map(|line| line.strip_prefix("NSpid:"))
+                .expect("PID namespace mapping")
+                .split_ascii_whitespace()
+                .map(|part| part.parse::<u32>().expect("numeric namespace PID"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                namespace_pids.first(),
+                Some(host_pid),
+                "NSpid must begin with the inspected host PID"
+            );
             let namespace_pid = status
                 .lines()
                 .find_map(|line| line.strip_prefix("NSpid:"))
@@ -211,8 +245,20 @@ mod linux {
                 reported.contains(&namespace_pid),
                 "cgroup PID {host_pid} ({namespace_pid}) was not reported by tree action"
             );
+            assert!(
+                !observed_namespace_pids.contains(&namespace_pid),
+                "two live job processes map to the same namespace PID"
+            );
+            observed_namespace_pids.push(namespace_pid);
         }
-        members
+        assert_eq!(observed_namespace_pids.len(), reported.len());
+        for namespace_pid in reported {
+            assert!(
+                observed_namespace_pids.contains(namespace_pid),
+                "reported PID {namespace_pid} is not a live member of the exact job cgroup"
+            );
+        }
+        assert_exact_membership(fixture, members);
     }
 
     fn assert_processes_gone(pids: &[u32]) {
@@ -405,6 +451,33 @@ mod linux {
             !fixture.cgroup.path().exists(),
             "empty job cgroup was not removed"
         );
+        assert_processes_gone(&host_pids);
+    }
+
+    #[test]
+    fn resource_tree_keeps_all_three_reported_processes_live_until_cgroup_kill() {
+        let fixture = Fixture::new(16, 128 * 1024 * 1024, 100_000);
+        let mut child = fixture.spawn("resource-tree", &[]);
+        let host_pids = host_tree_pids(&fixture);
+        let reported = wait_for_lines(
+            &fixture.job_dir.join("tree-pids.txt"),
+            3,
+            Duration::from_secs(5),
+        )
+        .lines()
+        .map(|line| line.parse::<u32>().expect("namespace PID"))
+        .collect::<Vec<_>>();
+
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(20));
+            assert_reported_tree_live(&fixture, &reported, &read_members(&fixture));
+        }
+
+        child
+            .kill()
+            .expect("cgroup.kill terminates the entire still-live reported tree");
+        assert!(fixture.cgroup.is_empty().expect("cgroup becomes empty"));
+        assert!(child.try_wait().expect("reap supervisor").is_some());
         assert_processes_gone(&host_pids);
     }
 

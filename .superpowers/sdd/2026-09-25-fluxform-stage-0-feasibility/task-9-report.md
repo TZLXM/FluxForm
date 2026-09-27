@@ -147,3 +147,15 @@ Required subject: `feat(server): contain worker resources with cgroup v2`.
   `std`. No target download or network fetch was attempted. A delegated Linux
   runner is still required for the eight native cgroup integration tests.
 - Review-fix commit subject: `fix(server): correct cgroup delegation and cancellation`.
+
+## Review fix round 3 — live fixed-action process evidence
+
+Task 14's `resource-tree` cgroup-kill proof uses the same strict Task 9
+expectation: the supervisor, setsid session child, and grandchild are exactly
+three reported PIDs, all remain live/non-zombie in the exact job cgroup until
+`cgroup.kill`, and all are then removed by the job-wide cancellation. The
+session child now blocks after recording its PID instead of exiting early. A
+Linux-only lifecycle regression checks the complete set repeatedly through a
+delay and immediately before cancellation. Its native execution remains
+**BLOCKED** on this Windows host; the portable fake-proc identity tests do not
+substitute for delegated-cgroup evidence.
