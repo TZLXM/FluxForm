@@ -6,6 +6,7 @@ members = [
     "crates/fluxform-atomic-output",
     "crates/fluxform-sandbox-probe",
     "apps/server-probe",
+    "apps/desktop-probe/src-tauri",
 ]
 resolver = "3"
 

@@ -6,6 +6,7 @@ bin/
 obj/
 publish/
 out/
+apps/desktop-probe/node_modules/
 
 # Visual Studio / VS Code
 .vs/

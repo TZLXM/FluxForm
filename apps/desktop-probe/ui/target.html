@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Visible Background Drop and Hit-Test Target</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="probe.js" defer></script>
+  </head>
+  <body class="target-page" data-surface="target">
+    <button class="target-control target-top-left" data-corner="top-left" type="button" aria-label="Top-left background click target">TL</button>
+    <button class="target-control target-top-right" data-corner="top-right" type="button" aria-label="Top-right background click target">TR</button>
+    <button class="target-control target-bottom-left" data-corner="bottom-left" type="button" aria-label="Bottom-left background click target">BL</button>
+    <button class="target-control target-bottom-right" data-corner="bottom-right" type="button" aria-label="Bottom-right background click target">BR</button>
+    <main class="target-surface">
+      <h1 class="target-title">Visible background target</h1>
+      <p class="target-copy">The orb window is layered above this surface. Its transparent corners should reveal this checker pattern and allow these four controls and file drops to reach this underlying window.</p>
+      <p id="target-status" class="target-status" aria-live="polite">Background interactions: 0</p>
+    </main>
+  </body>
+</html>

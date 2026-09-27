@@ -1,0 +1,17 @@
+{
+  "name": "@fluxform/desktop-probe",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Cross-platform transparent Tauri window feasibility probe",
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:build:transparent-orb": "tauri build --no-default-features --features probe-transparent-orb",
+    "tauri:build:rectangular-hit-region": "tauri build --no-default-features --features probe-transparent-window-with-rectangular-hit-region",
+    "tauri:build:opaque-fallback": "tauri build --no-default-features --features probe-opaque-frameless-fallback"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.0"
+  }
+}
