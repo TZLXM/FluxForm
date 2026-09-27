@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -110,6 +111,37 @@ impl UploadChunkWriter for FileUploadChunkWriter {
 /// Socket peer supplied by the connection adapter, never copied from a header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportPeer(pub SocketAddr);
+
+#[derive(Clone, Copy)]
+struct SettlementAckCandidate(i64);
+
+#[cfg(test)]
+struct TestOnlyPublicUploadEvidence;
+
+fn validate_listener_binding(address: SocketAddr) -> io::Result<()> {
+    if address.ip().is_loopback() {
+        // Unix loopback mode assumes one trusted service UID. It is not
+        // supported against an untrusted process running as that same UID.
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "non-loopback upload listeners are blocked until Task 7/14 exclusive-identity and private-storage evidence is integrated",
+    ))
+}
+
+#[cfg(test)]
+fn validate_listener_binding_with_test_evidence(
+    address: SocketAddr,
+    evidence: Option<TestOnlyPublicUploadEvidence>,
+) -> io::Result<()> {
+    if evidence.is_some() {
+        // Synthetic test evidence never reaches the production listener path.
+        Ok(())
+    } else {
+        validate_listener_binding(address)
+    }
+}
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -837,16 +869,11 @@ fn run_upload_worker(
                         settled = true;
                         drop(file.take());
                     } else {
-                        // A late commit or a completed commit whose HTTP
-                        // waiter timed out is revoked before releasing the
-                        // pinned handle. The durable compensation is retryable
-                        // and remains covered by the tracked actor until complete.
-                        while ledger
-                            .compensate_late_settlement(session_id, &token, receipt)
-                            .is_err()
-                        {
-                            thread::sleep(Duration::from_millis(25));
-                        }
+                        // Perform a finite inline retry. The settlement intent
+                        // and identity cleanup outbox remain durable if storage
+                        // is still unavailable; periodic/startup reconciliation
+                        // resumes them without retaining this actor or permit.
+                        let _ = ledger.compensate_late_settlement(session_id, &token, receipt);
                         drop(file.take());
                     }
                 } else {
@@ -880,7 +907,7 @@ fn cleanup_upload_worker(
     file: &mut Option<File>,
 ) {
     let _ = ledger.expire(session_id, token);
-    let _ = ledger.reconcile_cleanup_jobs();
+    let _ = ledger.reconcile_cleanup_job(session_id);
     drop(file.take());
 }
 
@@ -889,7 +916,7 @@ async fn recover_upload_worker(state: &ServerState, session_id: i64, token: Sess
     let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
     let _ = run_storage(state, deadline, move || {
         match ledger.expire(session_id, &token) {
-            Ok(()) => ledger.reconcile_cleanup_jobs(),
+            Ok(()) => ledger.reconcile_cleanup_job(session_id),
             Err(error) => Err(error),
         }
     })
@@ -954,6 +981,7 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    validate_listener_binding(listener.local_addr()?)?;
     let startup_ledger = state.ledger.clone();
     let startup_deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
     let startup = run_storage(&state, startup_deadline, move || {
@@ -986,24 +1014,54 @@ where
                     }
                 };
                 let connection_state = state.clone();
+                let acknowledgement_state = connection_state.clone();
+                let settlement_acknowledgement = Arc::new(Mutex::new(None::<i64>));
+                let service_settlement_acknowledgement =
+                    Arc::clone(&settlement_acknowledgement);
                 let header_timeout = connection_state.header_read_timeout;
                 connections.spawn(async move {
                     let _permit = permit;
                     let service = hyper_service_fn(move |request: Request<Incoming>| {
                         let state = connection_state.clone();
+                        let settlement_acknowledgement =
+                            Arc::clone(&service_settlement_acknowledgement);
                         async move {
                             let mut request = request.map(|body| {
                                 body.map_err(|error| Box::new(error) as BoxError)
                                     .boxed_unsync()
                             });
                             request.extensions_mut().insert(TransportPeer(peer));
-                            Ok::<_, Infallible>(handle_request(request, state).await)
+                            let response = handle_request(request, state).await;
+                            if let Some(candidate) = response
+                                .extensions()
+                                .get::<SettlementAckCandidate>()
+                                && let Ok(mut pending) = settlement_acknowledgement.lock()
+                            {
+                                *pending = Some(candidate.0);
+                            }
+                            Ok::<_, Infallible>(response)
                         }
                     });
                     let mut builder = http1::Builder::new();
                     builder.timer(TokioTimer::new());
                     builder.header_read_timeout(header_timeout);
-                    let _ = builder.serve_connection(TokioIo(stream), service).await;
+                    let connection_result =
+                        builder.serve_connection(TokioIo(stream), service).await;
+                    if connection_result.is_ok() {
+                        let session_id = settlement_acknowledgement
+                            .lock()
+                            .ok()
+                            .and_then(|mut pending| pending.take());
+                        if let Some(session_id) = session_id {
+                            let ledger = acknowledgement_state.ledger.clone();
+                            let deadline = tokio::time::Instant::now()
+                                + acknowledgement_state.storage_operation_timeout;
+                            let _ = run_storage(&acknowledgement_state, deadline, move || {
+                                ledger.acknowledge_settlement(session_id)
+                            })
+                            .await;
+                        }
+                    }
                 });
             }
             _ = maintenance.tick() => {
@@ -1114,10 +1172,12 @@ async fn handle_request(request: Request<HttpBody>, state: ServerState) -> Respo
     let close_on_error = request.method() == Method::PUT;
     let result = dispatch(request, &state).await;
     let mut response = result.unwrap_or_else(error_response);
-    if close_on_error && !response.status().is_success() {
+    if close_on_error {
         // A rejected upload body may still have unread frames. Closing the
         // HTTP/1 connection prevents Hyper from draining attacker-controlled
-        // bytes before the error response can complete.
+        // bytes before the error response can complete. Successful upload
+        // responses also close so settlement acknowledgment follows Hyper's
+        // completion of this response connection.
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -1306,7 +1366,13 @@ async fn upload_content(
     .await;
 
     match received {
-        Ok(()) => Ok(empty_response(StatusCode::NO_CONTENT)),
+        Ok(()) => {
+            let mut response = empty_response(StatusCode::NO_CONTENT);
+            response
+                .extensions_mut()
+                .insert(SettlementAckCandidate(session_id));
+            Ok(response)
+        }
         Err(error) => {
             // The actor still owns its pinned file and lease until any
             // non-cancellable syscall returns. Do not hold the HTTP response
@@ -2011,6 +2077,31 @@ mod late_completion_tests {
         )
         .unwrap();
         (temp, ledger, state)
+    }
+
+    #[test]
+    fn production_listener_gate_rejects_public_bind_without_task7_task14_evidence() {
+        let public_address = SocketAddr::from(([192, 0, 2, 1], 8080));
+        let error = validate_listener_binding(public_address).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("Task 7/14"));
+        assert!(validate_listener_binding(SocketAddr::from(([127, 0, 0, 1], 8080))).is_ok());
+    }
+
+    #[test]
+    fn synthetic_public_upload_evidence_is_explicitly_test_only() {
+        let public_address = SocketAddr::from(([192, 0, 2, 1], 8080));
+        assert!(
+            validate_listener_binding_with_test_evidence(
+                public_address,
+                Some(TestOnlyPublicUploadEvidence)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_listener_binding_with_test_evidence(public_address, None).is_err(),
+            "tests without synthetic evidence must use the production fail-closed path"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

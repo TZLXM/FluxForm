@@ -1176,6 +1176,62 @@ async fn listener_connection_cap_closes_excess_sockets_and_releases_slots() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_socket_response_acknowledges_durable_settlement_after_connection_close() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(1).await;
+    let (address, server) = start_server(harness.state.clone()).await;
+    let mut stream = connect(address).await;
+    let headers = [
+        ("Origin", PUBLIC_ORIGIN),
+        ("Authorization", &format!("Bearer {token}")),
+        ("Content-Length", "1"),
+    ];
+    send_request(
+        &mut stream,
+        "PUT",
+        &format!("/v1/upload-sessions/{session_id}/content"),
+        &headers,
+        b"x",
+    )
+    .await;
+    let (status, response_headers, _) = read_response(&mut stream).await.unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
+    assert!(
+        response_headers
+            .iter()
+            .any(|(name, value)| { name == "connection" && value.eq_ignore_ascii_case("close") })
+    );
+    let mut trailing = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut trailing))
+        .await
+        .expect("successful upload response must close its HTTP/1 connection")
+        .unwrap();
+    assert!(trailing.is_empty());
+
+    let database_path = harness.database_path.clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pending: i64 = Connection::open(&database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if pending == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Hyper connection completion should durably acknowledge settlement");
+    assert_eq!(harness.state(session_id, &token), UploadState::Uploaded);
+    server.abort();
+}
+
 #[tokio::test]
 async fn declared_size_and_hard_limit_boundaries_are_counted_across_chunks() {
     for (declared, actual, expected_status) in [

@@ -410,6 +410,13 @@ fn missing_pinned_identity_keeps_cleanup_job_pending_after_retry() {
     fs::remove_file(blocked_path.join("child/file")).unwrap();
     fs::remove_dir(blocked_path.join("child")).unwrap();
     fs::remove_dir(&blocked_path).unwrap();
+    Connection::open(temp_dir.path().join("ledger.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE cleanup_outbox SET next_attempt_at = 0 WHERE session_id = ?1",
+            [session.session_id],
+        )
+        .unwrap();
     let second = ledger.reconcile_cleanup_jobs().unwrap();
     assert_eq!(second.completed, 0);
     assert_eq!(second.retryable, 1);
@@ -688,7 +695,7 @@ fn opening_a_legacy_database_applies_a_schema_versioned_migration() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 5,
+        version, 6,
         "the database needs the current committed schema version"
     );
 }
@@ -868,13 +875,17 @@ fn populated_v0_nested_cleanup_retries_a_link_and_deletes_after_safe_restore() {
         first.retryable, 1,
         "a linked legacy parent must be rejected"
     );
-    assert_eq!(cleanup_job_attempts_at(&db_path), 2);
+    assert_eq!(cleanup_job_attempts_at(&db_path), 1);
     assert_eq!(fs::read(&outside_payload).unwrap(), b"must survive");
 
     remove_directory_link(&legacy_directory);
     fs::create_dir(&legacy_directory).unwrap();
     let in_root_payload = legacy_directory.join("payload.bin");
     fs::write(&in_root_payload, b"legacy payload").unwrap();
+    Connection::open(&db_path)
+        .unwrap()
+        .execute("UPDATE cleanup_outbox SET next_attempt_at = 0", [])
+        .unwrap();
 
     let second = ledger.reconcile_cleanup_jobs().unwrap();
     assert_eq!(second.completed, 1);

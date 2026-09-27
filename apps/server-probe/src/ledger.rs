@@ -16,7 +16,14 @@ use crate::auth::Capability;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
+const MAX_CLEANUP_JOBS_PER_PASS: usize = 64;
+const MAX_IDENTITY_SCAN_ENTRIES: usize = 64;
+const IDENTITY_SCAN_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_STARTUP_ORPHAN_SCAN_ENTRIES: usize = 4096;
+const STARTUP_ORPHAN_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+const SETTLEMENT_ACK_GRACE_SECONDS: i64 = 30;
+const MAX_STARTUP_SETTLEMENT_RECOVERIES: usize = 128;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS global_budget (
@@ -54,7 +61,14 @@ CREATE INDEX IF NOT EXISTS uploads_identity_state ON uploads(identity_id, state)
 CREATE TABLE IF NOT EXISTS cleanup_outbox (
     session_id INTEGER PRIMARY KEY REFERENCES uploads(id),
     relative_path TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settlement_outbox (
+    session_id INTEGER PRIMARY KEY REFERENCES uploads(id),
+    day INTEGER NOT NULL CHECK (day >= 0),
+    actual_bytes INTEGER NOT NULL CHECK (actual_bytes >= 0),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0)
 );
 "#;
 
@@ -94,6 +108,8 @@ pub enum LimitError {
     AccountingInvariant,
     #[error("upload staging file identity changed")]
     FileIdentityMismatch,
+    #[error("unacknowledged settlements exceed the bounded startup recovery limit")]
+    PendingSettlementRecoveryLimit,
     #[error("upload capability has expired")]
     CapabilityExpired,
     #[error("database is busy")]
@@ -256,6 +272,7 @@ impl std::fmt::Debug for SessionToken {
 pub struct CleanupReport {
     pub completed: usize,
     pub retryable: usize,
+    pub deferred: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -427,6 +444,9 @@ impl UploadLedger {
             had_uploads && table_has_column(&transaction, "uploads", "file_identity")?;
         let had_lease_expiry =
             had_uploads && table_has_column(&transaction, "uploads", "lease_expires_at")?;
+        let had_cleanup_outbox = table_exists(&transaction, "cleanup_outbox")?;
+        let had_cleanup_next_attempt = had_cleanup_outbox
+            && table_has_column(&transaction, "cleanup_outbox", "next_attempt_at")?;
         let had_ip_hashes = table_exists(&transaction, "ip_hashes")?;
         let had_key_id = had_ip_hashes && table_has_column(&transaction, "ip_hashes", "key_id")?;
         transaction.execute_batch(SCHEMA)?;
@@ -442,6 +462,12 @@ impl UploadLedger {
         if had_uploads && !had_lease_expiry {
             transaction.execute(
                 "ALTER TABLE uploads ADD COLUMN lease_expires_at INTEGER",
+                [],
+            )?;
+        }
+        if had_cleanup_outbox && !had_cleanup_next_attempt {
+            transaction.execute(
+                "ALTER TABLE cleanup_outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -492,6 +518,12 @@ impl UploadLedger {
                 [retained_key_id.as_slice()],
             )?;
         }
+        recover_unacknowledged_settlements_in_transaction(
+            &transaction,
+            None,
+            MAX_STARTUP_SETTLEMENT_RECOVERIES,
+            true,
+        )?;
         expire_abandoned_sessions_in_transaction(&transaction, current_unix_seconds())?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         ledger.validate_startup_invariants(&transaction)?;
@@ -563,7 +595,7 @@ impl UploadLedger {
         for _ in 0..4 {
             match self
                 .expire(session_id, capability)
-                .and_then(|()| self.reconcile_cleanup_jobs())
+                .and_then(|()| self.reconcile_cleanup_job(session_id))
             {
                 Ok(report) if report.retryable == 0 => return Ok(()),
                 Ok(_) => {
@@ -865,7 +897,8 @@ impl UploadLedger {
         capability: &SessionToken,
         actual_bytes: u64,
     ) -> Result<(), LimitError> {
-        self.settle_internal(session_id, capability, None, actual_bytes)
+        self.settle_internal(session_id, capability, None, actual_bytes)?;
+        self.acknowledge_settlement(session_id)
     }
 
     pub(crate) fn settle_pinned_until(
@@ -1023,6 +1056,16 @@ impl UploadLedger {
         if changed != 1 {
             return Err(LimitError::AccountingInvariant);
         }
+        transaction.execute(
+            "INSERT INTO settlement_outbox(session_id, day, actual_bytes, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                session_id,
+                day,
+                to_sql_integer(actual_bytes)?,
+                current_unix_seconds()
+            ],
+        )?;
         write_global_reserved(&transaction, next_global_reserved)?;
         (hooks.before_commit)();
         if let Some(file) = pinned_file {
@@ -1051,6 +1094,29 @@ impl UploadLedger {
             return Err(LimitError::OperationTimedOut);
         }
         Ok(receipt)
+    }
+
+    /// Acknowledges the settlement only after Hyper reports successful
+    /// completion of the response on a `Connection: close` connection. If
+    /// transport completion is ambiguous, the durable intent remains and is
+    /// compensated by the TTL reconciler or at next startup.
+    pub(crate) fn acknowledge_settlement(&self, session_id: i64) -> Result<(), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String = transaction.query_row(
+            "SELECT state FROM uploads WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if UploadState::from_str(&state)? != UploadState::Uploaded {
+            return Err(LimitError::InvalidTransition);
+        }
+        transaction.execute(
+            "DELETE FROM settlement_outbox WHERE session_id = ?1",
+            [session_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn compensate_late_settlement(
@@ -1148,13 +1214,53 @@ impl UploadLedger {
                 revoke_session_capability(&transaction, session_id)?;
                 enqueue_cleanup(&transaction, session_id)?;
             }
-            UploadState::Expired => revoke_session_capability(&transaction, session_id)?,
+            UploadState::Expired => {
+                let actual: Option<i64> = transaction.query_row(
+                    "SELECT actual_bytes FROM uploads WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )?;
+                if actual == Some(to_sql_integer(receipt.actual_bytes)?) {
+                    let changed = transaction.execute(
+                        "UPDATE daily_usage SET used_bytes = used_bytes - ?1 \
+                         WHERE identity_id = ?2 AND day = ?3 AND used_bytes >= ?1",
+                        params![
+                            to_sql_integer(receipt.actual_bytes)?,
+                            receipt.identity_id,
+                            receipt.day
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(LimitError::AccountingInvariant);
+                    }
+                    transaction.execute(
+                        "DELETE FROM daily_usage WHERE identity_id = ?1 AND day = ?2 AND used_bytes = 0",
+                        params![receipt.identity_id, receipt.day],
+                    )?;
+                    transaction.execute(
+                        "UPDATE uploads SET actual_bytes = NULL WHERE id = ?1 AND state = 'expired'",
+                        [session_id],
+                    )?;
+                } else if actual.is_some() {
+                    return Err(LimitError::AccountingInvariant);
+                }
+                revoke_session_capability(&transaction, session_id)?;
+            }
             UploadState::Rejected | UploadState::Probing | UploadState::Queued => {
                 return Err(LimitError::InvalidTransition);
             }
         }
+        transaction.execute(
+            "DELETE FROM settlement_outbox WHERE session_id = ?1",
+            [session_id],
+        )?;
         transaction.commit()?;
-        self.reconcile_cleanup_jobs()
+        self.reconcile_cleanup_job(session_id)
+            .map(|report| CleanupReport {
+                completed: report.completed,
+                retryable: report.retryable,
+                deferred: report.deferred,
+            })
     }
 
     pub fn expire(&self, session_id: i64, capability: &SessionToken) -> Result<(), LimitError> {
@@ -1188,61 +1294,117 @@ impl UploadLedger {
         let connection = self.connect()?;
         let jobs = {
             let mut statement = connection.prepare(
-                "SELECT cleanup_outbox.session_id, cleanup_outbox.relative_path, uploads.file_identity \
-                 FROM cleanup_outbox JOIN uploads ON uploads.id = cleanup_outbox.session_id \
-                 ORDER BY cleanup_outbox.session_id",
+                "SELECT cleanup_outbox.session_id FROM cleanup_outbox \
+                 WHERE cleanup_outbox.next_attempt_at <= ?1 \
+                 ORDER BY cleanup_outbox.next_attempt_at, cleanup_outbox.session_id LIMIT ?2",
             )?;
             statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                    ))
-                })?
+                .query_map(
+                    params![
+                        current_unix_seconds(),
+                        i64::try_from(MAX_CLEANUP_JOBS_PER_PASS + 1).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?
                 .collect::<Result<Vec<_>, _>>()?
         };
         drop(connection);
 
         let mut report = CleanupReport::default();
-        for (session_id, relative_path, expected_identity) in jobs {
-            let relative = normalize_relative_path(Path::new(&relative_path));
-            let deletion = match (relative, expected_identity) {
-                (Ok(relative), Some(expected_identity)) => {
-                    self.remove_upload_file_if_identity(Path::new(&relative), &expected_identity)
-                }
-                (Ok(relative), None) if reservation_leaf(Path::new(&relative)).is_err() => {
-                    self.remove_upload_file(Path::new(&relative))
-                }
-                (Ok(_), None) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "upload cleanup has no pinned file identity",
-                )),
-                (Err(_), _) => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path")),
-            };
-            let mut connection = self.connect()?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            match deletion {
-                Ok(()) => {
-                    let changed = transaction.execute(
-                        "DELETE FROM cleanup_outbox WHERE session_id = ?1",
-                        [session_id],
-                    )?;
-                    if changed == 1 {
-                        report.completed += 1;
-                    }
-                }
-                Err(_) => {
-                    transaction.execute(
-                        "UPDATE cleanup_outbox SET attempts = attempts + 1 WHERE session_id = ?1",
-                        [session_id],
-                    )?;
-                    report.retryable += 1;
-                }
-            }
-            transaction.commit()?;
+        let has_more_due = jobs.len() > MAX_CLEANUP_JOBS_PER_PASS;
+        let mut retryable_this_pass = 0usize;
+        for session_id in jobs.into_iter().take(MAX_CLEANUP_JOBS_PER_PASS) {
+            let result = self.reconcile_cleanup_job_once(session_id)?;
+            report.completed += result.completed;
+            retryable_this_pass += result.retryable;
         }
+        let connection = self.connect()?;
+        report.retryable = usize::try_from(connection.query_row(
+            "SELECT COUNT(*) FROM cleanup_outbox",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)
+        .unwrap_or(usize::MAX);
+        if has_more_due {
+            report.deferred = report.deferred.saturating_add(1);
+        }
+        report.deferred = report
+            .deferred
+            .max(report.retryable.saturating_sub(retryable_this_pass));
+        Ok(report)
+    }
+
+    pub(crate) fn reconcile_cleanup_job(
+        &self,
+        session_id: i64,
+    ) -> Result<CleanupReport, LimitError> {
+        self.reconcile_cleanup_job_once(session_id)
+    }
+
+    fn reconcile_cleanup_job_once(&self, session_id: i64) -> Result<CleanupReport, LimitError> {
+        let connection = self.connect()?;
+        let job = connection
+            .query_row(
+                "SELECT cleanup_outbox.relative_path, uploads.file_identity \
+                 FROM cleanup_outbox JOIN uploads ON uploads.id = cleanup_outbox.session_id \
+                 WHERE cleanup_outbox.session_id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .optional()?;
+        drop(connection);
+        let Some((relative_path, expected_identity)) = job else {
+            return Ok(CleanupReport::default());
+        };
+        let relative = normalize_relative_path(Path::new(&relative_path));
+        let deletion = match (relative, expected_identity) {
+            (Ok(relative), Some(expected_identity)) => {
+                self.remove_upload_file_if_identity(Path::new(&relative), &expected_identity)
+            }
+            (Ok(relative), None) if reservation_leaf(Path::new(&relative)).is_err() => {
+                self.remove_upload_file(Path::new(&relative))
+            }
+            (Ok(_), None) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upload cleanup has no pinned file identity",
+            )),
+            (Err(_), _) => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path")),
+        };
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut report = CleanupReport::default();
+        match deletion {
+            Ok(()) => {
+                let changed = transaction.execute(
+                    "DELETE FROM cleanup_outbox WHERE session_id = ?1",
+                    [session_id],
+                )?;
+                report.completed = usize::from(changed == 1);
+            }
+            Err(_) => {
+                let attempts: i64 = transaction.query_row(
+                    "SELECT attempts FROM cleanup_outbox WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )?;
+                let next_attempts = attempts.saturating_add(1);
+                let backoff = 1_i64
+                    .checked_shl(u32::try_from(next_attempts.min(8)).unwrap_or(8))
+                    .unwrap_or(256)
+                    .min(300);
+                transaction.execute(
+                    "UPDATE cleanup_outbox SET attempts = ?1, next_attempt_at = ?2 \
+                     WHERE session_id = ?3",
+                    params![
+                        next_attempts,
+                        current_unix_seconds().saturating_add(backoff),
+                        session_id
+                    ],
+                )?;
+                report.retryable = 1;
+            }
+        }
+        transaction.commit()?;
         Ok(report)
     }
 
@@ -1405,6 +1567,12 @@ impl UploadLedger {
         let now = current_unix_seconds();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        recover_unacknowledged_settlements_in_transaction(
+            &transaction,
+            Some(now.saturating_sub(SETTLEMENT_ACK_GRACE_SECONDS)),
+            MAX_CLEANUP_JOBS_PER_PASS,
+            false,
+        )?;
         expire_abandoned_sessions_excluding_in_transaction(&transaction, now, active_uploads)?;
         transaction.commit()?;
         self.reconcile_cleanup_jobs()
@@ -1619,7 +1787,10 @@ impl UploadLedger {
 
         let orphans = self
             .reservation_directory
-            .enumerate_files()
+            .enumerate_files_bounded(
+                MAX_STARTUP_ORPHAN_SCAN_ENTRIES,
+                Instant::now() + STARTUP_ORPHAN_SCAN_TIMEOUT,
+            )
             .map_err(LimitError::Filesystem)?
             .into_iter()
             .filter(|leaf| !referenced_leaves.contains(leaf))
@@ -1869,10 +2040,25 @@ where
         ));
     }
     let mut before_unlink = Some(before_unlink);
+    let scan_deadline = Instant::now() + IDENTITY_SCAN_TIMEOUT;
 
     for _ in 0..4 {
         let mut matches = Vec::new();
-        for candidate in directory.enumerate_files()? {
+        if Instant::now() >= scan_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pinned upload identity scan exceeded its time bound",
+            ));
+        }
+        for candidate in
+            directory.enumerate_files_bounded(MAX_IDENTITY_SCAN_ENTRIES, scan_deadline)?
+        {
+            if Instant::now() >= scan_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "pinned upload identity scan exceeded its time bound",
+                ));
+            }
             match directory.open_file(&candidate, false) {
                 Ok(file) if file_identity(&file)? == expected_identity => matches.push(candidate),
                 Ok(_) => {}
@@ -2021,6 +2207,111 @@ fn expire_abandoned_sessions_in_transaction(
     now: i64,
 ) -> Result<(), LimitError> {
     expire_abandoned_sessions_excluding_in_transaction(transaction, now, &[])
+}
+
+fn recover_unacknowledged_settlements_in_transaction(
+    transaction: &Transaction<'_>,
+    created_at_before: Option<i64>,
+    maximum: usize,
+    fail_closed_on_overflow: bool,
+) -> Result<usize, LimitError> {
+    let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT session_id, day, actual_bytes FROM settlement_outbox \
+             WHERE (?1 IS NULL OR created_at <= ?1) ORDER BY created_at, session_id LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![created_at_before, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if rows.len() > maximum && fail_closed_on_overflow {
+        return Err(LimitError::PendingSettlementRecoveryLimit);
+    }
+    let count = rows.len().min(maximum);
+    for (session_id, day, actual_sql) in rows.into_iter().take(maximum) {
+        let _actual_bytes = from_sql_integer(actual_sql)?;
+        let (state, identity_id, stored_actual) = transaction.query_row(
+            "SELECT state, identity_id, actual_bytes FROM uploads WHERE id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
+        match UploadState::from_str(&state)? {
+            UploadState::Uploaded => {
+                if stored_actual != Some(actual_sql) {
+                    return Err(LimitError::AccountingInvariant);
+                }
+                let changed = transaction.execute(
+                    "UPDATE daily_usage SET used_bytes = used_bytes - ?1 \
+                     WHERE identity_id = ?2 AND day = ?3 AND used_bytes >= ?1",
+                    params![actual_sql, identity_id, day],
+                )?;
+                if changed != 1 {
+                    return Err(LimitError::AccountingInvariant);
+                }
+                transaction.execute(
+                    "DELETE FROM daily_usage WHERE identity_id = ?1 AND day = ?2 AND used_bytes = 0",
+                    params![identity_id, day],
+                )?;
+                let changed = transaction.execute(
+                    "UPDATE uploads SET state = 'expired', actual_bytes = NULL, reserved_bytes = 0, \
+                     lease_expires_at = NULL WHERE id = ?1 AND state = 'uploaded' AND actual_bytes = ?2",
+                    params![session_id, actual_sql],
+                )?;
+                if changed != 1 {
+                    return Err(LimitError::AccountingInvariant);
+                }
+                revoke_session_capability(transaction, session_id)?;
+                enqueue_cleanup(transaction, session_id)?;
+            }
+            UploadState::Expired => {
+                // A manual expiry can win after settlement committed but
+                // before transport acknowledgment. The durable intent still
+                // proves the byte charge has not been acknowledged, so refund
+                // it exactly once before clearing the intent.
+                if let Some(stored_actual) = stored_actual {
+                    if stored_actual != actual_sql {
+                        return Err(LimitError::AccountingInvariant);
+                    }
+                    let changed = transaction.execute(
+                        "UPDATE daily_usage SET used_bytes = used_bytes - ?1 \
+                         WHERE identity_id = ?2 AND day = ?3 AND used_bytes >= ?1",
+                        params![actual_sql, identity_id, day],
+                    )?;
+                    if changed != 1 {
+                        return Err(LimitError::AccountingInvariant);
+                    }
+                    transaction.execute(
+                        "DELETE FROM daily_usage WHERE identity_id = ?1 AND day = ?2 AND used_bytes = 0",
+                        params![identity_id, day],
+                    )?;
+                    transaction.execute(
+                        "UPDATE uploads SET actual_bytes = NULL WHERE id = ?1 AND state = 'expired'",
+                        [session_id],
+                    )?;
+                }
+                enqueue_cleanup(transaction, session_id)?;
+            }
+            _ => return Err(LimitError::AccountingInvariant),
+        }
+        transaction.execute(
+            "DELETE FROM settlement_outbox WHERE session_id = ?1",
+            [session_id],
+        )?;
+    }
+    Ok(count)
 }
 
 fn expire_abandoned_sessions_excluding_in_transaction(
@@ -2309,7 +2600,17 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(unix)]
+    #[cfg(test)]
     fn enumerate_files(&self) -> io::Result<Vec<String>> {
+        self.enumerate_files_bounded(usize::MAX, Instant::now() + Duration::from_secs(30))
+    }
+
+    #[cfg(unix)]
+    fn enumerate_files_bounded(
+        &self,
+        maximum_entries: usize,
+        deadline: Instant,
+    ) -> io::Result<Vec<String>> {
         use std::os::fd::AsRawFd;
 
         let descriptor_path = if cfg!(target_os = "linux") {
@@ -2318,7 +2619,21 @@ impl SecureReservationDirectory {
             PathBuf::from(format!("/dev/fd/{}", self.handle.as_raw_fd()))
         };
         let mut names = Vec::new();
+        let mut entries_seen = 0usize;
         for entry in fs::read_dir(descriptor_path)? {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "reservation directory scan exceeded its time bound",
+                ));
+            }
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > maximum_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "reservation directory scan exceeded its entry bound",
+                ));
+            }
             let entry = entry?;
             if !entry.file_type()?.is_file() {
                 continue;
@@ -2335,13 +2650,21 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(windows)]
-    fn enumerate_files(&self) -> io::Result<Vec<String>> {
-        windows_enumerate_files(&self.handle)
+    fn enumerate_files_bounded(
+        &self,
+        maximum_entries: usize,
+        deadline: Instant,
+    ) -> io::Result<Vec<String>> {
+        windows_enumerate_files_bounded(&self.handle, maximum_entries, deadline)
     }
 }
 
 #[cfg(windows)]
-fn windows_enumerate_files(directory: &fs::File) -> io::Result<Vec<String>> {
+fn windows_enumerate_files_bounded(
+    directory: &fs::File,
+    maximum_entries: usize,
+    deadline: Instant,
+) -> io::Result<Vec<String>> {
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -2381,8 +2704,15 @@ fn windows_enumerate_files(directory: &fs::File) -> io::Result<Vec<String>> {
     const ERROR_NO_MORE_FILES: i32 = 18;
 
     let mut names = Vec::new();
+    let mut entries_seen = 0usize;
     let mut restart = true;
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "reservation directory scan exceeded its time bound",
+            ));
+        }
         let mut buffer = vec![0_u64; BUFFER_BYTES / std::mem::size_of::<u64>()];
         let info_class = if restart {
             FILE_ID_BOTH_DIRECTORY_RESTART_INFO
@@ -2408,6 +2738,19 @@ fn windows_enumerate_files(directory: &fs::File) -> io::Result<Vec<String>> {
 
         let mut offset = 0_usize;
         loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "reservation directory scan exceeded its time bound",
+                ));
+            }
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > maximum_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "reservation directory scan exceeded its entry bound",
+                ));
+            }
             if offset + std::mem::size_of::<FileIdBothDirectoryInfo>() > BUFFER_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2957,7 +3300,7 @@ fn table_has_column(
     table: &str,
     column: &str,
 ) -> Result<bool, LimitError> {
-    if !matches!(table, "uploads" | "ip_hashes") {
+    if !matches!(table, "uploads" | "ip_hashes" | "cleanup_outbox") {
         return Err(LimitError::AccountingInvariant);
     }
     let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -3722,6 +4065,420 @@ mod cleanup_security_tests {
         assert_eq!(duplicate.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert!(ambiguous.upload_path.exists());
         assert!(alias.exists());
+    }
+
+    #[test]
+    fn identity_cleanup_stops_at_the_per_scan_entry_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        fs::create_dir(&upload_root).unwrap();
+        let ledger = UploadLedger::open(
+            temp.path().join("ledger.sqlite3"),
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let timed_out = ledger
+            .reservation_directory
+            .enumerate_files_bounded(MAX_IDENTITY_SCAN_ENTRIES, Instant::now())
+            .unwrap_err();
+        assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut);
+        let reservation = ledger.reserve("192.0.2.10", Some(1)).unwrap();
+        let reservation_directory = upload_root.join(".fluxform-reservations");
+        for index in 0..65 {
+            fs::write(
+                reservation_directory.join(format!("unrelated-{index:03}")),
+                b"not a reservation",
+            )
+            .unwrap();
+        }
+        let pinned = ledger
+            .reservation_directory
+            .open_file(
+                reservation
+                    .upload_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let identity = file_identity(&pinned).unwrap();
+        drop(pinned);
+
+        let result = ledger.remove_upload_file_if_identity(
+            reservation
+                .upload_path
+                .strip_prefix(&ledger.upload_root)
+                .unwrap(),
+            &identity,
+        );
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(reservation.upload_path.exists());
+    }
+
+    #[test]
+    fn unrelated_sticky_cleanup_does_not_fail_target_settlement_compensation() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+
+        let sticky = ledger.reserve("192.0.2.11", Some(1)).unwrap();
+        let sticky_path = sticky.upload_path.clone();
+        let sticky_identity = {
+            let file = ledger
+                .reservation_directory
+                .open_file(sticky_path.file_name().unwrap().to_str().unwrap(), false)
+                .unwrap();
+            file_identity(&file).unwrap()
+        };
+        let displaced = temp.path().join("displaced-sticky-upload");
+        fs::rename(&sticky_path, &displaced).unwrap();
+        fs::write(&sticky_path, b"replacement").unwrap();
+        Connection::open(&database_path)
+            .unwrap()
+            .execute(
+                "UPDATE uploads SET file_identity = ?1 WHERE id = ?2",
+                params![sticky_identity, sticky.session_id],
+            )
+            .unwrap();
+        ledger
+            .expire(sticky.session_id, &sticky.session_token)
+            .unwrap();
+        assert_eq!(ledger.reconcile_cleanup_jobs().unwrap().retryable, 1);
+
+        let target = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.12",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap()
+            .0;
+        ledger
+            .claim_receiving_lease(
+                target.session_id,
+                &target.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(target.session_id, &target.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        let receipt = ledger
+            .settle_pinned_until(
+                target.session_id,
+                &target.session_token,
+                &file,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        drop(file);
+
+        let result =
+            ledger.compensate_late_settlement(target.session_id, &target.session_token, receipt);
+
+        assert!(
+            result.is_ok(),
+            "unrelated sticky work must not poison target cleanup"
+        );
+        assert_eq!(
+            ledger
+                .state(target.session_id, &target.session_token)
+                .unwrap(),
+            UploadState::Expired
+        );
+        assert!(!target.upload_path.exists());
+        assert_eq!(fs::read(sticky_path).unwrap(), b"replacement");
+        assert!(
+            displaced.exists(),
+            "the unidentifiable pinned object remains pending"
+        );
+        assert_eq!(ledger.reconcile_cleanup_jobs().unwrap().retryable, 1);
+    }
+
+    #[test]
+    fn unacknowledged_settlement_is_compensated_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let reservation = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap()
+            .0;
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        ledger
+            .settle_pinned_until(
+                reservation.session_id,
+                &reservation.session_token,
+                &file,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 1,
+            "settlement and remediation intent commit atomically"
+        );
+        drop(file);
+        drop(ledger);
+
+        let reopened = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+
+        assert_eq!(
+            reopened
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Expired
+        );
+        assert_eq!(reopened.reserved_bytes().unwrap(), 0);
+        assert!(!reservation.upload_path.exists());
+        let usage: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(used_bytes), 0) FROM daily_usage",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 0);
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "startup compensation is durable and idempotent");
+        drop(reopened);
+
+        let reopened_again = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_again
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Expired,
+            "a crash after compensation commit is idempotently recovered"
+        );
+    }
+
+    #[test]
+    fn acknowledged_settlement_survives_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let reservation = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap()
+            .0;
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        ledger
+            .settle_pinned_until(
+                reservation.session_id,
+                &reservation.session_token,
+                &file,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        ledger
+            .acknowledge_settlement(reservation.session_id)
+            .unwrap();
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 0,
+            "successful transport completion acknowledges intent"
+        );
+        drop(file);
+        drop(ledger);
+
+        let reopened = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Uploaded
+        );
+        assert!(reservation.upload_path.exists());
+        let usage: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(used_bytes), 0) FROM daily_usage",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 1);
+    }
+
+    #[test]
+    fn stale_unacknowledged_settlement_is_compensated_by_periodic_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let reservation = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap()
+            .0;
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        ledger
+            .settle_pinned_until(
+                reservation.session_id,
+                &reservation.session_token,
+                &file,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        drop(file);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute(
+                "UPDATE settlement_outbox SET created_at = 0 WHERE session_id = ?1",
+                [reservation.session_id],
+            )
+            .unwrap();
+
+        ledger.reconcile_expired_sessions().unwrap();
+
+        assert_eq!(
+            ledger
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Expired
+        );
+        assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+        assert!(!reservation.upload_path.exists());
+        let usage: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(used_bytes), 0) FROM daily_usage",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 0);
     }
 
     #[test]
