@@ -83,14 +83,93 @@ function Get-Task16ProcessImagePath([Diagnostics.Process]$Process) {
     return Get-Task16CanonicalPath $imagePath
 }
 
+function Stop-Task16CreatedProcess(
+    [Diagnostics.Process]$Process,
+    [int]$GraceTimeoutMilliseconds = 1000,
+    [int]$ForcedWaitMilliseconds = 5000
+) {
+    $forced = $false
+    $errors = [Collections.Generic.List[string]]::new()
+    if ($null -eq $Process) {
+        return [pscustomobject]@{ ProcessId = 0; Established = $false; Forced = $false; Error = 'No Process object was returned.' }
+    }
+
+    try {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            return [pscustomobject]@{ ProcessId = $Process.Id; Established = $true; Forced = $false; Error = '' }
+        }
+    } catch {
+        $errors.Add("Initial process-state query failed: $($_.Exception.Message)")
+    }
+
+    try { $null = $Process.CloseMainWindow() }
+    catch { $errors.Add("Graceful close request failed: $($_.Exception.Message)") }
+
+    $exited = $false
+    try { $exited = $Process.WaitForExit($GraceTimeoutMilliseconds) }
+    catch { $errors.Add("Grace-period wait failed: $($_.Exception.Message)") }
+
+    if (-not $exited) {
+        try {
+            # Kill is invoked on the exact Process handle returned by Start-Process, never by name
+            # or a re-enumerated PID/path set.
+            $Process.Kill()
+            $forced = $true
+        } catch {
+            $errors.Add("Exact-process termination request failed: $($_.Exception.Message)")
+        }
+        try { $exited = $Process.WaitForExit($ForcedWaitMilliseconds) }
+        catch { $errors.Add("Post-termination wait failed: $($_.Exception.Message)") }
+    }
+
+    try {
+        $Process.Refresh()
+        $exited = $exited -or $Process.HasExited
+    } catch {
+        $errors.Add("Final process-state query failed: $($_.Exception.Message)")
+    }
+
+    $cleanupError = $errors -join ' '
+    if (-not $exited -and -not $cleanupError) { $cleanupError = 'Process exit was not established within the bounded cleanup interval.' }
+    return [pscustomobject]@{ ProcessId = $Process.Id; Established = [bool]$exited; Forced = $forced; Error = $cleanupError }
+}
+
+function New-Task16LaunchFailureException(
+    [Diagnostics.Process]$Process,
+    [int]$ProcessId = 0,
+    [string]$ValidationError,
+    [object]$CleanupResult
+) {
+    if ($Process) { $ProcessId = [int]$Process.Id }
+    $processId = $ProcessId
+    $established = ($null -ne $CleanupResult -and [bool]$CleanupResult.Established)
+    $forced = ($null -ne $CleanupResult -and [bool]$CleanupResult.Forced)
+    $cleanupError = if ($null -ne $CleanupResult) { [string]$CleanupResult.Error } else { 'Cleanup was not attempted.' }
+    $message = "Verified launch validation failed for PID ${processId}: $ValidationError; cleanup_established=$established; cleanup_forced=$forced."
+    if (-not $established) {
+        $message += " The exact spawned process may still be running; retain and inspect PID $processId. Cleanup detail: $cleanupError"
+    }
+    $exception = [InvalidOperationException]::new($message)
+    $exception.Data['Task16ProcessId'] = $processId
+    $exception.Data['Task16CleanupEstablished'] = $established
+    $exception.Data['Task16CleanupForced'] = $forced
+    $exception.Data['Task16CleanupError'] = $cleanupError
+    $exception.Data['Task16ValidationError'] = $ValidationError
+    return $exception
+}
+
 function Start-Task16PinnedProcess(
     [string]$Path,
     [IO.FileStream]$Handle,
     [string]$ExpectedSha256,
     [string[]]$ArgumentList = @(),
+    [string]$ExpectedImagePath,
     [ValidateSet('Normal', 'Hidden', 'Minimized', 'Maximized')][string]$WindowStyle
 ) {
     $fullPath = Get-Task16CanonicalPath $Path
+    if ([string]::IsNullOrWhiteSpace($ExpectedImagePath)) { $ExpectedImagePath = $fullPath }
+    else { $ExpectedImagePath = Get-Task16CanonicalPath $ExpectedImagePath }
     if ($null -eq $Handle -or -not $Handle.CanRead -or
         -not (Get-Task16CanonicalPath $Handle.Name).Equals($fullPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The process path is not protected by the matching pinned read handle.'
@@ -103,16 +182,30 @@ function Start-Task16PinnedProcess(
     if ($ArgumentList.Count -gt 0) { $startArguments.ArgumentList = $ArgumentList }
     if (-not [string]::IsNullOrWhiteSpace($WindowStyle)) { $startArguments.WindowStyle = $WindowStyle }
     $process = Start-Process @startArguments
+    if ($null -eq $process) { throw "Start-Process did not return a Process object for $fullPath; no verified PID is available." }
+    $actualImagePath = $null
     try {
         $actualImagePath = Get-Task16ProcessImagePath $process
-        if (-not $actualImagePath.Equals($fullPath, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Launched process image identity mismatch: expected '$fullPath', observed '$actualImagePath'."
+        if (-not $actualImagePath.Equals($ExpectedImagePath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Launched process image identity mismatch: expected '$ExpectedImagePath', observed '$actualImagePath'."
         }
         if ((Get-Task16PinnedSha256 $Handle) -ne $ExpectedSha256.ToLowerInvariant()) {
             throw "Pinned executable SHA-256 changed across process creation: $fullPath"
         }
     } catch {
-        throw "Process launch was not verified; refusing a verified-launch result. $($_.Exception.Message)"
+        $validationError = $_.Exception.Message
+        try {
+            $cleanupResult = Stop-Task16CreatedProcess -Process $process
+        } catch {
+            $cleanupResult = [pscustomobject]@{
+                ProcessId = $process.Id
+                Established = $false
+                Forced = $false
+                Error = "Cleanup helper failed: $($_.Exception.Message)"
+            }
+        }
+        $failureException = New-Task16LaunchFailureException -Process $process -ValidationError $validationError -CleanupResult $cleanupResult
+        throw $failureException
     }
     return $process
 }
@@ -148,6 +241,8 @@ Export-ModuleMember -Function @(
     'Open-Task16PinnedReadHandle',
     'Get-Task16PinnedSha256',
     'Get-Task16ProcessImagePath',
+    'Stop-Task16CreatedProcess',
+    'New-Task16LaunchFailureException',
     'Start-Task16PinnedProcess',
     'Test-Task16ObservationPass',
     'Get-Task16StructuralPaths'

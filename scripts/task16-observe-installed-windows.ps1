@@ -294,6 +294,10 @@ $startUtc = [DateTime]::UtcNow.ToString('o')
 $steps = [Collections.Generic.List[object]]::new()
 $notes = [Collections.Generic.List[string]]::new()
 $secondProcessId = $null
+$secondProcess = $null
+$secondLaunchCleanupEstablished = $null
+$secondLaunchCleanupForced = $null
+$secondLaunchFailure = $null
 $repeatLaunchPassed = $false
 $singleClosePassed = $false
 $lastClosePassed = $false
@@ -317,7 +321,22 @@ try {
         throw "Expected one top-level probe window before second launch; observed $($baselineProbeWindows.Count)."
     }
 
-    $secondProcess = Start-Task16PinnedProcess -Path $executablePath -Handle $executableHandle -ExpectedSha256 $executableHash
+    try {
+        $secondProcess = Start-Task16PinnedProcess -Path $executablePath -Handle $executableHandle -ExpectedSha256 $executableHash
+    } catch {
+        # The helper attaches the exact PID plus bounded-cleanup state when
+        # post-launch verification fails; retain these scalar values in the journal.
+        $secondProcessId = [int]$_.Exception.Data['Task16ProcessId']
+        $secondProcess = $null
+        $secondLaunchCleanupEstablished = $_.Exception.Data['Task16CleanupEstablished']
+        $secondLaunchCleanupForced = $_.Exception.Data['Task16CleanupForced']
+        $secondLaunchFailure = $_.Exception.Message
+        if ($secondProcessId -gt 0) {
+            $_.Exception.Data['Task16ObserverSecondProcessId'] = $secondProcessId
+        }
+        if ([bool]$secondLaunchCleanupForced) { $forcedTermination = $true }
+        throw
+    }
     $secondProcessId = $secondProcess.Id
     $repeatLaunchPassed = Wait-ForCondition {
         $probeWindows = @(Get-ProbeWindows $ExpectedProcessId)
@@ -382,14 +401,19 @@ try {
     $failure = $_.Exception.Message
     $notes.Add("Safe native observation stopped: $failure")
 } finally {
-    # Graceful cleanup is restricted to this exact installed path and task-created process ID(s).
-    foreach ($candidateId in @($ExpectedProcessId, $secondProcessId) | Where-Object { $_ }) {
-        $candidate = Get-Process -Id ([int]$candidateId) -ErrorAction SilentlyContinue
-        $candidatePath = $null
-        if ($candidate) {
-            try { $candidatePath = Get-Task16ProcessImagePath -Process $candidate }
-            catch { $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'WM_CLOSE skipped'; reason = 'could not verify process image path' }) }
+    # Cleanup only Process objects retained from the verified initial PID and this
+    # observer's exact Start-Process return/launch-failure exception. Never kill a
+    # re-enumerated process by name, PID set, or matching-path set.
+    $taskProcessObjects = [Collections.Generic.List[Diagnostics.Process]]::new()
+    foreach ($candidate in @($process, $secondProcess) | Where-Object { $null -ne $_ }) {
+        if (-not @($taskProcessObjects | Where-Object { $_.Id -eq $candidate.Id }).Count) {
+            $taskProcessObjects.Add($candidate)
         }
+    }
+    foreach ($candidate in $taskProcessObjects) {
+        $candidatePath = $null
+        try { $candidatePath = Get-Task16ProcessImagePath -Process $candidate }
+        catch { $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'WM_CLOSE skipped'; reason = 'could not verify process image path' }) }
         if ($candidate -and $candidatePath -and $candidatePath.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
             $windows = @([FluxFormTask16.Native]::GetWindowsForProcess([uint32]$candidate.Id))
             foreach ($window in $windows) {
@@ -399,18 +423,23 @@ try {
             }
         }
     }
-    $allTaskProcesses = @(Get-InstalledProbeProcesses $executablePath)
-    foreach ($candidate in $allTaskProcesses) {
+    foreach ($candidate in $taskProcessObjects) {
         try { $null = $candidate.WaitForExit(5000) } catch { }
-    }
-    $allTaskProcesses = @(Get-InstalledProbeProcesses $executablePath)
-    foreach ($candidate in $allTaskProcesses) {
         $candidatePath = $null
         try { $candidatePath = Get-Task16ProcessImagePath -Process $candidate } catch { }
-        if ($candidate.Id -in @($ExpectedProcessId, $secondProcessId) -and $candidatePath -and $candidatePath.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
-            Stop-Process -Id $candidate.Id -Force
-            $forcedTermination = $true
-            $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'Stop-Process -Force'; exact_path_reverified = $true })
+        try { $candidate.Refresh() } catch { }
+        if (-not $candidate.HasExited -and $candidatePath -and $candidatePath.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+            try {
+                # Terminate through the retained Process object (its exact process
+                # handle), not Stop-Process -Id or a newly enumerated path match.
+                $candidate.Kill()
+                $null = $candidate.WaitForExit(5000)
+                $candidate.Refresh()
+                $forcedTermination = $true
+                $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'exact Process.Kill after WM_CLOSE'; exit_established = $candidate.HasExited; exact_image_path_reverified = $true })
+            } catch {
+                $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'exact Process.Kill failed'; exit_established = $false; error = $_.Exception.Message })
+            }
         }
     }
 }
@@ -494,6 +523,9 @@ $rawObservations = [ordered]@{
     installed_executable_sha256 = $executableHash
     initial_pid = $ExpectedProcessId
     second_launch_pid = $secondProcessId
+    second_launch_cleanup_established = $secondLaunchCleanupEstablished
+    second_launch_cleanup_forced = $secondLaunchCleanupForced
+    second_launch_failure = $secondLaunchFailure
     second_launch_backend_count_and_window_check_passed = $repeatLaunchPassed
     non_last_wm_close_passed = $singleClosePassed
     last_wm_close_passed = $lastClosePassed -and ($remainingProcesses.Count -eq 0)

@@ -177,7 +177,17 @@ if ($ResumeFinalize) {
     # NSIS requires /D as the final option. The generated target path contains no spaces.
     $installArgument = '/D=' + $installDirectory
     $installCommand = '"' + $installerFullPath + '" /S ' + $installArgument
-    $installerProcess = Start-Task16PinnedProcess -Path $installerFullPath -Handle $installerHandle -ExpectedSha256 $expectedInstallerSha256 -ArgumentList @('/S', $installArgument) -WindowStyle Hidden
+    try {
+        $installerProcess = Start-Task16PinnedProcess -Path $installerFullPath -Handle $installerHandle -ExpectedSha256 $expectedInstallerSha256 -ArgumentList @('/S', $installArgument) -WindowStyle Hidden
+    } catch {
+        # Preserve the exact Process/PID placed on the verifier exception even though
+        # verified launch failed. The helper has already attempted bounded cleanup.
+        $installerProcessId = [int]$_.Exception.Data['Task16ProcessId']
+        if ($installerProcessId -gt 0) {
+            $_.Exception.Data['Task16InstallerProcessId'] = $installerProcessId
+        }
+        throw
+    }
     $installerProcess.WaitForExit()
     $installerProcessId = $installerProcess.Id
     $installerExitCode = $installerProcess.ExitCode
