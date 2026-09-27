@@ -53,6 +53,7 @@ const DEFAULT_MAX_STORAGE_WORKERS: usize = 8;
 const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const STORAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const SETTLEMENT_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FORWARDED_HOPS: usize = 8;
 const MAX_FORWARDED_HEADER_BYTES: usize = 4 * 1024;
 const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
@@ -160,9 +161,12 @@ pub struct ServerState {
     header_read_timeout: Duration,
     upload_workers: Arc<Semaphore>,
     storage_workers: Arc<Semaphore>,
+    pending_delivery_acknowledgements: Arc<AtomicUsize>,
     active_uploads: Arc<Mutex<HashSet<i64>>>,
     worker_tracker: Arc<WorkerTracker>,
     resources: Arc<Mutex<ResourceCatalog>>,
+    #[cfg(test)]
+    test_acknowledgement_gate: Option<(Arc<Notify>, Arc<Semaphore>)>,
 }
 
 impl ServerState {
@@ -204,9 +208,12 @@ impl ServerState {
             header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT,
             upload_workers: Arc::new(Semaphore::new(DEFAULT_MAX_UPLOAD_WORKERS)),
             storage_workers: Arc::new(Semaphore::new(DEFAULT_MAX_STORAGE_WORKERS)),
+            pending_delivery_acknowledgements: Arc::new(AtomicUsize::new(0)),
             active_uploads: Arc::new(Mutex::new(HashSet::new())),
             worker_tracker: Arc::new(WorkerTracker::default()),
             resources: Arc::new(Mutex::new(ResourceCatalog::default())),
+            #[cfg(test)]
+            test_acknowledgement_gate: None,
         })
     }
 
@@ -1015,7 +1022,7 @@ where
                 };
                 let connection_state = state.clone();
                 let acknowledgement_state = connection_state.clone();
-                let settlement_acknowledgement = Arc::new(Mutex::new(None::<i64>));
+                let settlement_acknowledgement = Arc::new(Mutex::new(Vec::<i64>::new()));
                 let service_settlement_acknowledgement =
                     Arc::clone(&settlement_acknowledgement);
                 let header_timeout = connection_state.header_read_timeout;
@@ -1031,13 +1038,32 @@ where
                                     .boxed_unsync()
                             });
                             request.extensions_mut().insert(TransportPeer(peer));
-                            let response = handle_request(request, state).await;
+                            let mut response = handle_request(request, state.clone()).await;
                             if let Some(candidate) = response
                                 .extensions()
                                 .get::<SettlementAckCandidate>()
-                                && let Ok(mut pending) = settlement_acknowledgement.lock()
                             {
-                                *pending = Some(candidate.0);
+                                let session_id = candidate.0;
+                                let ledger = state.ledger.clone();
+                                let deadline = tokio::time::Instant::now()
+                                    + state.storage_operation_timeout;
+                                let delivery_marker = run_storage(&state, deadline, move || {
+                                    ledger.mark_settlement_delivery_possible(session_id)
+                                })
+                                .await;
+                                let marked = matches!(delivery_marker, Ok(Ok(())));
+                                if marked {
+                                    state
+                                        .pending_delivery_acknowledgements
+                                        .fetch_add(1, Ordering::AcqRel);
+                                    settlement_acknowledgement
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(session_id);
+                                } else {
+                                    response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+                                    add_common_headers(&mut response);
+                                }
                             }
                             Ok::<_, Infallible>(response)
                         }
@@ -1045,21 +1071,42 @@ where
                     let mut builder = http1::Builder::new();
                     builder.timer(TokioTimer::new());
                     builder.header_read_timeout(header_timeout);
-                    let connection_result =
+                    let _connection_result =
                         builder.serve_connection(TokioIo(stream), service).await;
-                    if connection_result.is_ok() {
-                        let session_id = settlement_acknowledgement
+                    let session_ids = {
+                        let mut pending = settlement_acknowledgement
                             .lock()
-                            .ok()
-                            .and_then(|mut pending| pending.take());
-                        if let Some(session_id) = session_id {
-                            let ledger = acknowledgement_state.ledger.clone();
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        std::mem::take(&mut *pending)
+                    };
+                    for session_id in session_ids {
+                        #[cfg(test)]
+                        if let Some((reached, release)) =
+                            &acknowledgement_state.test_acknowledgement_gate
+                        {
+                            reached.notify_one();
+                            if let Ok(permit) = release.acquire().await {
+                                permit.forget();
+                            }
+                        }
+                        let ledger = acknowledgement_state.ledger.clone();
+                        loop {
                             let deadline = tokio::time::Instant::now()
                                 + acknowledgement_state.storage_operation_timeout;
-                            let _ = run_storage(&acknowledgement_state, deadline, move || {
+                            let ledger = ledger.clone();
+                            match run_storage(&acknowledgement_state, deadline, move || {
                                 ledger.acknowledge_settlement(session_id)
                             })
-                            .await;
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    acknowledgement_state
+                                        .pending_delivery_acknowledgements
+                                        .fetch_sub(1, Ordering::AcqRel);
+                                    break;
+                                }
+                                _ => tokio::time::sleep(SETTLEMENT_ACK_RETRY_INTERVAL).await,
+                            }
                         }
                     }
                 });
@@ -1096,6 +1143,16 @@ where
                 break;
             }
         }
+    }
+    if state
+        .pending_delivery_acknowledgements
+        .load(Ordering::Acquire)
+        != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server shutdown grace elapsed with upload delivery ACK remediation still pending",
+        ));
     }
     if !state
         .worker_tracker
@@ -2246,6 +2303,177 @@ mod late_completion_tests {
         assert_eq!(state_name, "expired");
         assert_eq!(expires_at, 0);
         assert!(!temp.path().join("uploads").join(relative_path).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delivered_204_retries_ack_after_storage_semaphore_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_temp, ledger, mut state) = test_state();
+        state.storage_operation_timeout = Duration::from_millis(40);
+        let acknowledgement_reached = Arc::new(Notify::new());
+        let acknowledgement_release = Arc::new(Semaphore::new(0));
+        state.test_acknowledgement_gate = Some((
+            Arc::clone(&acknowledgement_reached),
+            Arc::clone(&acknowledgement_release),
+        ));
+        let (reservation, capability) = ledger
+            .reserve_with_upload_capability(
+                "127.0.0.1",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_with_shutdown(listener, state.clone(), async move {
+            let _ = shutdown_receiver.await;
+        }));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "PUT /v1/upload-sessions/{}/content HTTP/1.1\r\nHost: localhost\r\nOrigin: https://flux.test\r\nAuthorization: Bearer {}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            reservation.session_id,
+            capability.token()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .expect("the response must finish before ACK remediation")
+            .unwrap();
+        let status_line = String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            status_line.contains(" 204 "),
+            "unexpected response: {status_line}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), acknowledgement_reached.notified())
+            .await
+            .expect("Hyper must report the delivered connection before ACK remediation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.storage_workers.available_permits() != DEFAULT_MAX_STORAGE_WORKERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload storage workers should release their bounded permits");
+        let held_permits = Arc::clone(&state.storage_workers)
+            .acquire_many_owned(DEFAULT_MAX_STORAGE_WORKERS as u32)
+            .await
+            .unwrap();
+        acknowledgement_release.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(held_permits);
+
+        let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let pending: i64 = Connection::open(ledger.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                    [reservation.session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if pending == 0 || tokio::time::Instant::now() >= ack_deadline {
+                assert_eq!(pending, 0, "delivered 204 must retain a tracked ACK retry");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ledger
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            crate::ledger::UploadState::Uploaded
+        );
+
+        shutdown.send(()).unwrap();
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_reports_delivery_ack_remediation_that_exceeds_its_grace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_temp, ledger, mut state) = test_state();
+        let acknowledgement_reached = Arc::new(Notify::new());
+        let acknowledgement_release = Arc::new(Semaphore::new(0));
+        state.test_acknowledgement_gate = Some((
+            Arc::clone(&acknowledgement_reached),
+            Arc::clone(&acknowledgement_release),
+        ));
+        let (reservation, capability) = ledger
+            .reserve_with_upload_capability(
+                "127.0.0.1",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_with_shutdown(listener, state.clone(), async move {
+            let _ = shutdown_receiver.await;
+        }));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "PUT /v1/upload-sessions/{}/content HTTP/1.1\r\nHost: localhost\r\nOrigin: https://flux.test\r\nAuthorization: Bearer {}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            reservation.session_id,
+            capability.token()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .expect("the response must complete before shutdown")
+            .unwrap();
+        let status_line = String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            status_line.contains(" 204 "),
+            "unexpected response: {status_line}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), acknowledgement_reached.notified())
+            .await
+            .expect("the delivered response must enter tracked ACK remediation");
+
+        shutdown.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(7), server)
+            .await
+            .expect("shutdown must be bounded by its remediation grace")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("delivery ACK remediation"));
+        assert_eq!(
+            ledger
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            crate::ledger::UploadState::Uploaded
+        );
+        let pending: i64 = Connection::open(ledger.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 1,
+            "shutdown must not reinterpret delivery as failure"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

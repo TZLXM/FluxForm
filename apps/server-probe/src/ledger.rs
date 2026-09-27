@@ -16,11 +16,13 @@ use crate::auth::Capability;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const MAX_CLEANUP_JOBS_PER_PASS: usize = 64;
 const MAX_IDENTITY_SCAN_ENTRIES: usize = 64;
-const IDENTITY_SCAN_TIMEOUT: Duration = Duration::from_millis(100);
-const MAX_STARTUP_ORPHAN_SCAN_ENTRIES: usize = 4096;
+const MAX_RESERVATION_DIRECTORY_ENTRIES: usize = 4096;
+const MAX_IDENTITY_SCAN_DIRECTORY_ENTRIES: usize = MAX_RESERVATION_DIRECTORY_ENTRIES;
+const IDENTITY_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_STARTUP_ORPHAN_SCAN_ENTRIES: usize = MAX_RESERVATION_DIRECTORY_ENTRIES;
 const STARTUP_ORPHAN_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTLEMENT_ACK_GRACE_SECONDS: i64 = 30;
 const MAX_STARTUP_SETTLEMENT_RECOVERIES: usize = 128;
@@ -62,13 +64,15 @@ CREATE TABLE IF NOT EXISTS cleanup_outbox (
     session_id INTEGER PRIMARY KEY REFERENCES uploads(id),
     relative_path TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-    next_attempt_at INTEGER NOT NULL DEFAULT 0
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    scan_cursor TEXT
 );
 CREATE TABLE IF NOT EXISTS settlement_outbox (
     session_id INTEGER PRIMARY KEY REFERENCES uploads(id),
     day INTEGER NOT NULL CHECK (day >= 0),
     actual_bytes INTEGER NOT NULL CHECK (actual_bytes >= 0),
-    created_at INTEGER NOT NULL CHECK (created_at >= 0)
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    delivery_possible INTEGER NOT NULL DEFAULT 0 CHECK (delivery_possible IN (0, 1))
 );
 "#;
 
@@ -447,6 +451,11 @@ impl UploadLedger {
         let had_cleanup_outbox = table_exists(&transaction, "cleanup_outbox")?;
         let had_cleanup_next_attempt = had_cleanup_outbox
             && table_has_column(&transaction, "cleanup_outbox", "next_attempt_at")?;
+        let had_cleanup_scan_cursor =
+            had_cleanup_outbox && table_has_column(&transaction, "cleanup_outbox", "scan_cursor")?;
+        let had_settlement_outbox = table_exists(&transaction, "settlement_outbox")?;
+        let had_delivery_possible = had_settlement_outbox
+            && table_has_column(&transaction, "settlement_outbox", "delivery_possible")?;
         let had_ip_hashes = table_exists(&transaction, "ip_hashes")?;
         let had_key_id = had_ip_hashes && table_has_column(&transaction, "ip_hashes", "key_id")?;
         transaction.execute_batch(SCHEMA)?;
@@ -468,6 +477,23 @@ impl UploadLedger {
         if had_cleanup_outbox && !had_cleanup_next_attempt {
             transaction.execute(
                 "ALTER TABLE cleanup_outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if had_cleanup_outbox && !had_cleanup_scan_cursor {
+            transaction.execute("ALTER TABLE cleanup_outbox ADD COLUMN scan_cursor TEXT", [])?;
+        }
+        if had_settlement_outbox && !had_delivery_possible {
+            transaction.execute(
+                "ALTER TABLE settlement_outbox ADD COLUMN delivery_possible INTEGER NOT NULL DEFAULT 0 CHECK (delivery_possible IN (0, 1))",
+                [],
+            )?;
+            // Older rows may already have produced a 204 before their ACK
+            // write failed. Their transport outcome is unknowable, so favor
+            // identity-verified ACK recovery over destructive compensation.
+            transaction.execute(
+                "UPDATE settlement_outbox SET delivery_possible = 1 \
+                 WHERE session_id IN (SELECT id FROM uploads WHERE state = 'uploaded')",
                 [],
             )?;
         }
@@ -528,6 +554,7 @@ impl UploadLedger {
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         ledger.validate_startup_invariants(&transaction)?;
         transaction.commit()?;
+        ledger.acknowledge_delivery_possible_settlements(MAX_STARTUP_SETTLEMENT_RECOVERIES)?;
         ledger.reconcile_cleanup_jobs()?;
         ledger.reconcile_unreferenced_files()?;
         Ok(ledger)
@@ -638,6 +665,32 @@ impl UploadLedger {
         let capability_hash = session_token.hash();
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Serialize the namespace admission check with all reservation writes
+        // so concurrent callers cannot exceed the directory-entry policy.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(LimitError::OperationTimedOut);
+        }
+        let scan_deadline =
+            deadline.unwrap_or_else(|| Instant::now() + STARTUP_ORPHAN_SCAN_TIMEOUT);
+        let existing_entries = match self
+            .reservation_directory
+            .enumerate_files_bounded(MAX_RESERVATION_DIRECTORY_ENTRIES, scan_deadline)
+        {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(LimitError::GlobalCapacityExceeded);
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut && deadline.is_some() => {
+                return Err(LimitError::OperationTimedOut);
+            }
+            Err(error) => return Err(LimitError::Filesystem(error)),
+        };
+        if existing_entries.len() >= MAX_RESERVATION_DIRECTORY_ENTRIES {
+            return Err(LimitError::GlobalCapacityExceeded);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(LimitError::OperationTimedOut);
+        }
         let identity_id = self.resolve_identity(&transaction, &canonical_ip)?;
         let (used, active_reserved, active_sessions) =
             identity_usage(&transaction, identity_id, day)?;
@@ -868,10 +921,28 @@ impl UploadLedger {
     ) -> Result<(), LimitError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, reserved, _, _) = load_session(&transaction, session_id, capability)?;
+        let (state, reserved, _, relative_path) =
+            load_session(&transaction, session_id, capability)?;
         if !transition_is_legal(state, target) {
             return Err(LimitError::InvalidTransition);
         }
+        let pinned_uploaded_file = if state == UploadState::Uploaded {
+            let pending_settlement: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM settlement_outbox WHERE session_id = ?1)",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            if pending_settlement {
+                return Err(LimitError::InvalidTransition);
+            }
+            let expected_file_identity = load_file_identity(&transaction, session_id)?;
+            Some(self.open_verified_reservation_file(
+                relative_path.as_deref(),
+                &expected_file_identity,
+            )?)
+        } else {
+            None
+        };
         let releases = target == UploadState::Rejected && reserved > 0;
         if releases {
             release_global_reserved(&transaction, reserved)?;
@@ -888,6 +959,7 @@ impl UploadLedger {
             enqueue_cleanup(&transaction, session_id)?;
         }
         transaction.commit()?;
+        drop(pinned_uploaded_file);
         Ok(())
     }
 
@@ -1018,10 +1090,19 @@ impl UploadLedger {
             return Err(LimitError::InvalidTransition);
         }
         let expected_file_identity = load_file_identity(&transaction, session_id)?;
+        // The writer handle may permit Windows delete sharing. A separate
+        // identity pin denies delete sharing through final verification and
+        // the SQLite commit.
+        let identity_pin =
+            self.open_verified_reservation_file(relative_path.as_deref(), &expected_file_identity)?;
         if let Some(file) = pinned_file {
             self.verify_file_identity(relative_path.as_deref(), file, &expected_file_identity)?;
         } else {
-            self.verify_file_entry_identity(relative_path.as_deref(), &expected_file_identity)?;
+            self.verify_file_identity(
+                relative_path.as_deref(),
+                &identity_pin,
+                &expected_file_identity,
+            )?;
         }
         if actual_bytes > reserved {
             return Err(LimitError::SettlementExceedsReservation);
@@ -1067,16 +1148,21 @@ impl UploadLedger {
             ],
         )?;
         write_global_reserved(&transaction, next_global_reserved)?;
-        (hooks.before_commit)();
         if let Some(file) = pinned_file {
             self.verify_file_identity(relative_path.as_deref(), file, &expected_file_identity)?;
         } else {
-            self.verify_file_entry_identity(relative_path.as_deref(), &expected_file_identity)?;
+            self.verify_file_identity(
+                relative_path.as_deref(),
+                &identity_pin,
+                &expected_file_identity,
+            )?;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(LimitError::OperationTimedOut);
         }
+        (hooks.before_commit)();
         transaction.commit()?;
+        drop(identity_pin);
         (hooks.after_commit)();
         let receipt = SettlementReceipt {
             session_id,
@@ -1096,27 +1182,95 @@ impl UploadLedger {
         Ok(receipt)
     }
 
-    /// Acknowledges the settlement only after Hyper reports successful
-    /// completion of the response on a `Connection: close` connection. If
-    /// transport completion is ambiguous, the durable intent remains and is
-    /// compensated by the TTL reconciler or at next startup.
-    pub(crate) fn acknowledge_settlement(&self, session_id: i64) -> Result<(), LimitError> {
+    /// Records that Hyper may now deliver a 204 response. Once this durable
+    /// marker is committed, recovery preserves the Uploaded row and retries
+    /// only the identity-verified acknowledgment.
+    pub(crate) fn mark_settlement_delivery_possible(
+        &self,
+        session_id: i64,
+    ) -> Result<(), LimitError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state: String = transaction.query_row(
-            "SELECT state FROM uploads WHERE id = ?1",
+        let (state, relative_path): (String, Option<String>) = transaction.query_row(
+            "SELECT state, upload_path FROM uploads WHERE id = ?1",
             [session_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if UploadState::from_str(&state)? != UploadState::Uploaded {
             return Err(LimitError::InvalidTransition);
         }
+        let expected_file_identity = load_file_identity(&transaction, session_id)?;
+        let file =
+            self.open_verified_reservation_file(relative_path.as_deref(), &expected_file_identity)?;
+        let changed = transaction.execute(
+            "UPDATE settlement_outbox SET delivery_possible = 1 WHERE session_id = ?1",
+            [session_id],
+        )?;
+        if changed != 1 {
+            return Err(LimitError::InvalidTransition);
+        }
+        transaction.commit()?;
+        drop(file);
+        Ok(())
+    }
+
+    /// Acknowledges a settlement after Hyper completes its connection. Both
+    /// the persisted identity and the directory entry are pinned through the
+    /// acknowledgment commit; a mismatched replacement is never accepted.
+    pub(crate) fn acknowledge_settlement(&self, session_id: i64) -> Result<(), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, relative_path): (String, Option<String>) = transaction.query_row(
+            "SELECT state, upload_path FROM uploads WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if UploadState::from_str(&state)? != UploadState::Uploaded {
+            return Err(LimitError::InvalidTransition);
+        }
+        let pending: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settlement_outbox WHERE session_id = ?1)",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if !pending {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let expected_file_identity = load_file_identity(&transaction, session_id)?;
+        let file =
+            self.open_verified_reservation_file(relative_path.as_deref(), &expected_file_identity)?;
         transaction.execute(
             "DELETE FROM settlement_outbox WHERE session_id = ?1",
             [session_id],
         )?;
         transaction.commit()?;
+        drop(file);
         Ok(())
+    }
+
+    fn acknowledge_delivery_possible_settlements(
+        &self,
+        maximum: usize,
+    ) -> Result<usize, LimitError> {
+        let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
+        let session_ids = {
+            let connection = self.connect()?;
+            let mut statement = connection.prepare(
+                "SELECT session_id FROM settlement_outbox WHERE delivery_possible = 1 \
+                 ORDER BY created_at, session_id LIMIT ?1",
+            )?;
+            statement
+                .query_map([limit], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if session_ids.len() > maximum {
+            return Err(LimitError::PendingSettlementRecoveryLimit);
+        }
+        for session_id in &session_ids {
+            self.acknowledge_settlement(*session_id)?;
+        }
+        Ok(session_ids.len())
     }
 
     pub(crate) fn compensate_late_settlement(
@@ -1157,6 +1311,15 @@ impl UploadLedger {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, reserved, identity_id, _) = load_session(&transaction, session_id, capability)?;
+        let delivery_possible: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settlement_outbox \
+             WHERE session_id = ?1 AND delivery_possible = 1)",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if delivery_possible {
+            return Err(LimitError::InvalidTransition);
+        }
         if identity_id != receipt.identity_id {
             return Err(LimitError::AccountingInvariant);
         }
@@ -1274,6 +1437,15 @@ impl UploadLedger {
         if state == UploadState::Rejected {
             return Err(LimitError::InvalidTransition);
         }
+        let delivery_possible: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settlement_outbox \
+             WHERE session_id = ?1 AND delivery_possible = 1)",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if delivery_possible {
+            return Err(LimitError::InvalidTransition);
+        }
         if reserved > 0 {
             release_global_reserved(&transaction, reserved)?;
         }
@@ -1345,25 +1517,33 @@ impl UploadLedger {
         let connection = self.connect()?;
         let job = connection
             .query_row(
-                "SELECT cleanup_outbox.relative_path, uploads.file_identity \
+                "SELECT cleanup_outbox.relative_path, uploads.file_identity, cleanup_outbox.scan_cursor \
                  FROM cleanup_outbox JOIN uploads ON uploads.id = cleanup_outbox.session_id \
                  WHERE cleanup_outbox.session_id = ?1",
                 [session_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
         drop(connection);
-        let Some((relative_path, expected_identity)) = job else {
+        let Some((relative_path, expected_identity, scan_cursor)) = job else {
             return Ok(CleanupReport::default());
         };
         let relative = normalize_relative_path(Path::new(&relative_path));
         let deletion = match (relative, expected_identity) {
-            (Ok(relative), Some(expected_identity)) => {
-                self.remove_upload_file_if_identity(Path::new(&relative), &expected_identity)
-            }
-            (Ok(relative), None) if reservation_leaf(Path::new(&relative)).is_err() => {
-                self.remove_upload_file(Path::new(&relative))
-            }
+            (Ok(relative), Some(expected_identity)) => self.remove_upload_file_if_identity_page(
+                Path::new(&relative),
+                &expected_identity,
+                scan_cursor.as_deref(),
+            ),
+            (Ok(relative), None) if reservation_leaf(Path::new(&relative)).is_err() => self
+                .remove_upload_file(Path::new(&relative))
+                .map(|()| IdentityCleanupPage::Removed),
             (Ok(_), None) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "upload cleanup has no pinned file identity",
@@ -1374,12 +1554,33 @@ impl UploadLedger {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut report = CleanupReport::default();
         match deletion {
-            Ok(()) => {
+            Ok(IdentityCleanupPage::Removed) => {
                 let changed = transaction.execute(
                     "DELETE FROM cleanup_outbox WHERE session_id = ?1",
                     [session_id],
                 )?;
                 report.completed = usize::from(changed == 1);
+            }
+            Ok(IdentityCleanupPage::Continue(next_cursor)) => {
+                let attempts: i64 = transaction.query_row(
+                    "SELECT attempts FROM cleanup_outbox WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )?;
+                let next_attempts = attempts.saturating_add(1);
+                // A page miss is forward progress, not a failed delete. Keep
+                // pagination moving without applying the error backoff.
+                transaction.execute(
+                    "UPDATE cleanup_outbox SET attempts = ?1, next_attempt_at = ?2, scan_cursor = ?3 \
+                     WHERE session_id = ?4",
+                    params![
+                        next_attempts,
+                        current_unix_seconds().saturating_add(1),
+                        next_cursor,
+                        session_id
+                    ],
+                )?;
+                report.retryable = 1;
             }
             Err(_) => {
                 let attempts: i64 = transaction.query_row(
@@ -1575,7 +1776,26 @@ impl UploadLedger {
         )?;
         expire_abandoned_sessions_excluding_in_transaction(&transaction, now, active_uploads)?;
         transaction.commit()?;
+        self.acknowledge_delivery_possible_settlements(MAX_CLEANUP_JOBS_PER_PASS)?;
         self.reconcile_cleanup_jobs()
+    }
+
+    fn open_verified_reservation_file(
+        &self,
+        relative_path: Option<&str>,
+        expected_file_identity: &[u8],
+    ) -> Result<fs::File, LimitError> {
+        let relative_path = relative_path.ok_or(LimitError::AccountingInvariant)?;
+        let file_name = reservation_leaf(Path::new(relative_path))
+            .map_err(|_| LimitError::InvalidUploadPath)?;
+        let file = self
+            .reservation_directory
+            .open_identity_file(&file_name)
+            .map_err(LimitError::Filesystem)?;
+        if file_identity(&file).map_err(LimitError::Filesystem)? != expected_file_identity {
+            return Err(LimitError::FileIdentityMismatch);
+        }
+        Ok(file)
     }
 
     fn verify_file_identity(
@@ -1773,7 +1993,6 @@ impl UploadLedger {
             let mut statement = transaction.prepare(
                 "SELECT upload_path FROM uploads \
                  WHERE upload_path IS NOT NULL \
-                   AND state IN ('reserved', 'receiving', 'uploaded', 'probing', 'queued') \
                  UNION SELECT relative_path FROM cleanup_outbox",
             )?;
             statement
@@ -1793,7 +2012,7 @@ impl UploadLedger {
             )
             .map_err(LimitError::Filesystem)?
             .into_iter()
-            .filter(|leaf| !referenced_leaves.contains(leaf))
+            .filter(|leaf| is_managed_reservation_leaf(leaf) && !referenced_leaves.contains(leaf))
             .collect::<Vec<_>>();
         transaction.commit()?;
 
@@ -1859,12 +2078,32 @@ impl UploadLedger {
         self.remove_upload_file_with_hook(relative, || {})
     }
 
+    #[cfg(test)]
     fn remove_upload_file_if_identity(
         &self,
         relative: &Path,
         expected_identity: &[u8],
     ) -> io::Result<()> {
         self.remove_upload_file_with_identity_and_hook(relative, Some(expected_identity), || {})
+    }
+
+    fn remove_upload_file_if_identity_page(
+        &self,
+        relative: &Path,
+        expected_identity: &[u8],
+        scan_cursor: Option<&str>,
+    ) -> io::Result<IdentityCleanupPage> {
+        let normalized = normalize_relative_path(relative).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid upload cleanup path")
+        })?;
+        let leaf = reservation_leaf(Path::new(&normalized))?;
+        remove_file_if_identity_page(
+            &self.reservation_directory,
+            &leaf,
+            expected_identity,
+            scan_cursor,
+            || {},
+        )
     }
 
     fn remove_upload_file_with_hook<F>(&self, relative: &Path, before_remove: F) -> io::Result<()>
@@ -1916,6 +2155,7 @@ impl UploadLedger {
             if let Some(expected_identity) = expected_identity {
                 return remove_file_if_identity(
                     &self.reservation_directory,
+                    &components[1],
                     expected_identity,
                     before_remove,
                 );
@@ -2027,9 +2267,40 @@ fn load_session(
 
 fn remove_file_if_identity<F>(
     directory: &SecureReservationDirectory,
+    preferred_leaf: &str,
     expected_identity: &[u8],
     before_unlink: F,
 ) -> io::Result<()>
+where
+    F: FnOnce(),
+{
+    match remove_file_if_identity_page(
+        directory,
+        preferred_leaf,
+        expected_identity,
+        None,
+        before_unlink,
+    )? {
+        IdentityCleanupPage::Removed => Ok(()),
+        IdentityCleanupPage::Continue(_) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "pinned upload identity was not present on this bounded scan page",
+        )),
+    }
+}
+
+enum IdentityCleanupPage {
+    Removed,
+    Continue(Option<String>),
+}
+
+fn remove_file_if_identity_page<F>(
+    directory: &SecureReservationDirectory,
+    preferred_leaf: &str,
+    expected_identity: &[u8],
+    scan_cursor: Option<&str>,
+    before_unlink: F,
+) -> io::Result<IdentityCleanupPage>
 where
     F: FnOnce(),
 {
@@ -2042,110 +2313,192 @@ where
     let mut before_unlink = Some(before_unlink);
     let scan_deadline = Instant::now() + IDENTITY_SCAN_TIMEOUT;
 
-    for _ in 0..4 {
-        let mut matches = Vec::new();
+    match directory.open_file(preferred_leaf, false) {
+        Ok(file) if file_identity(&file)? == expected_identity => {
+            if file_link_count(&file)? > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "pinned upload identity is ambiguous in its reservation directory",
+                ));
+            }
+            drop(file);
+            if remove_identity_entry(
+                directory,
+                preferred_leaf,
+                expected_identity,
+                &mut before_unlink,
+            )? {
+                return Ok(IdentityCleanupPage::Removed);
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let (candidates, next_cursor) =
+        enumerate_identity_scan_page(directory, scan_cursor, scan_deadline)?;
+    let mut matches = Vec::new();
+    for candidate in &candidates {
         if Instant::now() >= scan_deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "pinned upload identity scan exceeded its time bound",
             ));
         }
-        for candidate in
-            directory.enumerate_files_bounded(MAX_IDENTITY_SCAN_ENTRIES, scan_deadline)?
-        {
-            if Instant::now() >= scan_deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "pinned upload identity scan exceeded its time bound",
-                ));
+        match directory.open_file(candidate, false) {
+            Ok(file) if file_identity(&file)? == expected_identity => {
+                matches.push(candidate.clone())
             }
-            match directory.open_file(&candidate, false) {
-                Ok(file) if file_identity(&file)? == expected_identity => matches.push(candidate),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        if matches.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "pinned upload identity is absent from its reservation directory",
-            ));
+    }
+    if matches.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "pinned upload identity is ambiguous in its reservation directory",
+        ));
+    }
+    if let Some(candidate) = matches.first()
+        && remove_identity_entry(directory, candidate, expected_identity, &mut before_unlink)?
+    {
+        return Ok(IdentityCleanupPage::Removed);
+    }
+    if next_cursor.is_none() && scan_cursor.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "pinned upload identity is absent from its complete reservation-directory scan",
+        ));
+    }
+    Ok(IdentityCleanupPage::Continue(next_cursor))
+}
+
+fn enumerate_identity_scan_page(
+    directory: &SecureReservationDirectory,
+    scan_cursor: Option<&str>,
+    deadline: Instant,
+) -> io::Result<(Vec<String>, Option<String>)> {
+    let mut entries =
+        directory.enumerate_files_bounded(MAX_IDENTITY_SCAN_DIRECTORY_ENTRIES, deadline)?;
+    entries.sort_unstable();
+    let mut start = scan_cursor.map_or(0, |cursor| {
+        entries
+            .iter()
+            .position(|entry| entry.as_str() > cursor)
+            .unwrap_or(entries.len())
+    });
+    if start == entries.len() && scan_cursor.is_some() {
+        start = 0;
+    }
+    let end = start
+        .saturating_add(MAX_IDENTITY_SCAN_ENTRIES)
+        .min(entries.len());
+    let page = entries[start..end].to_vec();
+    let next_cursor = (end < entries.len()).then(|| entries[end - 1].clone());
+    Ok((page, next_cursor))
+}
+
+fn remove_identity_entry<F>(
+    directory: &SecureReservationDirectory,
+    candidate: &str,
+    expected_identity: &[u8],
+    before_unlink: &mut Option<F>,
+) -> io::Result<bool>
+where
+    F: FnOnce(),
+{
+    #[cfg(windows)]
+    {
+        let file = match directory.open_file_for_delete(candidate) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if file_identity(&file)? != expected_identity {
+            return Ok(false);
         }
-        if matches.len() != 1 {
+        if file_link_count(&file)? > 1 {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "pinned upload identity is ambiguous in its reservation directory",
             ));
         }
-        let candidate = &matches[0];
-        #[cfg(windows)]
-        {
-            let file = match directory.open_file_for_delete(candidate) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if file_identity(&file)? != expected_identity {
-                continue;
-            }
-            if let Some(before_unlink) = before_unlink.take() {
-                before_unlink();
-            }
-            return delete_open_file(&file);
+        if let Some(before_unlink) = before_unlink.take() {
+            before_unlink();
         }
-        #[cfg(unix)]
-        {
-            let quarantine = format!(".cleanup-{}.tmp", Uuid::new_v4());
-            match directory.rename_file(candidate, &quarantine) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            }
-            let moved = match directory.open_file(&quarantine, false) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if file_identity(&moved)? != expected_identity {
-                drop(moved);
-                if directory.open_file(candidate, false).is_err() {
-                    let _ = directory.rename_file(&quarantine, candidate);
-                }
-                continue;
-            }
+        delete_open_file(&file)?;
+        Ok(true)
+    }
+    #[cfg(unix)]
+    {
+        let quarantine = format!(".cleanup-{}.tmp", Uuid::new_v4());
+        match directory.rename_file(candidate, &quarantine) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let moved = match directory.open_file(&quarantine, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if file_identity(&moved)? != expected_identity {
             drop(moved);
-            if let Some(before_unlink) = before_unlink.take() {
-                before_unlink();
+            if directory.open_file(candidate, false).is_err() {
+                let _ = directory.rename_file(&quarantine, candidate);
             }
-            let verified = match directory.open_file(&quarantine, false) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if file_identity(&verified)? != expected_identity {
-                drop(verified);
-                if directory.open_file(candidate, false).is_err() {
-                    let _ = directory.rename_file(&quarantine, candidate);
-                }
-                continue;
-            }
-            drop(verified);
-            return directory.remove_file(&quarantine);
+            return Ok(false);
         }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = candidate;
+        if file_link_count(&moved)? > 1 {
+            drop(moved);
+            if directory.open_file(candidate, false).is_err() {
+                let _ = directory.rename_file(&quarantine, candidate);
+            }
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "identity-safe upload cleanup is unsupported on this platform",
+                io::ErrorKind::AlreadyExists,
+                "pinned upload identity is ambiguous in its reservation directory",
             ));
         }
+        drop(moved);
+        if let Some(before_unlink) = before_unlink.take() {
+            before_unlink();
+        }
+        let verified = match directory.open_file(&quarantine, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if file_identity(&verified)? != expected_identity {
+            drop(verified);
+            if directory.open_file(candidate, false).is_err() {
+                let _ = directory.rename_file(&quarantine, candidate);
+            }
+            return Ok(false);
+        }
+        if file_link_count(&verified)? > 1 {
+            drop(verified);
+            if directory.open_file(candidate, false).is_err() {
+                let _ = directory.rename_file(&quarantine, candidate);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pinned upload identity is ambiguous in its reservation directory",
+            ));
+        }
+        drop(verified);
+        directory.remove_file(&quarantine)?;
+        return Ok(true);
     }
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "upload identity kept changing during cleanup",
-    ))
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, candidate, expected_identity, before_unlink);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-safe upload cleanup is unsupported on this platform",
+        ))
+    }
 }
 
 fn load_file_identity(
@@ -2218,7 +2571,7 @@ fn recover_unacknowledged_settlements_in_transaction(
     let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
     let rows = {
         let mut statement = transaction.prepare(
-            "SELECT session_id, day, actual_bytes FROM settlement_outbox \
+            "SELECT session_id, day, actual_bytes, delivery_possible FROM settlement_outbox \
              WHERE (?1 IS NULL OR created_at <= ?1) ORDER BY created_at, session_id LIMIT ?2",
         )?;
         statement
@@ -2227,6 +2580,7 @@ fn recover_unacknowledged_settlements_in_transaction(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -2234,8 +2588,8 @@ fn recover_unacknowledged_settlements_in_transaction(
     if rows.len() > maximum && fail_closed_on_overflow {
         return Err(LimitError::PendingSettlementRecoveryLimit);
     }
-    let count = rows.len().min(maximum);
-    for (session_id, day, actual_sql) in rows.into_iter().take(maximum) {
+    let mut count = 0;
+    for (session_id, day, actual_sql, delivery_possible) in rows.into_iter().take(maximum) {
         let _actual_bytes = from_sql_integer(actual_sql)?;
         let (state, identity_id, stored_actual) = transaction.query_row(
             "SELECT state, identity_id, actual_bytes FROM uploads WHERE id = ?1",
@@ -2248,7 +2602,17 @@ fn recover_unacknowledged_settlements_in_transaction(
                 ))
             },
         )?;
-        match UploadState::from_str(&state)? {
+        let state = UploadState::from_str(&state)?;
+        if delivery_possible {
+            if state != UploadState::Uploaded || stored_actual != Some(actual_sql) {
+                return Err(LimitError::AccountingInvariant);
+            }
+            // A 204 might have reached the peer. Preserve both its charge and
+            // file until an identity-verified ACK retry clears this intent.
+            continue;
+        }
+        count += 1;
+        match state {
             UploadState::Uploaded => {
                 if stored_actual != Some(actual_sql) {
                     return Err(LimitError::AccountingInvariant);
@@ -2404,6 +2768,15 @@ fn reservation_leaf(relative: &Path) -> io::Result<String> {
     Ok(leaf.to_owned())
 }
 
+fn is_managed_reservation_leaf(leaf: &str) -> bool {
+    leaf.strip_suffix(".upload")
+        .or_else(|| {
+            leaf.strip_prefix(".cleanup-")
+                .and_then(|name| name.strip_suffix(".tmp"))
+        })
+        .is_some_and(|name| Uuid::parse_str(name).is_ok())
+}
+
 impl SecureReservationDirectory {
     #[cfg(unix)]
     fn open(path: &Path) -> io::Result<Self> {
@@ -2449,6 +2822,11 @@ impl SecureReservationDirectory {
             return Err(io::Error::last_os_error());
         }
         Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    #[cfg(unix)]
+    fn open_identity_file(&self, leaf: &str) -> io::Result<fs::File> {
+        self.open_file(leaf, false)
     }
 
     #[cfg(unix)]
@@ -2552,12 +2930,17 @@ impl SecureReservationDirectory {
 
     #[cfg(windows)]
     fn open_file(&self, leaf: &str, create_new: bool) -> io::Result<fs::File> {
-        windows_open_relative_file(&self.handle, leaf, create_new, false)
+        windows_open_relative_file(&self.handle, leaf, create_new, false, false)
+    }
+
+    #[cfg(windows)]
+    fn open_identity_file(&self, leaf: &str) -> io::Result<fs::File> {
+        windows_open_relative_file(&self.handle, leaf, false, false, true)
     }
 
     #[cfg(windows)]
     fn open_file_for_delete(&self, leaf: &str) -> io::Result<fs::File> {
-        windows_open_relative_file(&self.handle, leaf, false, true)
+        windows_open_relative_file(&self.handle, leaf, false, true, false)
     }
 
     #[cfg(windows)]
@@ -2575,6 +2958,14 @@ impl SecureReservationDirectory {
 
     #[cfg(not(any(unix, windows)))]
     fn open_file(&self, _leaf: &str, _create_new: bool) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure relative file access is unsupported",
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open_identity_file(&self, _leaf: &str) -> io::Result<fs::File> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "secure relative file access is unsupported",
@@ -2838,6 +3229,7 @@ fn windows_open_relative_file(
     leaf: &str,
     create_new: bool,
     delete_access: bool,
+    deny_delete_sharing: bool,
 ) -> io::Result<fs::File> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
@@ -2934,7 +3326,11 @@ fn windows_open_relative_file(
             &mut status_block,
             std::ptr::null_mut(),
             0x80,
-            0x0001 | 0x0002 | 0x0004,
+            if deny_delete_sharing {
+                0x0001 | 0x0002
+            } else {
+                0x0001 | 0x0002 | 0x0004
+            },
             if create_new { 2 } else { 1 },
             0x40 | 0x20 | 0x0020_0000,
             std::ptr::null_mut(),
@@ -3300,7 +3696,10 @@ fn table_has_column(
     table: &str,
     column: &str,
 ) -> Result<bool, LimitError> {
-    if !matches!(table, "uploads" | "ip_hashes" | "cleanup_outbox") {
+    if !matches!(
+        table,
+        "uploads" | "ip_hashes" | "cleanup_outbox" | "settlement_outbox"
+    ) {
         return Err(LimitError::AccountingInvariant);
     }
     let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -3557,6 +3956,69 @@ fn file_identity(_file: &fs::File) -> io::Result<Vec<u8>> {
     ))
 }
 
+#[cfg(unix)]
+fn file_link_count(file: &fs::File) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(file.metadata()?.nlink())
+}
+
+#[cfg(windows)]
+fn file_link_count(file: &fs::File) -> io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time_low: u32,
+        creation_time_high: u32,
+        last_access_time_low: u32,
+        last_access_time_high: u32,
+        last_write_time_low: u32,
+        last_write_time_high: u32,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time_low: 0,
+        creation_time_high: 0,
+        last_access_time_low: 0,
+        last_access_time_high: 0,
+        last_write_time_low: 0,
+        last_write_time_high: 0,
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    let valid =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } != 0;
+    if !valid {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(information.number_of_links))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_link_count(_file: &fs::File) -> io::Result<u64> {
+    Ok(1)
+}
+
 fn checked_add(left: u64, right: u64) -> Result<u64, LimitError> {
     left.checked_add(right)
         .ok_or(LimitError::AccountingInvariant)
@@ -3622,7 +4084,12 @@ impl Drop for ReservationFileGuard {
                 let _ = set_file_allocation(&file, previous_size);
             }
         } else {
-            let _ = remove_file_if_identity(&self.directory, &self.file_identity, || {});
+            let _ = remove_file_if_identity(
+                &self.directory,
+                &self.file_name,
+                &self.file_identity,
+                || {},
+            );
         }
     }
 }
@@ -4068,7 +4535,7 @@ mod cleanup_security_tests {
     }
 
     #[test]
-    fn identity_cleanup_stops_at_the_per_scan_entry_limit() {
+    fn identity_cleanup_uses_the_known_name_before_bounded_fallback_scan() {
         let temp = tempfile::tempdir().unwrap();
         let upload_root = temp.path().join("uploads");
         fs::create_dir(&upload_root).unwrap();
@@ -4116,8 +4583,154 @@ mod cleanup_security_tests {
             &identity,
         );
 
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        assert!(reservation.upload_path.exists());
+        result.unwrap();
+        assert!(!reservation.upload_path.exists());
+        for index in 0..65 {
+            assert_eq!(
+                fs::read(reservation_directory.join(format!("unrelated-{index:03}"))).unwrap(),
+                b"not a reservation"
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_namespace_admission_is_bounded_by_directory_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        fs::create_dir(&upload_root).unwrap();
+        let ledger = UploadLedger::open(
+            temp.path().join("ledger.sqlite3"),
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        for index in 0..MAX_RESERVATION_DIRECTORY_ENTRIES {
+            fs::write(
+                upload_root
+                    .join(".fluxform-reservations")
+                    .join(format!("untrusted-{index:04}")),
+                b"unrelated",
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            ledger.reserve("192.0.2.10", Some(1)),
+            Err(LimitError::GlobalCapacityExceeded)
+        ));
+        let rows: i64 = Connection::open(&ledger.database_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM uploads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "directory policy must reject before reservation");
+        assert_eq!(
+            ledger
+                .reservation_directory
+                .enumerate_files_bounded(
+                    MAX_RESERVATION_DIRECTORY_ENTRIES + 2,
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .unwrap()
+                .len(),
+            MAX_RESERVATION_DIRECTORY_ENTRIES
+        );
+    }
+
+    #[test]
+    fn identity_cleanup_fallback_paginates_persists_cursor_and_preserves_other_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let limits = LedgerLimits {
+            max_file_bytes: 1,
+            daily_quota_bytes: 200,
+            max_active_sessions_per_ip: 2,
+            max_global_reserved_bytes: 200,
+            disk_safety_margin_bytes: 0,
+        };
+        let ledger =
+            UploadLedger::open(&database_path, &upload_root, limits, vec![[0xA1; 32]]).unwrap();
+        let expires_at = SystemTime::now() + Duration::from_secs(600);
+        let (target, _) = ledger
+            .reserve_with_upload_capability("198.51.100.250", Some(1), expires_at)
+            .unwrap();
+        let target_original = target.upload_path.clone();
+        let displaced = upload_root
+            .join(".fluxform-reservations")
+            .join("zzzz-displaced-original.upload");
+        let mut unrelated_paths = Vec::new();
+        for index in 1..=70 {
+            let reservation = ledger
+                .reserve_with_upload_capability(&format!("198.51.100.{index}"), Some(1), expires_at)
+                .unwrap()
+                .0;
+            unrelated_paths.push(reservation.upload_path);
+        }
+        fs::rename(&target_original, &displaced).unwrap();
+        fs::write(&target_original, b"unrelated replacement").unwrap();
+        ledger
+            .expire(target.session_id, &target.session_token)
+            .unwrap();
+
+        let first_page = ledger.reconcile_cleanup_job(target.session_id).unwrap();
+        assert_eq!(first_page.retryable, 1);
+        let (cursor, attempts): (Option<String>, i64) = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT scan_cursor, attempts FROM cleanup_outbox WHERE session_id = ?1",
+                [target.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            cursor.is_some(),
+            "page one must persist a stable resume cursor"
+        );
+        assert_eq!(attempts, 1);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute(
+                "UPDATE cleanup_outbox SET next_attempt_at = 0 WHERE session_id = ?1",
+                [target.session_id],
+            )
+            .unwrap();
+        drop(ledger);
+
+        let reopened =
+            UploadLedger::open(&database_path, &upload_root, limits, vec![[0xA1; 32]]).unwrap();
+
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM cleanup_outbox WHERE session_id = ?1",
+                [target.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "the next bounded page must resume after reopen");
+        assert!(
+            !displaced.exists(),
+            "only the persisted target identity is removed"
+        );
+        assert_eq!(
+            fs::read(&target_original).unwrap(),
+            b"unrelated replacement"
+        );
+        for path in unrelated_paths {
+            assert!(
+                path.exists(),
+                "normal retained upload was removed: {path:?}"
+            );
+        }
+        assert_eq!(
+            reopened
+                .state(target.session_id, &target.session_token)
+                .unwrap(),
+            UploadState::Expired
+        );
     }
 
     #[test]
@@ -4210,6 +4823,312 @@ mod cleanup_security_tests {
             "the unidentifiable pinned object remains pending"
         );
         assert_eq!(ledger.reconcile_cleanup_jobs().unwrap().retryable, 1);
+    }
+
+    #[test]
+    fn settlement_acknowledgement_rejects_a_replacement_at_the_persisted_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let (reservation, _) = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        ledger
+            .settle_pinned_until(
+                reservation.session_id,
+                &reservation.session_token,
+                &file,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        drop(file);
+
+        let displaced = reservation.upload_path.with_extension("displaced");
+        fs::rename(&reservation.upload_path, &displaced).unwrap();
+        fs::write(&reservation.upload_path, b"unrelated replacement").unwrap();
+
+        assert!(matches!(
+            ledger.acknowledge_settlement(reservation.session_id),
+            Err(LimitError::FileIdentityMismatch)
+        ));
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "identity failure must leave the durable intent");
+        assert_eq!(
+            fs::read(&reservation.upload_path).unwrap(),
+            b"unrelated replacement"
+        );
+        assert_eq!(fs::read(displaced).unwrap(), b"x");
+    }
+
+    #[test]
+    fn uploaded_consumer_transition_rejects_a_replacement_file_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let (reservation, _) = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        ledger
+            .settle(reservation.session_id, &reservation.session_token, 1)
+            .unwrap();
+        drop(file);
+
+        let displaced = reservation.upload_path.with_extension("displaced");
+        fs::rename(&reservation.upload_path, &displaced).unwrap();
+        fs::write(&reservation.upload_path, b"unrelated replacement").unwrap();
+
+        assert!(matches!(
+            ledger.transition(
+                reservation.session_id,
+                &reservation.session_token,
+                UploadState::Probing
+            ),
+            Err(LimitError::FileIdentityMismatch)
+        ));
+        assert_eq!(
+            ledger
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Uploaded
+        );
+        assert_eq!(
+            fs::read(&reservation.upload_path).unwrap(),
+            b"unrelated replacement"
+        );
+        assert_eq!(fs::read(displaced).unwrap(), b"x");
+    }
+
+    #[test]
+    fn delivery_possible_ack_failure_survives_reopen_and_is_eventually_acknowledged() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let (reservation, _) = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+        ledger
+            .settle_pinned_until(
+                reservation.session_id,
+                &reservation.session_token,
+                &file,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        drop(file);
+
+        Connection::open(&database_path)
+            .unwrap()
+            .execute(
+                "UPDATE settlement_outbox SET delivery_possible = 1 WHERE session_id = ?1",
+                [reservation.session_id],
+            )
+            .unwrap();
+        let lock = Connection::open(&database_path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(
+            ledger
+                .acknowledge_settlement(reservation.session_id)
+                .is_err()
+        );
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        drop(ledger);
+
+        let reopened = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Uploaded,
+            "a response marked delivery-possible must not be rolled back on startup"
+        );
+        assert_eq!(fs::read(&reservation.upload_path).unwrap(), b"x");
+        reopened
+            .acknowledge_settlement(reservation.session_id)
+            .unwrap();
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(
+            reopened
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Uploaded
+        );
+    }
+
+    #[test]
+    fn migration_treats_legacy_pending_settlements_as_delivery_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let (reservation, _) = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        ledger
+            .claim_receiving_lease(
+                reservation.session_id,
+                &reservation.session_token,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(reservation.session_id, &reservation.session_token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        ledger
+            .settle_internal(
+                reservation.session_id,
+                &reservation.session_token,
+                Some(&file),
+                1,
+            )
+            .unwrap();
+        drop(file);
+        drop(ledger);
+
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE cleanup_outbox DROP COLUMN scan_cursor;
+                 ALTER TABLE settlement_outbox DROP COLUMN delivery_possible;
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+
+        let reopened = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            UploadState::Uploaded,
+            "legacy pending settlement delivery is unknowable and must not be rolled back"
+        );
+        assert_eq!(fs::read(&reservation.upload_path).unwrap(), b"x");
+        let pending: i64 = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "startup should finish the conservative ACK");
     }
 
     #[test]
@@ -4482,7 +5401,8 @@ mod cleanup_security_tests {
     }
 
     #[test]
-    fn settlement_revalidates_identity_at_the_commit_boundary() {
+    #[cfg(unix)]
+    fn same_uid_unix_swap_is_not_claimed_but_ack_refuses_the_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let upload_root = temp.path().join("uploads");
         let database_path = temp.path().join("ledger.sqlite3");
@@ -4520,17 +5440,77 @@ mod cleanup_security_tests {
             fs::write(&path, b"unrelated replacement").unwrap();
         });
 
-        assert!(
-            result.is_err(),
-            "a namespace swap after verification must prevent settlement"
+        assert!(result.is_ok());
+        assert_eq!(
+            ledger.state(session_id, &token).unwrap(),
+            UploadState::Uploaded
         );
-        ledger.expire(session_id, &token).unwrap();
-        ledger.reconcile_cleanup_jobs().unwrap();
+        assert!(matches!(
+            ledger.acknowledge_settlement(session_id),
+            Err(LimitError::FileIdentityMismatch)
+        ));
         drop(file);
-        let state = ledger.state(session_id, &token).unwrap();
-        assert_ne!(state, UploadState::Uploaded);
         assert_eq!(fs::read(&path).unwrap(), b"unrelated replacement");
-        assert!(!displaced.exists(), "the pinned original must be deleted");
+        assert_eq!(fs::read(displaced).unwrap(), b"x");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn settlement_pins_the_namespace_through_final_verification_and_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("uploads");
+        let database_path = temp.path().join("ledger.sqlite3");
+        fs::create_dir(&upload_root).unwrap();
+        crate::auth::CapabilityStore::open(&database_path).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            test_limits(),
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let (reservation, _) = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        let session_id = reservation.session_id;
+        let token = reservation.session_token;
+        let path = reservation.upload_path;
+        let displaced = path.with_extension("displaced");
+        ledger
+            .claim_receiving_lease(session_id, &token, Duration::from_secs(30))
+            .unwrap();
+        let (mut file, _) = ledger
+            .open_receiving_upload_file(session_id, &token)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+        file.flush().unwrap();
+
+        let mut namespace_swap_succeeded = false;
+        let result = ledger.settle_internal_with_hook(session_id, &token, Some(&file), 1, || {
+            namespace_swap_succeeded = fs::rename(&path, &displaced).is_ok();
+            if namespace_swap_succeeded {
+                fs::write(&path, b"unrelated replacement").unwrap();
+            }
+        });
+
+        assert!(
+            result.is_ok(),
+            "an open no-delete-sharing handle must pin the verified directory entry until commit"
+        );
+        assert!(
+            !namespace_swap_succeeded,
+            "the entry must not be replaceable in the final verification-to-commit interval"
+        );
+        assert_eq!(
+            ledger.state(session_id, &token).unwrap(),
+            UploadState::Uploaded
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"x");
+        assert!(!displaced.exists());
     }
 
     #[test]

@@ -706,6 +706,7 @@ async fn committed_expansion_is_observable_at_the_exact_excess_chunk_write() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn replacement_of_open_staging_entry_cannot_be_reported_as_a_successful_upload() {
     let harness = Harness::new(64, 0);
     let (session_id, token) = harness.create_upload(4).await;

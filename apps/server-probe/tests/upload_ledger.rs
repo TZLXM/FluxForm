@@ -11,6 +11,7 @@ use fluxform_server_probe::{
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 const SECRET_A: [u8; 32] = [0xA1; 32];
 const SECRET_B: [u8; 32] = [0xB2; 32];
@@ -695,7 +696,7 @@ fn opening_a_legacy_database_applies_a_schema_versioned_migration() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 6,
+        version, 8,
         "the database needs the current committed schema version"
     );
 }
@@ -706,7 +707,7 @@ fn startup_recovers_orphaned_and_oversized_files_after_an_allocation_crash() {
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(4)).unwrap();
     let reservations = temp_dir.path().join(".fluxform-reservations");
-    let orphan = reservations.join("crashed-before-commit.upload");
+    let orphan = reservations.join(format!("{}.upload", Uuid::new_v4()));
     fs::write(&orphan, [0_u8; 8]).unwrap();
     fs::OpenOptions::new()
         .write(true)
