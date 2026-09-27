@@ -78,7 +78,7 @@ mod kill_evidence_tests {
 mod startup_authorization_tests {
     use super::{
         SandboxCheck, SandboxProbeConfig, ServerConfig, ServerMode, StartupError,
-        prepare_server_with_check,
+        parse_reported_tree_pids, prepare_server_with_check,
     };
     use std::net::{SocketAddr, TcpListener};
     use tempfile::TempDir;
@@ -103,6 +103,15 @@ mod startup_authorization_tests {
     fn unused_loopback_address() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
         listener.local_addr().expect("get loopback port")
+    }
+
+    #[test]
+    fn fixed_action_pid_report_requires_complete_distinct_positive_ids() {
+        assert_eq!(parse_reported_tree_pids("7\n8\n9\n"), Ok(vec![7, 8, 9]));
+        assert!(parse_reported_tree_pids("7\n8\n").is_err());
+        assert!(parse_reported_tree_pids("7\n8\n8\n").is_err());
+        assert!(parse_reported_tree_pids("7\n0\n9\n").is_err());
+        assert!(parse_reported_tree_pids("7\nnot-a-pid\n9\n").is_err());
     }
 
     #[test]
@@ -379,10 +388,6 @@ impl PreparedServer {
 
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("server.sqlite3")
-    }
-
-    pub fn state(&self) -> &ServerState {
-        &self.state
     }
 
     /// This is the only operation that binds. It is available only after all
@@ -777,7 +782,7 @@ fn run_placement_probe(
 
     let action_marker = job_dir.join("tree-pids.txt");
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    let action_started = loop {
+    let reported_namespace_pids = loop {
         if child
             .try_wait()
             .map_err(|error| {
@@ -790,21 +795,17 @@ fn run_placement_probe(
                 "sandbox-child resource-tree action exited before cgroup.kill proof",
             ));
         }
-        let marker_ready = fs::read_to_string(&action_marker)
+        let reported_namespace_pids = fs::read_to_string(&action_marker)
             .ok()
-            .map(|contents| {
-                contents
-                    .lines()
-                    .filter(|line| line.parse::<u32>().is_ok())
-                    .count()
-                    >= 3
-            })
-            .unwrap_or(false);
+            .and_then(|contents| parse_reported_tree_pids(&contents).ok());
         let populated = !job
             .is_empty()
             .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
-        if marker_ready && populated {
-            break true;
+        if let Some(reported) = reported_namespace_pids
+            && reported.len() >= 3
+            && populated
+        {
+            break reported;
         }
         if std::time::Instant::now() >= deadline {
             return Err(StartupError::sandbox_check_failed(
@@ -821,6 +822,29 @@ fn run_placement_probe(
     let populated_before_kill = !job
         .is_empty()
         .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+    if !supervisor_live_before_kill || !populated_before_kill {
+        return Err(StartupError::sandbox_check_failed(
+            SandboxCheck::CgroupKill,
+            "startup resource-tree process set became empty or its supervisor exited before membership verification",
+        ));
+    }
+    job.verify_reported_processes(&reported_namespace_pids, child.id())
+        .map_err(|error| {
+            StartupError::sandbox_check_failed(
+                SandboxCheck::CgroupKill,
+                format!("reported resource-tree process membership is not exact: {error}"),
+            )
+        })?;
+    if child
+        .try_wait()
+        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?
+        .is_some()
+    {
+        return Err(StartupError::sandbox_check_failed(
+            SandboxCheck::CgroupKill,
+            "startup supervisor exited after membership verification and before cgroup.kill",
+        ));
+    }
 
     job.kill_all()
         .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
@@ -839,13 +863,39 @@ fn run_placement_probe(
         .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
 
     Ok(KillProbeEvidence {
-        action_started,
+        action_started: true,
         supervisor_live_before_kill,
         populated_before_kill,
         kill_all_succeeded: true,
         supervisor_reaped,
         empty_after_kill,
     })
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_reported_tree_pids(contents: &str) -> Result<Vec<u32>, &'static str> {
+    let mut pids = Vec::new();
+    for line in contents.lines() {
+        let pid = line
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or("fixed action PID report contains a malformed or zero PID")?;
+        if pids.contains(&pid) {
+            return Err("fixed action PID report contains a duplicate PID");
+        }
+        pids.push(pid);
+    }
+    if pids.len() < 3 {
+        return Err("fixed action PID report omits its supervisor or descendants");
+    }
+    Ok(pids)
 }
 
 #[cfg(all(

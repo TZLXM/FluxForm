@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+#[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
 use std::fs::File;
@@ -37,7 +38,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf as TokioReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
+#[cfg(test)]
 use tower::Service;
+#[cfg(test)]
 use tower::service_fn;
 use uuid::Uuid;
 
@@ -101,7 +104,7 @@ pub type HttpBody = UnsyncBoxBody<Bytes, BoxError>;
 ///
 /// The trait is injectable so tests can observe the committed reservation at
 /// the exact writer call. Implementations run on the bounded storage worker.
-pub trait UploadChunkWriter: Send + Sync + 'static {
+pub(crate) trait UploadChunkWriter: Send + Sync + 'static {
     fn write_chunk(&self, file: &mut File, chunk: &[u8]) -> io::Result<()>;
 }
 
@@ -115,7 +118,7 @@ impl UploadChunkWriter for FileUploadChunkWriter {
 
 /// Socket peer supplied by the connection adapter, never copied from a header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TransportPeer(pub SocketAddr);
+pub(crate) struct TransportPeer(pub(crate) SocketAddr);
 
 #[derive(Clone, Copy)]
 struct SettlementAckCandidate(i64);
@@ -149,7 +152,7 @@ fn validate_listener_binding_with_test_evidence(
 }
 
 #[derive(Clone)]
-pub struct ServerState {
+pub(crate) struct ServerState {
     ledger: UploadLedger,
     capabilities: CapabilityStore,
     public_origin: String,
@@ -179,8 +182,9 @@ pub struct ServerState {
     test_delivery_abort_started: Option<Arc<Notify>>,
 }
 
+#[allow(dead_code)]
 impl ServerState {
-    pub fn new(
+    pub(crate) fn new(
         ledger: UploadLedger,
         capabilities: CapabilityStore,
         public_origin: impl Into<String>,
@@ -238,7 +242,7 @@ impl ServerState {
         })
     }
 
-    pub fn with_upload_timeouts(
+    pub(crate) fn with_upload_timeouts(
         mut self,
         idle_timeout: Duration,
         total_timeout: Duration,
@@ -251,12 +255,12 @@ impl ServerState {
         Ok(self)
     }
 
-    pub fn with_upload_chunk_writer(mut self, writer: Arc<dyn UploadChunkWriter>) -> Self {
+    pub(crate) fn with_upload_chunk_writer(mut self, writer: Arc<dyn UploadChunkWriter>) -> Self {
         self.upload_chunk_writer = writer;
         self
     }
 
-    pub fn with_upload_lease_policy(
+    pub(crate) fn with_upload_lease_policy(
         mut self,
         lease_duration: Duration,
         renewal_interval: Duration,
@@ -272,7 +276,7 @@ impl ServerState {
         Ok(self)
     }
 
-    pub fn with_storage_operation_timeout(
+    pub(crate) fn with_storage_operation_timeout(
         mut self,
         timeout: Duration,
     ) -> Result<Self, RouteConfigurationError> {
@@ -283,7 +287,7 @@ impl ServerState {
         Ok(self)
     }
 
-    pub fn with_listener_limits(
+    pub(crate) fn with_listener_limits(
         mut self,
         max_connections: usize,
         header_read_timeout: Duration,
@@ -296,7 +300,7 @@ impl ServerState {
         Ok(self)
     }
 
-    pub fn register_job(
+    pub(crate) fn register_job(
         &self,
         id: &str,
         initial_state: &str,
@@ -310,7 +314,7 @@ impl ServerState {
         Ok(())
     }
 
-    pub fn job_status(&self, id: &str) -> Option<String> {
+    pub(crate) fn job_status(&self, id: &str) -> Option<String> {
         self.events
             .snapshot(id)
             .ok()?
@@ -320,7 +324,7 @@ impl ServerState {
             .map(str::to_owned)
     }
 
-    pub fn register_artifact(
+    pub(crate) fn register_artifact(
         &self,
         id: &str,
         path: impl AsRef<Path>,
@@ -345,7 +349,7 @@ impl ServerState {
         Ok(())
     }
 
-    pub fn register_job_artifact(
+    pub(crate) fn register_job_artifact(
         &self,
         job_id: &str,
         artifact_id: &str,
@@ -987,7 +991,7 @@ async fn recover_upload_worker(state: &ServerState, session_id: i64, token: Sess
 }
 
 #[derive(Debug, Error)]
-pub enum RouteConfigurationError {
+pub(crate) enum RouteConfigurationError {
     #[error("invalid server route configuration")]
     InvalidConfiguration,
     #[error("server route state is unavailable")]
@@ -995,7 +999,8 @@ pub enum RouteConfigurationError {
 }
 
 /// Builds the same HTTP handler as [`serve`] for in-process route tests.
-pub fn router(
+#[cfg(test)]
+pub(crate) fn router(
     state: ServerState,
 ) -> impl Clone
 + Service<Request<HttpBody>, Response = Response<HttpBody>, Error = Infallible>
@@ -1009,14 +1014,15 @@ pub fn router(
 
 /// Accepts HTTP/1 connections and attaches each accepted socket's peer address
 /// to its requests. Forwarding headers are never used as the transport identity.
-pub async fn serve(listener: TcpListener, state: ServerState) -> io::Result<()> {
+#[cfg(test)]
+pub(crate) async fn serve(listener: TcpListener, state: ServerState) -> io::Result<()> {
     serve_with_shutdown(listener, state, std::future::pending()).await
 }
 
 /// Serves HTTP/1 connections until `shutdown` resolves, then stops accepting,
 /// drains connections and waits for tracked blocking workers within a grace
 /// period. A non-cancellable worker past that deadline is reported explicitly.
-pub async fn serve_with_shutdown<F>(
+pub(crate) async fn serve_with_shutdown<F>(
     listener: TcpListener,
     state: ServerState,
     shutdown: F,
@@ -2165,6 +2171,7 @@ fn valid_resource_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+#[allow(dead_code)]
 fn safe_download_filename(filename: &str) -> String {
     let leaf = filename.rsplit(['/', '\\']).next().unwrap_or("download");
     let sanitized = leaf
@@ -2324,6 +2331,7 @@ fn map_event_store_error(error: EventStoreError) -> HttpError {
     }
 }
 
+#[allow(dead_code)]
 fn map_event_configuration_error(error: EventStoreError) -> RouteConfigurationError {
     match error {
         EventStoreError::InvalidRecord

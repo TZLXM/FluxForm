@@ -2,6 +2,7 @@
 name = "fluxform-server-probe"
 version = "0.1.0"
 edition.workspace = true
+autotests = false
 
 [dependencies]
 fluxform-sandbox-probe = { path = "../../crates/fluxform-sandbox-probe" }
@@ -23,3 +24,11 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.23"
+
+[[test]]
+name = "public_startup"
+path = "tests/public_startup.rs"
+
+[[test]]
+name = "upload_ledger"
+path = "tests/upload_ledger.rs"

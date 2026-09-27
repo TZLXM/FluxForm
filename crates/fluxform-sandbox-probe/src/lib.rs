@@ -388,18 +388,183 @@ fn parse_cgroup_populated(events: &str) -> Result<bool, &'static str> {
     )
 ))]
 fn proc_cgroup_matches(contents: &str, expected_path: &str) -> bool {
-    if !expected_path.starts_with('/') || expected_path.ends_with('/') {
-        return false;
-    }
+    parse_proc_cgroup_path(contents).is_ok_and(|path| path == expected_path)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_proc_cgroup_path(contents: &str) -> Result<String, &'static str> {
     let mut unified = None;
     for line in contents.lines() {
         if let Some(path) = line.strip_prefix("0::")
-            && unified.replace(path).is_some()
+            && unified.replace(path.to_owned()).is_some()
         {
-            return false;
+            return Err("process cgroup identity has duplicate unified records");
         }
     }
-    unified == Some(expected_path)
+    let path = unified.ok_or("process cgroup identity has no unified record")?;
+    cgroup_path_components(&path).map_err(|_| "process cgroup identity is not canonical")?;
+    Ok(path)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessMembershipEvidence {
+    host_pid: u32,
+    namespace_pids: Vec<u32>,
+    state: char,
+    cgroup_path: String,
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn validate_reported_cgroup_membership(
+    reported_namespace_pids: &[u32],
+    supervisor_host_pid: u32,
+    cgroup_processes: &[u32],
+    processes: &[ProcessMembershipEvidence],
+    expected_cgroup_path: &str,
+) -> Result<(), &'static str> {
+    if expected_cgroup_path.is_empty() || expected_cgroup_path == "/" {
+        return Err("job cgroup membership path is invalid");
+    }
+    cgroup_path_components(expected_cgroup_path)
+        .map_err(|_| "job cgroup membership path is not canonical")?;
+    if reported_namespace_pids.is_empty()
+        || reported_namespace_pids.contains(&0)
+        || reported_namespace_pids.iter().collect::<HashSet<_>>().len()
+            != reported_namespace_pids.len()
+    {
+        return Err("fixed action reported an empty, zero, or duplicate PID");
+    }
+    if cgroup_processes.is_empty()
+        || cgroup_processes.contains(&0)
+        || cgroup_processes.iter().collect::<HashSet<_>>().len() != cgroup_processes.len()
+    {
+        return Err("job cgroup process list is empty or malformed");
+    }
+    if !cgroup_processes.contains(&supervisor_host_pid) {
+        return Err("reported supervisor is not present in the exact job cgroup");
+    }
+    if processes.len() != cgroup_processes.len() {
+        return Err("job cgroup process membership changed during identity inspection");
+    }
+
+    let cgroup_process_set = cgroup_processes.iter().copied().collect::<HashSet<_>>();
+    let mut inspected_hosts = HashSet::new();
+    let mut namespace_to_host = BTreeMap::new();
+    for process in processes {
+        if !cgroup_process_set.contains(&process.host_pid)
+            || !inspected_hosts.insert(process.host_pid)
+        {
+            return Err("job cgroup process inspection is incomplete or duplicated");
+        }
+        if !matches!(process.state, 'R' | 'S' | 'D') {
+            return Err("a reported job process is not live");
+        }
+        if process.cgroup_path != expected_cgroup_path {
+            return Err("a reported job process escaped the exact job cgroup");
+        }
+        let namespace_pid = process
+            .namespace_pids
+            .last()
+            .copied()
+            .filter(|pid| *pid != 0)
+            .ok_or("a reported job process has no valid namespace PID")?;
+        if namespace_to_host
+            .insert(namespace_pid, process.host_pid)
+            .is_some()
+        {
+            return Err("multiple job processes map to one namespace PID");
+        }
+    }
+    if inspected_hosts != cgroup_process_set {
+        return Err("job cgroup process identity set changed during inspection");
+    }
+
+    let reported_set = reported_namespace_pids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let inspected_namespace_set = namespace_to_host.keys().copied().collect::<HashSet<_>>();
+    if reported_set != inspected_namespace_set {
+        return Err("fixed action PID report does not exactly match live job cgroup members");
+    }
+    let supervisor_namespace_pid = namespace_to_host
+        .iter()
+        .find_map(|(namespace_pid, host_pid)| {
+            (*host_pid == supervisor_host_pid).then_some(*namespace_pid)
+        })
+        .ok_or("supervisor has no verified namespace PID")?;
+    if !reported_set.contains(&supervisor_namespace_pid) {
+        return Err("fixed action did not report the verified supervisor PID");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn parse_process_membership_evidence(
+    host_pid: u32,
+    status: &str,
+    cgroup: &str,
+) -> Result<ProcessMembershipEvidence, &'static str> {
+    let mut state = None;
+    let mut namespace_pids = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("State:") {
+            let mut fields = value.split_ascii_whitespace();
+            let character = fields
+                .next()
+                .and_then(|field| field.chars().next())
+                .ok_or("process status has a malformed State record")?;
+            if state.replace(character).is_some() {
+                return Err("process status has duplicate State records");
+            }
+        }
+        if let Some(value) = line.strip_prefix("NSpid:") {
+            let pids = value
+                .split_ascii_whitespace()
+                .map(|field| {
+                    field
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid != 0)
+                        .ok_or("process status has an invalid NSpid record")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if pids.is_empty() || namespace_pids.replace(pids).is_some() {
+                return Err("process status has missing or duplicate NSpid records");
+            }
+        }
+    }
+    Ok(ProcessMembershipEvidence {
+        host_pid,
+        namespace_pids: namespace_pids.ok_or("process status has no NSpid record")?,
+        state: state.ok_or("process status has no State record")?,
+        cgroup_path: parse_proc_cgroup_path(cgroup)?,
+    })
 }
 
 #[cfg(any(
@@ -861,6 +1026,34 @@ impl CgroupV2Job {
         )))]
         {
             ""
+        }
+    }
+
+    /// Verifies that the fixed action's reported namespace PIDs map exactly to
+    /// every live host PID in this job's pinned cgroup, including the blocked
+    /// supervisor. This is intended for the startup `resource-tree` proof
+    /// immediately before `kill_all`.
+    pub fn verify_reported_processes(
+        &self,
+        reported_namespace_pids: &[u32],
+        supervisor_host_pid: u32,
+    ) -> Result<(), SandboxError> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            self.inner
+                .verify_reported_processes(reported_namespace_pids, supervisor_host_pid)
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let _ = (reported_namespace_pids, supervisor_host_pid);
+            Err(SandboxError::UnsupportedPlatform)
         }
     }
 }
@@ -1945,6 +2138,59 @@ mod linux {
                 reaper,
                 cleanup: Arc::clone(self),
                 _lease: lease,
+            })
+        }
+
+        pub(super) fn verify_reported_processes(
+            &self,
+            reported_namespace_pids: &[u32],
+            supervisor_host_pid: u32,
+        ) -> Result<(), SandboxError> {
+            let cgroup_procs =
+                read_cgroup_file(self.job_fd.as_raw_fd(), "cgroup.procs").map_err(|source| {
+                    SandboxError::Io {
+                        operation: "read pinned job cgroup.procs before cgroup.kill",
+                        source,
+                    }
+                })?;
+            let cgroup_processes =
+                super::parse_cgroup_pids(&cgroup_procs).map_err(|reason| SandboxError::Io {
+                    operation: "parse pinned job cgroup.procs before cgroup.kill",
+                    source: io::Error::new(io::ErrorKind::InvalidData, reason),
+                })?;
+            let mut processes = Vec::with_capacity(cgroup_processes.len());
+            for host_pid in &cgroup_processes {
+                let status_path = format!("/proc/{host_pid}/status");
+                let status =
+                    fs::read_to_string(&status_path).map_err(|source| SandboxError::Io {
+                        operation: "read live job process status before cgroup.kill",
+                        source,
+                    })?;
+                let cgroup_path = format!("/proc/{host_pid}/cgroup");
+                let cgroup =
+                    fs::read_to_string(&cgroup_path).map_err(|source| SandboxError::Io {
+                        operation: "read live job process membership before cgroup.kill",
+                        source,
+                    })?;
+                processes.push(
+                    super::parse_process_membership_evidence(*host_pid, &status, &cgroup).map_err(
+                        |reason| SandboxError::Io {
+                            operation: "parse live job process identity before cgroup.kill",
+                            source: io::Error::new(io::ErrorKind::InvalidData, reason),
+                        },
+                    )?,
+                );
+            }
+            super::validate_reported_cgroup_membership(
+                reported_namespace_pids,
+                supervisor_host_pid,
+                &cgroup_processes,
+                &processes,
+                &self.expected_cgroup_path,
+            )
+            .map_err(|reason| SandboxError::Io {
+                operation: "verify exact reported job process membership before cgroup.kill",
+                source: io::Error::new(io::ErrorKind::PermissionDenied, reason),
             })
         }
 
@@ -7226,6 +7472,84 @@ mod review_regression_tests {
             "0::/delegated/job-42\n0::/other\n",
             "/delegated/job-42"
         ));
+    }
+
+    #[test]
+    fn reported_tree_members_must_be_live_and_exactly_in_the_job_cgroup() {
+        let expected = "/delegated/job-42";
+        let reported = [7, 8, 9];
+        let supervisor = 701;
+        let members = [701];
+        let evidence = [ProcessMembershipEvidence {
+            host_pid: 701,
+            namespace_pids: vec![701, 7],
+            state: 'S',
+            cgroup_path: expected.to_owned(),
+        }];
+
+        assert!(
+            validate_reported_cgroup_membership(
+                &reported, supervisor, &members, &evidence, expected,
+            )
+            .is_err(),
+            "the supervisor alone cannot prove two escaped or dead descendants are contained"
+        );
+    }
+
+    #[test]
+    fn reported_zombie_or_wrong_cgroup_descendant_is_rejected() {
+        let expected = "/delegated/job-42";
+        let reported = [7, 8];
+        let evidence = [
+            ProcessMembershipEvidence {
+                host_pid: 701,
+                namespace_pids: vec![701, 7],
+                state: 'S',
+                cgroup_path: expected.to_owned(),
+            },
+            ProcessMembershipEvidence {
+                host_pid: 702,
+                namespace_pids: vec![702, 8],
+                state: 'Z',
+                cgroup_path: "/delegated/escaped".to_owned(),
+            },
+        ];
+
+        assert!(
+            validate_reported_cgroup_membership(&reported, 701, &[701, 702], &evidence, expected,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn process_membership_parser_requires_state_namespace_pids_and_one_unified_path() {
+        let evidence = parse_process_membership_evidence(
+            701,
+            "Name:\tsandbox-child\nState:\tS (sleeping)\nNSpid:\t701\t7\n",
+            "12:cpu:/user.slice\n0::/delegated/job-42\n",
+        )
+        .expect("complete exact process identity");
+        assert_eq!(evidence.host_pid, 701);
+        assert_eq!(evidence.namespace_pids, [701, 7]);
+        assert_eq!(evidence.state, 'S');
+        assert_eq!(evidence.cgroup_path, "/delegated/job-42");
+
+        assert!(
+            parse_process_membership_evidence(
+                701,
+                "State:\tS (sleeping)\n",
+                "0::/delegated/job-42\n",
+            )
+            .is_err()
+        );
+        assert!(
+            parse_process_membership_evidence(
+                701,
+                "State:\tS (sleeping)\nNSpid:\t701\n",
+                "0::/delegated/job-42\n0::/other\n",
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,10 +1,16 @@
 use fluxform_server_probe::startup::{
     SandboxProbeConfig, ServerConfig, ServerMode, prepare_server,
 };
+#[cfg(any(target_os = "linux", debug_assertions))]
 use std::fs;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(any(target_os = "linux", debug_assertions))]
+use std::net::TcpStream;
+use std::net::{SocketAddr, TcpListener};
+#[cfg(any(target_os = "linux", debug_assertions))]
 use std::process::{Child, Command, Stdio};
+#[cfg(any(target_os = "linux", debug_assertions))]
 use std::thread;
+#[cfg(any(target_os = "linux", debug_assertions))]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -64,8 +70,7 @@ fn local_development_rejects_non_loopback_addresses_instead_of_upgrading_to_publ
 #[tokio::test]
 async fn delegated_linux_process_binds_public_mode_and_serves_protected_status() {
     use fluxform_server_probe::auth::{Capability, CapabilityStore, Scope};
-    use fluxform_server_probe::routes::ServerState;
-    use fluxform_server_probe::{LedgerLimits, UploadLedger};
+    use fluxform_server_probe::events::EventStore;
     use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -81,30 +86,19 @@ async fn delegated_linux_process_binds_public_mode_and_serves_protected_status()
     let upload_root = data_dir.join("uploads");
     fs::create_dir(&upload_root).unwrap();
     fs::set_permissions(&upload_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let artifact_root = upload_root.join(".fluxform-artifacts");
+    fs::create_dir(&artifact_root).unwrap();
+    fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
     let database_path = data_dir.join("server.sqlite3");
-    let ledger = UploadLedger::open(
-        &database_path,
-        &upload_root,
-        LedgerLimits {
-            max_file_bytes: 256 * 1024 * 1024,
-            daily_quota_bytes: 512 * 1024 * 1024,
-            max_active_sessions_per_ip: 4,
-            max_global_reserved_bytes: 1024 * 1024 * 1024,
-            disk_safety_margin_bytes: 1024 * 1024 * 1024,
-        },
-        vec![[0x6d; 32]],
-    )
-    .unwrap();
-    let capabilities = CapabilityStore::open(&database_path).unwrap();
-    let state = ServerState::new(
-        ledger,
-        capabilities,
-        "https://fluxform.test",
-        Vec::new(),
-        Duration::from_secs(60 * 60),
-    )
-    .unwrap();
-    state.register_job("startup-proof", "queued").unwrap();
+    let events = EventStore::open(&database_path, &artifact_root).unwrap();
+    let retain_until = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+    events
+        .register_state("startup-proof", "queued", retain_until)
+        .unwrap();
     let capabilities = CapabilityStore::open(&database_path).unwrap();
     let capability = Capability::issue(
         &capabilities,
@@ -591,8 +585,10 @@ fn wait_for_process_exit(child: &mut ChildGuard, timeout: Duration) -> std::proc
     }
 }
 
+#[cfg(any(target_os = "linux", debug_assertions))]
 struct ChildGuard(Child);
 
+#[cfg(any(target_os = "linux", debug_assertions))]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
