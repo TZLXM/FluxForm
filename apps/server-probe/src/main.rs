@@ -37,6 +37,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn startup_checker() -> Result<Box<dyn SandboxChecker>, StartupError> {
     #[cfg(debug_assertions)]
+    if env::var_os("FLUXFORM_TEST_REQUIRE_RELEASE").is_some() {
+        return Err(StartupError::InvalidConfiguration(
+            "native Public startup evidence requires a release-built server executable",
+        ));
+    }
+
+    #[cfg(debug_assertions)]
     if let Some(value) = env::var_os("FLUXFORM_TEST_FORCE_SANDBOX_FAILURE") {
         let check = parse_forced_check(&value.to_string_lossy())?;
         return Ok(Box::new(ForcedFailureChecker { check }));

@@ -490,6 +490,9 @@ fn native_server_command(
             "FLUXFORM_SERVER_SANDBOX_PROBE_SHA256",
             native_env_string("FLUXFORM_TEST_SANDBOX_PROBE_SHA256"),
         )
+        // Debug builds reject this native-evidence launch; release builds
+        // compile the test-only rejection hook out.
+        .env("FLUXFORM_TEST_REQUIRE_RELEASE", "1")
         .env_remove("FLUXFORM_TEST_FORCE_SANDBOX_FAILURE")
         .env_remove("FLUXFORM_TEST_SANDBOX_READY_FILE")
         .env_remove("FLUXFORM_TEST_SANDBOX_RELEASE_FILE")
@@ -682,4 +685,36 @@ fn forced_public_checker_failure_leaves_the_reserved_port_available_while_proces
         !status.success(),
         "forced sandbox failure must stop startup"
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn debug_server_binary_is_rejected_for_native_public_startup_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let address = unused_loopback_address();
+    let output = Command::new(env!("CARGO_BIN_EXE_fluxform-server-probe"))
+        .env("FLUXFORM_SERVER_MODE", "public")
+        .env("FLUXFORM_SERVER_LISTEN", address.to_string())
+        .env("FLUXFORM_SERVER_DATA_DIR", root.path().join("server-data"))
+        .env("FLUXFORM_SERVER_SECRET", "6d".repeat(32))
+        .env(
+            "FLUXFORM_SERVER_DELEGATED_CGROUP_ROOT",
+            root.path().join("delegated-cgroup"),
+        )
+        .env(
+            "FLUXFORM_SERVER_SANDBOX_PROBE",
+            root.path().join("tools").join("sandbox-child"),
+        )
+        .env(
+            "FLUXFORM_SERVER_SANDBOX_TOOL_DIR",
+            root.path().join("tools"),
+        )
+        .env("FLUXFORM_SERVER_SANDBOX_PROBE_SHA256", "0".repeat(64))
+        .env("FLUXFORM_TEST_REQUIRE_RELEASE", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("release-built server executable"));
+    assert!(TcpListener::bind(address).is_ok());
 }
