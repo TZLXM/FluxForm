@@ -43,9 +43,10 @@ if ([string]::IsNullOrWhiteSpace($ReportPath)) {
 $automatedDefaults = @(
     'format', 'clippy', 'protocol', 'contract-drift', 'capabilities',
     'ffmpeg-profile-tests', 'atomic-output', 'sandbox-unit', 'server-probe', 'desktop-probe-modes',
-    'desktop-build', 'ffmpeg-profile', 'public-server-linux'
+    'desktop-build', 'ffmpeg-profile'
 )
 $completeDefaults = @('report', 'ffmpeg-artifacts', 'aggregate-samples', 'public-server-linux')
+$completeRequired = @($automatedDefaults + $completeDefaults)
 $expectedReportEvidence = @(
     'Protocol/schema determinism',
     'Windows FFmpeg profile and license record',
@@ -77,7 +78,7 @@ foreach ($entry in $gateEntries) {
         if (-not [string]::IsNullOrWhiteSpace($item)) { $requestedGates += $item.Trim() }
     }
 }
-$selected = if ($requestedGates.Count -gt 0) { $requestedGates } elseif ($Mode -eq 'Complete') { $completeDefaults } else { $automatedDefaults }
+$selected = if ($requestedGates.Count -gt 0) { $requestedGates } elseif ($Mode -eq 'Complete') { $completeRequired } else { $automatedDefaults }
 $knownGates = @($automatedDefaults + $completeDefaults | Select-Object -Unique)
 $results = [ordered]@{}
 $stopAfterFailure = $false
@@ -216,6 +217,45 @@ function Test-ReportArtifactIdentity {
     return $false
 }
 
+function Get-WorkingPython3Command {
+    foreach ($commandName in @('python3', 'python')) {
+        $candidate = @(Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)[0]
+        if (-not $candidate) { continue }
+        try {
+            $versionOutput = @(& $candidate.Source --version 2>&1)
+            $versionExitCode = $LASTEXITCODE
+            if ($versionExitCode -eq 0 -and [string]($versionOutput | Select-Object -First 1) -match '^Python 3\.') {
+                return $candidate
+            }
+        } catch { continue }
+    }
+    return $null
+}
+
+function Invoke-ReviewedReportValidator {
+    param([string] $Path)
+    $python = Get-WorkingPython3Command
+    if (-not $python) { throw 'BLOCKED: Python 3 is required to validate reviewed per-row evidence manifests.' }
+    $validator = Join-Path $scriptRoot 'validate_stage0_report.py'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& $python.Source $validator --repo-root $repoRoot --report $Path 2>&1 | ForEach-Object { [string] $_ })
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    foreach ($line in $lines) { Write-Host $line }
+    if ($exitCode -eq 10) { throw 'BLOCKED: reviewed per-row evidence bundle is missing, untrusted, or invalid.' }
+    if ($exitCode -ne 0) { throw 'FAIL: reviewed per-row evidence bundle or report is malformed.' }
+}
+
+function Get-SourceGitStatus {
+    $lines = @(& git -C $repoRoot status --porcelain --untracked-files=all 2>&1 | ForEach-Object { [string] $_ })
+    if ($LASTEXITCODE -ne 0) { throw 'BLOCKED: git status could not verify source-tree cleanliness around the desktop build.' }
+    return [string]::Join("`n", $lines)
+}
+
 function Copy-ProfileEvidence {
     param([string] $SourceRoot, [string] $DestinationRoot)
     $targets = @(
@@ -304,9 +344,27 @@ function Invoke-Stage0Gate {
             if ($pnpmVersionExitCode -ne 0) { throw 'BLOCKED: could not read the installed pnpm version.' }
             $pnpmVersion = [string]($pnpmVersionOutput | Select-Object -First 1)
             if ($pnpmVersion -ne '11.19.0') { Write-Host "SKIPPED: expected pinned pnpm 11.19.0, found $pnpmVersion; no package was installed."; return 'SKIPPED' }
-            $nodeModules = Join-Path $repoRoot 'apps/desktop-probe/node_modules/@tauri-apps/cli'
-            if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) { Write-Host 'SKIPPED: pinned pnpm dependencies are not preinstalled; no package was installed.'; return 'SKIPPED' }
-            Invoke-LoggedCommand -Name $Name -Executable 'pnpm' -Arguments @('--dir', 'apps/desktop-probe', 'run', 'tauri:build', '--no-bundle')
+            $sourceStatusBefore = Get-SourceGitStatus
+            $sourceSnapshot = Join-Path $runRoot 'desktop-source'
+            $python = Get-WorkingPython3Command
+            if (-not $python) { throw 'BLOCKED: Python 3 is required to make an isolated desktop source snapshot.' }
+            try {
+                Invoke-LoggedCommand -Name "$Name-snapshot" -Executable $python.Source -Arguments @((Join-Path $scriptRoot 'prepare_stage0_desktop_source.py'), '--repo-root', $repoRoot, '--destination', $sourceSnapshot)
+                try {
+                    Invoke-LoggedCommand -Name "$Name-pnpm-install" -Executable 'pnpm' -Arguments @('--dir', (Join-Path $sourceSnapshot 'apps/desktop-probe'), 'install', '--offline', '--frozen-lockfile')
+                } catch {
+                    throw "BLOCKED: offline frozen pnpm install failed; no download was attempted. $($_.Exception.Message)"
+                }
+                Invoke-LoggedCommand -Name $Name -Executable 'pnpm' -Arguments @('--dir', (Join-Path $sourceSnapshot 'apps/desktop-probe'), 'run', 'tauri:build', '--no-bundle')
+            } finally {
+                if (Test-Path -LiteralPath $sourceSnapshot -PathType Container) {
+                    Invoke-LoggedCommand -Name "$Name-snapshot-cleanup" -Executable $python.Source -Arguments @((Join-Path $scriptRoot 'prepare_stage0_desktop_source.py'), '--repo-root', $repoRoot, '--destination', $sourceSnapshot, '--cleanup')
+                }
+                $sourceStatusAfter = Get-SourceGitStatus
+                if ($sourceStatusAfter -cne $sourceStatusBefore) {
+                    throw 'FAIL: desktop build changed the source Git status; build outputs must stay in target/stage0.'
+                }
+            }
             return 'PASS'
         }
         'ffmpeg-profile' {
@@ -356,7 +414,8 @@ function Invoke-Stage0Gate {
             if ($gateReport.Fail -gt 0) { Write-Host "FAIL: $($gateReport.Fail) gate report row(s) are FAIL."; return 'FAIL' }
             if ($gateReport.Blocked -gt 0) { Write-Host "BLOCKED: $($gateReport.Blocked) gate report row(s) are BLOCKED."; return 'BLOCKED' }
             if ($gateReport.Pass -ne 23) { throw 'FAIL: every one of the 23 gate report rows must be PASS.' }
-            Write-Host 'PASS: all 23 report rows are PASS, dated, identified, and independently reviewed.'
+            Invoke-ReviewedReportValidator -Path $ReportPath
+            Write-Host 'PASS: all 23 report rows have unique, reviewed, row-bound evidence manifests and payloads.'
             return 'PASS'
         }
         'ffmpeg-artifacts' {
@@ -430,7 +489,14 @@ try {
 
 Write-Host 'Stage 0 gate summary:'
 foreach ($name in $selected) { Write-Host "$name=$($results[$name])" }
-$complete = $Mode -eq 'Complete' -and $selected.Count -eq $completeDefaults.Count -and @($selected | Where-Object { $_ -notin $completeDefaults }).Count -eq 0 -and @($results.Values | Where-Object { $_ -ne 'PASS' }).Count -eq 0
+$completeAttempt = $Mode -eq 'Complete' -and $selected.Count -eq $completeRequired.Count
+$completeSelectionMatches = $completeAttempt
+if ($completeSelectionMatches) {
+    for ($index = 0; $index -lt $completeRequired.Count; $index++) {
+        if ($selected[$index] -cne $completeRequired[$index]) { $completeSelectionMatches = $false; break }
+    }
+}
+$complete = $completeSelectionMatches -and @($results.Values | Where-Object { $_ -ne 'PASS' }).Count -eq 0
 Write-Host "stage0_complete=$($complete.ToString().ToLowerInvariant())"
-if (@($results.Values | Where-Object { $_ -in @('FAIL', 'BLOCKED') }).Count -gt 0 -or ($Mode -eq 'Complete' -and $selected.Count -eq $completeDefaults.Count -and @($selected | Where-Object { $_ -notin $completeDefaults }).Count -eq 0 -and -not $complete)) { exit 1 }
+if (@($results.Values | Where-Object { $_ -in @('FAIL', 'BLOCKED') }).Count -gt 0 -or ($completeAttempt -and -not $complete)) { exit 1 }
 exit 0

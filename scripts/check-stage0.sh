@@ -58,12 +58,13 @@ mkdir -p -- "$run_root"
 report_path="${report_path:-$repo_root/docs/architecture/stage-0-gate-report.md}"
 export CARGO_NET_OFFLINE=true
 
-automated_defaults=(format clippy protocol contract-drift capabilities ffmpeg-profile-tests atomic-output sandbox-unit server-probe desktop-probe-modes desktop-build ffmpeg-profile public-server-linux)
+automated_defaults=(format clippy protocol contract-drift capabilities ffmpeg-profile-tests atomic-output sandbox-unit server-probe desktop-probe-modes desktop-build ffmpeg-profile)
 complete_defaults=(report ffmpeg-artifacts aggregate-samples public-server-linux)
+complete_required=("${automated_defaults[@]}" "${complete_defaults[@]}")
 if ((${#requested_gates[@]})); then
   selected_gates=("${requested_gates[@]}")
 elif [[ "$mode" == 'complete' ]]; then
-  selected_gates=("${complete_defaults[@]}")
+  selected_gates=("${complete_required[@]}")
 else
   selected_gates=("${automated_defaults[@]}")
 fi
@@ -113,6 +114,17 @@ run_cargo() {
 
 blocked() { gate_status='BLOCKED'; gate_reason="$1"; return 1; }
 failed() { gate_status='FAIL'; gate_reason="$1"; return 1; }
+
+find_python3() {
+  local candidate
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
 validate_report() {
   local path="$1"
@@ -239,6 +251,10 @@ if counts["PASS"] != 23:
     fail("every one of the 23 gate report rows must be PASS")
 print("PASS: all 23 report rows are PASS, dated, identified, and independently reviewed")
 PY
+  "$python_command" "$script_dir/validate_stage0_report.py" --repo-root "$repo_root" --report "$path"
+  local evidence_exit_code=$?
+  if ((evidence_exit_code == 10)); then gate_status='BLOCKED'; gate_reason='reviewed per-row evidence bundle is missing, untrusted, or invalid.'; return 1; fi
+  if ((evidence_exit_code != 0)); then gate_status='FAIL'; gate_reason='reviewed per-row evidence bundle or report is malformed.'; return 1; fi
   local exit_code=$?
   if ((exit_code == 0)); then gate_status='PASS'; gate_reason=''; return 0; fi
   if ((exit_code == 10)); then gate_status='BLOCKED'; gate_reason='one or more report rows are BLOCKED or await human review.'; return 1; fi
@@ -250,12 +266,13 @@ copy_profile_evidence() {
   local names=(windows-x86_64 macos-x86_64 macos-aarch64 linux-x86_64)
   local triples=(x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu)
   local files=(ffmpeg-windows-x86_64.json ffmpeg-macos-x86_64.json ffmpeg-macos-aarch64.json ffmpeg-linux-x86_64.json)
-  command -v python3 >/dev/null 2>&1 || { blocked 'python3 is required to validate native profile report artifacts.'; return 1; }
+  local python_command
+  python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to validate native profile report artifacts.'; return 1; }
   mkdir -p -- "$destination_root"
   for index in "${!names[@]}"; do
     local source="$source_root/${files[$index]}"
     [[ -f "$source" ]] || { blocked "exact native profile artifact is missing: $source"; return 1; }
-    python3 - "$source" "${triples[$index]}" <<'PY'
+    "$python_command" - "$source" "${triples[$index]}" <<'PY'
 import json
 import sys
 try:
@@ -308,11 +325,24 @@ run_gate() {
       ;;
     desktop-build)
       if ! command -v pnpm >/dev/null 2>&1; then echo 'SKIPPED: pnpm is unavailable; no package was installed.'; gate_status='SKIPPED'; return 0; fi
-      if [[ ! -d "$repo_root/apps/desktop-probe/node_modules/@tauri-apps/cli" ]]; then echo 'SKIPPED: pinned pnpm dependencies are not preinstalled; no package was installed.'; gate_status='SKIPPED'; return 0; fi
       local pnpm_version
       pnpm_version="$(pnpm --version 2>/dev/null)" || { gate_status='BLOCKED'; gate_reason='could not read the installed pnpm version.'; return 1; }
       if [[ "$pnpm_version" != '11.19.0' ]]; then echo "SKIPPED: expected pinned pnpm 11.19.0, found $pnpm_version; no package was installed."; gate_status='SKIPPED'; return 0; fi
-      run_logged "$name" pnpm --dir apps/desktop-probe run tauri:build --no-bundle || return 1
+      local python_command
+      python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to make an isolated desktop source snapshot.'; return 1; }
+      local source_status_before source_status_after snapshot install_failed=0 build_failed=0
+      source_status_before="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { blocked 'git status could not verify source-tree cleanliness around the desktop build.'; return 1; }
+      snapshot="$run_root/desktop-source"
+      run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" || return 1
+      if ! run_logged "$name-pnpm-install" pnpm --dir "$snapshot/apps/desktop-probe" install --offline --frozen-lockfile; then install_failed=1; fi
+      if ((install_failed == 0)); then
+        if ! run_logged "$name" pnpm --dir "$snapshot/apps/desktop-probe" run tauri:build --no-bundle; then build_failed=1; fi
+      fi
+      if ! run_logged "$name-snapshot-cleanup" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" --cleanup; then failed 'could not safely clean this invocation-owned desktop snapshot.'; return 1; fi
+      source_status_after="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { failed 'git status could not verify source-tree cleanliness after the desktop build.'; return 1; }
+      if [[ "$source_status_after" != "$source_status_before" ]]; then failed 'desktop build changed source Git status; build outputs must stay in target/stage0.'; return 1; fi
+      if ((install_failed)); then blocked 'offline frozen pnpm install failed; no download was attempted.'; return 1; fi
+      if ((build_failed)); then return 1; fi
       ;;
     ffmpeg-profile)
       if [[ -n "$ffmpeg_path" || -n "$ffprobe_path" ]]; then
@@ -324,8 +354,9 @@ run_gate() {
       local output="$run_root/ffmpeg-profile-verification.json"
       run_cargo "$name" run -p fluxform-ffmpeg-profile -- verify --profile "$profile_path" --artifact-id "$artifact_id" --archive "$ffmpeg_archive" --out "$output" || return 1
       [[ -f "$output" ]] || { blocked 'hardened verifier did not produce a report.'; return 1; }
-      command -v python3 >/dev/null 2>&1 || { blocked 'python3 is required to inspect the verifier report.'; return 1; }
-      python3 - "$output" <<'PY'
+      local python_command
+      python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to inspect the verifier report.'; return 1; }
+      "$python_command" - "$output" <<'PY'
 import json
 import sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -365,9 +396,10 @@ PY
     aggregate-samples)
       local collected="$evidence_root/collected"
       [[ -d "$collected" ]] || { blocked 'target/stage0/collected is missing; four native artifacts are required.'; return 1; }
-      command -v python3 >/dev/null 2>&1 || { blocked 'python3 is required to validate native sample evidence.'; return 1; }
+      local python_command
+      python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to validate native sample evidence.'; return 1; }
       local digest
-      digest="$(python3 - "$collected" <<'PY'
+      digest="$("$python_command" - "$collected" <<'PY'
 import json
 import os
 import re
@@ -444,12 +476,10 @@ echo 'Stage 0 gate summary:'
 for index in "${!selected_gates[@]}"; do echo "${selected_gates[$index]}=${statuses[$index]}"; done
 complete=false
 complete_set=0
-if [[ "$mode" == 'complete' && ${#selected_gates[@]} -eq ${#complete_defaults[@]} ]]; then
+if [[ "$mode" == 'complete' && ${#selected_gates[@]} -eq ${#complete_required[@]} ]]; then
   complete_set=1
-  for required_gate in "${complete_defaults[@]}"; do
-    found=0
-    for selected in "${selected_gates[@]}"; do [[ "$selected" == "$required_gate" ]] && found=1; done
-    ((found)) || complete_set=0
+  for index in "${!complete_required[@]}"; do
+    [[ "${selected_gates[$index]}" == "${complete_required[$index]}" ]] || complete_set=0
   done
   if ((complete_set)); then
     complete=true
@@ -457,5 +487,5 @@ if [[ "$mode" == 'complete' && ${#selected_gates[@]} -eq ${#complete_defaults[@]
   fi
 fi
 echo "stage0_complete=$complete"
-if ((failed_gate)) || { [[ "$mode" == 'complete' ]] && ((complete_set == 1)) && [[ "$complete" != true ]]; }; then exit 1; fi
+if ((failed_gate)) || { [[ "$mode" == 'complete' && ${#selected_gates[@]} -eq ${#complete_required[@]} ]] && [[ "$complete" != true ]]; }; then exit 1; fi
 exit 0

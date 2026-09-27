@@ -25,6 +25,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/cache@v4
         with:
@@ -70,6 +73,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/cache@v4
         with:
@@ -114,6 +120,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/cache@v4
         with:
@@ -312,41 +321,7 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           WORKFLOW_JOB_ID: ${{ github.job }}
           COMMIT_SHA: ${{ github.sha }}
-        run: |
-          python - <<'PY'
-          import hashlib, json, os, shutil
-          from pathlib import Path
-          target = os.environ['TARGET']
-          profile = Path(f'target/stage0/ffmpeg-{target}.json')
-          sample = Path(f'target/stage0/samples-{target}.json')
-          report = json.loads(sample.read_text(encoding='utf-8'))
-          digest = report['evidence_input_digest']
-          arch = {'x64': 'x86_64', 'arm64': 'aarch64'}.get(os.environ['RUNNER_ARCH_NAME'].lower(), os.environ['RUNNER_ARCH_NAME'].lower())
-          runner_os = os.environ['RUNNER_OS_NAME'].lower()
-          artifact_name = f'stage0-samples-{target}-{digest}'
-          def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
-          provenance = {
-              'schema': 'fluxform.native-sample-artifact.v1',
-              'artifact_name': artifact_name,
-              'target_profile_id': report['target_profile_id'],
-              'target_triple': report['target_triple'],
-              'runner_os': runner_os,
-              'runner_arch': arch,
-              'git_commit': os.environ['COMMIT_SHA'],
-              'evidence_input_digest': digest,
-              'workflow_run_id': os.environ['WORKFLOW_RUN_ID'],
-              'workflow_job_id': os.environ['WORKFLOW_JOB_ID'],
-              'ffmpeg_profile_report_sha256': sha(profile),
-              'sample_report_sha256': sha(sample),
-          }
-          out = Path(f'target/stage0/native-artifact-{target}')
-          out.mkdir(parents=True, exist_ok=True)
-          shutil.copyfile(profile, out / 'ffmpeg-profile-report.json')
-          shutil.copyfile(sample, out / 'sample-report.json')
-          (out / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n', encoding='utf-8')
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              output.write(f'digest={digest}\n')
-          PY
+        run: python scripts/bind_stage0_native_provenance.py
       - name: Upload exact native reports (never sample media)
         if: success()
         uses: actions/upload-artifact@v4
@@ -368,6 +343,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/cache@v4
         with:
@@ -430,6 +408,8 @@ jobs:
     env:
       FLUXFORM_STAGE0_LINUX_CGROUPV2_DELEGATED: '1'
       FLUXFORM_TEST_CGROUP_ROOT: ${{ vars.FLUXFORM_TEST_CGROUP_ROOT }}
+      STAGE0_FFMPEG_ARCHIVE: ${{ vars.STAGE0_FFMPEG_ARCHIVE_LINUX_X86_64 }}
+      STAGE0_FFMPEG_ARTIFACT_ID: ${{ vars.STAGE0_FFMPEG_ARTIFACT_ID_LINUX_X86_64 }}
     steps:
       - name: Require every automated, native, and aggregate prerequisite
         env:
@@ -446,6 +426,9 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/cache@v4
         with:
@@ -457,6 +440,16 @@ jobs:
           restore-keys: linux-complete-cargo-
       - name: Prefetch locked Rust dependencies for offline gates
         run: cargo fetch --locked
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop-probe/pnpm-lock.yaml
+      - name: Prepare pinned desktop dependencies before offline gate execution
+        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
       - name: Download this run's native sample reports
         uses: actions/download-artifact@v4
         with:
@@ -491,4 +484,8 @@ jobs:
           PY
       - name: Run Complete against the reviewed report and aggregated evidence
         shell: bash
-        run: ./scripts/check-stage0.sh --mode complete
+        run: >-
+          ./scripts/check-stage0.sh --mode complete
+          --ffmpeg-archive "$STAGE0_FFMPEG_ARCHIVE"
+          --artifact-id "$STAGE0_FFMPEG_ARTIFACT_ID"
+          --profile config/ffmpeg-profile.toml
