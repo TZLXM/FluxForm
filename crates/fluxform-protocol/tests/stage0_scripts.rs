@@ -232,6 +232,7 @@ const REPORT_PLATFORMS: [&str; 23] = [
 struct FixtureReport {
     path: PathBuf,
     _evidence: TempDir,
+    _report: TempDir,
 }
 
 fn workspace_root() -> PathBuf {
@@ -241,7 +242,7 @@ fn workspace_root() -> PathBuf {
     root
 }
 
-fn fixture_report(directory: &Path, blocked_row: Option<usize>) -> FixtureReport {
+fn fixture_report(_directory: &Path, blocked_row: Option<usize>) -> FixtureReport {
     let root = workspace_root();
     let evidence_root = root.join("target/stage0/reviewed-evidence");
     fs::create_dir_all(&evidence_root).unwrap();
@@ -349,11 +350,13 @@ fn fixture_report(directory: &Path, blocked_row: Option<usize>) -> FixtureReport
         ));
     }
 
-    let path = directory.join("stage-0-gate-report.md");
+    let report_directory = TempDir::new_in(root.join("target/stage0")).unwrap();
+    let path = report_directory.path().join("stage-0-gate-report.md");
     fs::write(&path, report).unwrap();
     FixtureReport {
         path,
         _evidence: evidence,
+        _report: report_directory,
     }
 }
 
@@ -861,6 +864,23 @@ fn native_provenance_workflow_step_uses_a_cross_shell_python_file() {
 
 #[cfg(any(windows, unix))]
 #[test]
+fn complete_workflow_keeps_reviewed_raw_evidence_on_the_protected_runner() {
+    let workflow =
+        fs::read_to_string(workspace_root().join(".github/workflows/stage0-gates.yml")).unwrap();
+    let complete_job = workflow.split("  complete:").nth(1).unwrap();
+    assert!(complete_job.contains("stage0-reviewed-evidence"));
+    assert!(complete_job.contains("environment: stage0-manual-review"));
+    assert!(complete_job.contains("STAGE0_REVIEWED_EVIDENCE_INPUT_DIR"));
+    assert!(complete_job.contains("STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID"));
+    assert!(complete_job.contains("scripts/transfer_stage0_reviewed_evidence.py"));
+    assert!(
+        !complete_job.contains("actions/upload-artifact@v4"),
+        "reviewed manifests/raw results must not leave the protected runner"
+    );
+}
+
+#[cfg(any(windows, unix))]
+#[test]
 fn desktop_build_uses_a_target_snapshot_and_preserves_source_status() {
     let directory = TempDir::new().unwrap();
     let (bin, log) = pnpm_shim(directory.path());
@@ -904,14 +924,18 @@ fn complete_mode_rejects_a_blocked_report_row() {
 
 #[cfg(any(windows, unix))]
 #[test]
-fn complete_report_gate_passes_only_with_all_reviewed_pass_rows() {
+fn synthetic_all_pass_report_without_authoritative_evidence_remains_blocked() {
     let directory = TempDir::new().unwrap();
     let report = fixture_report(directory.path(), None);
     let output = invoke_gate("Complete", &["report"], Some(&report.path), None);
     let text = output_text(&output);
 
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("report=PASS"), "{text}");
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("report=BLOCKED"), "{text}");
+    assert!(
+        text.contains("same-run reviewed-evidence attestation is missing"),
+        "{text}"
+    );
     assert!(text.contains("stage0_complete=false"), "{text}");
 }
 
@@ -956,7 +980,7 @@ fn complete_report_gate_rejects_a_nonexistent_or_mismatched_evidence_identity() 
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("report=BLOCKED"), "{text}");
     assert!(
-        text.contains("no existing in-repository artifact"),
+        text.contains("same-run reviewed-evidence attestation is missing"),
         "{text}"
     );
 }
@@ -999,14 +1023,14 @@ fn complete_report_gate_requires_a_reviewed_row_manifest_bundle() {
 
 #[cfg(any(windows, unix))]
 #[test]
-fn complete_report_gate_rejects_one_cargo_lock_reused_for_every_row() {
+fn complete_report_gate_rejects_one_cargo_lock_and_sha_reused_for_every_row() {
     let directory = TempDir::new().unwrap();
     let report = fixture_report(directory.path(), None);
     let cargo_lock = workspace_root().join("Cargo.lock");
     let bytes = fs::read(&cargo_lock).unwrap();
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let mut content = fs::read_to_string(&report.path).unwrap();
-    let shared_identity = format!("Evidence artifact: `./Cargo.lock`; SHA-256 `{digest}`");
+    let shared_identity = format!("Reviewed evidence manifest: `Cargo.lock` SHA-256 `{digest}`");
     let mut rewritten = Vec::new();
     for line in content.lines() {
         let mut cells: Vec<_> = line.split('|').collect();
@@ -1025,7 +1049,10 @@ fn complete_report_gate_rejects_one_cargo_lock_reused_for_every_row() {
 
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("report=BLOCKED"), "{text}");
-    assert!(text.contains("reviewed evidence manifest"), "{text}");
+    assert!(
+        text.contains("outside target/stage0/reviewed-evidence"),
+        "{text}"
+    );
 }
 
 #[cfg(any(windows, unix))]
@@ -1076,7 +1103,7 @@ fn complete_report_gate_requires_manual_window_observation_payload_not_a_lockfil
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("report=BLOCKED"), "{text}");
     assert!(
-        text.contains("evidence payload escaped its reviewed bundle"),
+        text.contains("same-run reviewed-evidence attestation is missing"),
         "{text}"
     );
 }
@@ -1103,7 +1130,7 @@ fn complete_report_gate_rejects_payload_reuse_between_row_manifests() {
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("report=BLOCKED"), "{text}");
     assert!(
-        text.contains("payload is reused across report rows"),
+        text.contains("same-run reviewed-evidence attestation is missing"),
         "{text}"
     );
 }
@@ -1139,7 +1166,10 @@ fn complete_report_gate_rejects_payload_symlinks_outside_the_bundle() {
 
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("report=BLOCKED"), "{text}");
-    assert!(text.contains("symlink or reparse point"), "{text}");
+    assert!(
+        text.contains("same-run reviewed-evidence attestation is missing"),
+        "{text}"
+    );
 }
 
 #[cfg(any(windows, unix))]
@@ -1159,7 +1189,7 @@ fn complete_report_gate_rejects_a_row_kind_that_does_not_match_its_label() {
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("report=BLOCKED"), "{text}");
     assert!(
-        text.contains("evidence kind does not match required row"),
+        text.contains("same-run reviewed-evidence attestation is missing"),
         "{text}"
     );
 }

@@ -45,7 +45,7 @@ $automatedDefaults = @(
     'ffmpeg-profile-tests', 'atomic-output', 'sandbox-unit', 'server-probe', 'desktop-probe-modes',
     'desktop-build', 'ffmpeg-profile'
 )
-$completeDefaults = @('report', 'ffmpeg-artifacts', 'aggregate-samples', 'public-server-linux')
+$completeDefaults = @('ffmpeg-artifacts', 'aggregate-samples', 'report', 'public-server-linux')
 $completeRequired = @($automatedDefaults + $completeDefaults)
 $expectedReportEvidence = @(
     'Protocol/schema determinism',
@@ -83,7 +83,9 @@ $knownGates = @($automatedDefaults + $completeDefaults | Select-Object -Unique)
 $results = [ordered]@{}
 $stopAfterFailure = $false
 $previousOffline = $env:CARGO_NET_OFFLINE
+$previousPythonNoBytecode = $env:PYTHONDONTWRITEBYTECODE
 $env:CARGO_NET_OFFLINE = 'true'
+$env:PYTHONDONTWRITEBYTECODE = '1'
 
 function Write-Stage0Log {
     param([string] $Name, [string[]] $Lines)
@@ -159,10 +161,7 @@ function Get-ReportRows {
         if ($row.ReviewerCell -match '(?i)pending|unreviewed|placeholder|fixture|codex.*recorder') {
             throw "BLOCKED: evidence row $($row.Number) has no independent human review."
         }
-        if ($row.Status -eq 'PASS' -and -not (Test-ReportArtifactIdentity -Details $row.Details)) {
-            throw "BLOCKED: passing evidence row $($row.Number) has no existing in-repository artifact whose SHA-256 matches the recorded identity."
-        }
-        if ($row.Status -eq 'BLOCKED' -and $row.Details -notmatch '(?i)blocked|not run|no .* exists|no .* available|not available|missing') {
+        if ($row.Status -eq 'BLOCKED' -and $row.Details -notmatch '(?i)blocked|not run|not .*(verified|performed|measured|available)|no .* exists|no .* available|no .* (collected|recorded|observed|claim|evidence|result)|not available|missing|unknown|false') {
             throw "FAIL: blocked evidence row $($row.Number) does not explain its prerequisite."
         }
     }
@@ -233,14 +232,19 @@ function Get-WorkingPython3Command {
 }
 
 function Invoke-ReviewedReportValidator {
-    param([string] $Path)
+    param([string] $Path, [string] $AggregateReportPath)
     $python = Get-WorkingPython3Command
     if (-not $python) { throw 'BLOCKED: Python 3 is required to validate reviewed per-row evidence manifests.' }
     $validator = Join-Path $scriptRoot 'validate_stage0_report.py'
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $lines = @(& $python.Source $validator --repo-root $repoRoot --report $Path 2>&1 | ForEach-Object { [string] $_ })
+        $arguments = @(
+            $validator, '--repo-root', $repoRoot, '--report', $Path,
+            '--attestation', (Join-Path $evidenceRoot 'reviewed-evidence-attestation.json'),
+            '--aggregate-report', $AggregateReportPath
+        )
+        $lines = @(& $python.Source @arguments 2>&1 | ForEach-Object { [string] $_ })
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -414,8 +418,8 @@ function Invoke-Stage0Gate {
             if ($gateReport.Fail -gt 0) { Write-Host "FAIL: $($gateReport.Fail) gate report row(s) are FAIL."; return 'FAIL' }
             if ($gateReport.Blocked -gt 0) { Write-Host "BLOCKED: $($gateReport.Blocked) gate report row(s) are BLOCKED."; return 'BLOCKED' }
             if ($gateReport.Pass -ne 23) { throw 'FAIL: every one of the 23 gate report rows must be PASS.' }
-            Invoke-ReviewedReportValidator -Path $ReportPath
-            Write-Host 'PASS: all 23 report rows have unique, reviewed, row-bound evidence manifests and payloads.'
+            Invoke-ReviewedReportValidator -Path $ReportPath -AggregateReportPath (Join-Path $runRoot 'aggregate-sample-report.json')
+            Write-Host 'PASS: all 23 report rows have strict per-kind raw-result semantics and same-run reviewed attestation.'
             return 'PASS'
         }
         'ffmpeg-artifacts' {
@@ -485,6 +489,7 @@ try {
     }
 } finally {
     if ($null -eq $previousOffline) { Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue } else { $env:CARGO_NET_OFFLINE = $previousOffline }
+    if ($null -eq $previousPythonNoBytecode) { Remove-Item Env:PYTHONDONTWRITEBYTECODE -ErrorAction SilentlyContinue } else { $env:PYTHONDONTWRITEBYTECODE = $previousPythonNoBytecode }
 }
 
 Write-Host 'Stage 0 gate summary:'

@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
 concurrency:
   group: stage0-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -293,9 +296,11 @@ jobs:
           mkdir -p target/stage0
           cargo run --locked --offline -p fluxform-ffmpeg-profile -- verify --profile config/ffmpeg-profile.toml --artifact-id "$STAGE0_FFMPEG_ARTIFACT_ID" --archive "$STAGE0_FFMPEG_ARCHIVE" --out target/stage0/ffmpeg-${{ matrix.target }}.json
           python - <<'PY'
-          import json
+          import sys
           from pathlib import Path
-          report = json.loads(Path('target/stage0/ffmpeg-${{ matrix.target }}.json').read_text())
+          sys.path.insert(0, str(Path.cwd() / 'scripts'))
+          from stage0_json import read_pinned_json
+          report, _digest, _identity = read_pinned_json(Path('target/stage0/ffmpeg-${{ matrix.target }}.json'), 'FFmpeg profile report', Path.cwd().resolve())
           if report.get('artifact_status') != 'approved' or report.get('distribution_gate_status') != 'approved':
               raise SystemExit('BLOCKED: candidate-only artifact or blocked distribution approval.')
           PY
@@ -404,12 +409,16 @@ jobs:
   complete:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'Complete' }}
     needs: [windows, macos, ubuntu, public-server-hosted-status, public-server-linux-native, native-profile-samples, aggregate-evidence]
-    runs-on: [self-hosted, linux, x64, linux-cgroupv2-delegated]
+    runs-on: [self-hosted, linux, x64, linux-cgroupv2-delegated, stage0-reviewed-evidence]
+    environment: stage0-manual-review
     env:
       FLUXFORM_STAGE0_LINUX_CGROUPV2_DELEGATED: '1'
       FLUXFORM_TEST_CGROUP_ROOT: ${{ vars.FLUXFORM_TEST_CGROUP_ROOT }}
       STAGE0_FFMPEG_ARCHIVE: ${{ vars.STAGE0_FFMPEG_ARCHIVE_LINUX_X86_64 }}
       STAGE0_FFMPEG_ARTIFACT_ID: ${{ vars.STAGE0_FFMPEG_ARTIFACT_ID_LINUX_X86_64 }}
+      STAGE0_REVIEWED_EVIDENCE_INPUT_DIR: ${{ vars.STAGE0_REVIEWED_EVIDENCE_INPUT_DIR }}
+      STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID: ${{ vars.STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID }}
+      STAGE0_REVIEWED_EVIDENCE_ENV: stage0-manual-review
     steps:
       - name: Require every automated, native, and aggregate prerequisite
         env:
@@ -429,6 +438,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Bind protected pre-provisioned review evidence locally
+        shell: bash
+        run: |
+          [[ -n "$STAGE0_REVIEWED_EVIDENCE_INPUT_DIR" ]] || { echo 'BLOCKED: protected STAGE0_REVIEWED_EVIDENCE_INPUT_DIR is not configured.' >&2; exit 1; }
+          [[ -n "$STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID" ]] || { echo 'BLOCKED: protected STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID is not configured.' >&2; exit 1; }
+          python scripts/transfer_stage0_reviewed_evidence.py --repo-root . --input "$STAGE0_REVIEWED_EVIDENCE_INPUT_DIR" --bundle-id "$STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID" --run-id "$GITHUB_RUN_ID" --commit-sha "$GITHUB_SHA" --actor "$GITHUB_ACTOR" --environment "$STAGE0_REVIEWED_EVIDENCE_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/cache@v4
         with:

@@ -3,21 +3,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import re
 import shutil
 import sys
 from pathlib import Path
 
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from stage0_json import read_pinned_bytes, read_pinned_json_bytes
 
 
 def main() -> int:
@@ -35,18 +27,16 @@ def main() -> int:
     profile = Path(f"target/stage0/ffmpeg-{target}.json")
     sample = Path(f"target/stage0/samples-{target}.json")
     try:
-        report = json.loads(sample.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        root = Path.cwd().resolve(strict=True)
+        report, sample_bytes, sample_sha256, _sample_identity = read_pinned_json_bytes(sample, "native sample report", root)
+        profile_bytes, profile_sha256, _profile_identity = read_pinned_bytes(profile, "native FFmpeg profile report", root)
+    except (OSError, UnicodeError, ValueError) as error:
         print(f"FAIL: native sample report is unavailable or invalid: {error}", file=sys.stderr)
         return 2
     digest = report.get("evidence_input_digest")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         print("FAIL: native sample report has no valid evidence-input digest", file=sys.stderr)
         return 2
-    if not profile.is_file():
-        print("FAIL: native FFmpeg profile report is missing", file=sys.stderr)
-        return 2
-
     arch_value = os.environ["RUNNER_ARCH_NAME"].lower()
     arch = {"x64": "x86_64", "arm64": "aarch64"}.get(arch_value, arch_value)
     provenance = {
@@ -60,17 +50,16 @@ def main() -> int:
         "evidence_input_digest": digest,
         "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
         "workflow_job_id": os.environ["WORKFLOW_JOB_ID"],
-        "ffmpeg_profile_report_sha256": sha256(profile),
-        "sample_report_sha256": sha256(sample),
+        "ffmpeg_profile_report_sha256": profile_sha256,
+        "sample_report_sha256": sample_sha256,
     }
     output_directory = Path(f"target/stage0/native-artifact-{target}")
     try:
         output_directory.mkdir(parents=True, exist_ok=False)
-        shutil.copyfile(profile, output_directory / "ffmpeg-profile-report.json")
-        shutil.copyfile(sample, output_directory / "sample-report.json")
-        (output_directory / "provenance.json").write_text(
-            json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
-        )
+        (output_directory / "ffmpeg-profile-report.json").write_bytes(profile_bytes)
+        (output_directory / "sample-report.json").write_bytes(sample_bytes)
+        import json
+        (output_directory / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8", newline="") as output:
             output.write(f"digest={digest}\n")
     except OSError as error:

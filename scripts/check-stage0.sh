@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -u
+export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
   cat <<'USAGE'
@@ -59,7 +60,7 @@ report_path="${report_path:-$repo_root/docs/architecture/stage-0-gate-report.md}
 export CARGO_NET_OFFLINE=true
 
 automated_defaults=(format clippy protocol contract-drift capabilities ffmpeg-profile-tests atomic-output sandbox-unit server-probe desktop-probe-modes desktop-build ffmpeg-profile)
-complete_defaults=(report ffmpeg-artifacts aggregate-samples public-server-linux)
+complete_defaults=(ffmpeg-artifacts aggregate-samples report public-server-linux)
 complete_required=("${automated_defaults[@]}" "${complete_defaults[@]}")
 if ((${#requested_gates[@]})); then
   selected_gates=("${requested_gates[@]}")
@@ -127,6 +128,20 @@ find_python3() {
 }
 
 validate_report() {
+  local path="$1"
+  local aggregate_report="$2"
+  if [[ ! -f "$path" ]]; then blocked "gate report does not exist: $path"; return 1; fi
+  local python_command
+  python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to validate the complete evidence report.'; return 1; }
+  "$python_command" "$script_dir/validate_stage0_report.py" --repo-root "$repo_root" --report "$path" \
+    --attestation "$evidence_root/reviewed-evidence-attestation.json" --aggregate-report "$aggregate_report"
+  local exit_code=$?
+  if ((exit_code == 0)); then gate_status='PASS'; gate_reason=''; return 0; fi
+  if ((exit_code == 10)); then gate_status='BLOCKED'; gate_reason='reviewed per-row evidence bundle is missing, untrusted, or invalid.'; return 1; fi
+  gate_status='FAIL'; gate_reason='reviewed per-row evidence bundle or report is malformed.'; return 1
+}
+
+validate_report_legacy_unused() {
   local path="$1"
   if [[ ! -f "$path" ]]; then blocked "gate report does not exist: $path"; return 1; fi
   local python_command='python3'
@@ -231,7 +246,7 @@ for number, evidence, status, reviewer, details in rows:
                 continue
         if not verified_identity:
             blocked(f"passing evidence row {number} has no existing in-repository artifact whose SHA-256 matches the recorded identity")
-    if status == "BLOCKED" and not re.search(r"blocked|not run|no .* exists|no .* available|not available|missing", details, re.I):
+    if status == "BLOCKED" and not re.search(r"blocked|not run|not .* (?:verified|performed|measured|available)|no .* exists|no .* available|no .* (?:collected|recorded|observed|claim|evidence|result)|not available|missing|unknown|false", details, re.I):
         fail(f"blocked evidence row {number} does not explain its prerequisite")
 
 summary = re.search(r"\*\*Overall status: (PASS|FAIL|BLOCKED)\.\*\*\s*Current matrix:\s*\*\*(\d+) PASS,\s*(\d+) FAIL,\s*(\d+) BLOCKED\*\*", text)
@@ -273,10 +288,13 @@ copy_profile_evidence() {
     local source="$source_root/${files[$index]}"
     [[ -f "$source" ]] || { blocked "exact native profile artifact is missing: $source"; return 1; }
     "$python_command" - "$source" "${triples[$index]}" <<'PY'
-import json
+from pathlib import Path
 import sys
+sys.path.insert(0, str(Path.cwd() / "scripts"))
+from stage0_json import read_pinned_json
+
 try:
-    report = json.load(open(sys.argv[1], encoding="utf-8"))
+    report, _digest, _identity = read_pinned_json(Path(sys.argv[1]), "native FFmpeg profile report", Path.cwd().resolve())
 except Exception as error:
     print(f"FAIL: invalid profile JSON: {error}", file=sys.stderr)
     raise SystemExit(2)
@@ -357,9 +375,11 @@ run_gate() {
       local python_command
       python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to inspect the verifier report.'; return 1; }
       "$python_command" - "$output" <<'PY'
-import json
+from pathlib import Path
 import sys
-report = json.load(open(sys.argv[1], encoding="utf-8"))
+sys.path.insert(0, str(Path.cwd() / "scripts"))
+from stage0_json import read_pinned_json
+report, _digest, _identity = read_pinned_json(Path(sys.argv[1]), "hardened verifier report", Path.cwd().resolve())
 if report.get("artifact_status") != "approved" or report.get("distribution_gate_status") != "approved":
     print("BLOCKED: verifier evidence is candidate-only or distribution approval is missing", file=sys.stderr)
     raise SystemExit(10)
@@ -387,7 +407,7 @@ PY
       run_cargo "$name-startup-positive" test -p fluxform-server-probe --test public_startup delegated_linux_process_binds_public_mode_and_serves_protected_status --all-features -- --ignored --exact || return 1
       ;;
     report)
-      validate_report "$report_path" || return 1
+      validate_report "$report_path" "$run_root/aggregate-sample-report.json" || return 1
       ;;
     ffmpeg-artifacts)
       copy_profile_evidence "$evidence_root" "$run_root/profiles" || return 1
@@ -404,6 +424,10 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / "scripts"))
+from stage0_json import read_pinned_json
 root = sys.argv[1]
 expected = {"windows-x86_64", "macos-x86_64", "macos-aarch64", "linux-x86_64"}
 try:
@@ -422,7 +446,7 @@ for name in expected:
         print(f"BLOCKED: {name} has missing or unexpected artifact files", file=sys.stderr)
         raise SystemExit(10)
     try:
-        report = json.load(open(os.path.join(directory, "sample-report.json"), encoding="utf-8"))
+        report, _digest, _identity = read_pinned_json(Path(directory) / "sample-report.json", f"{name} native sample report", Path.cwd().resolve())
     except Exception as error:
         print(f"BLOCKED: invalid sample report for {name}: {error}", file=sys.stderr)
         raise SystemExit(10)
