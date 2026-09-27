@@ -1,56 +1,12 @@
 use fluxform_server_probe::startup::{
-    SandboxCheck, SandboxChecker, SandboxProbeConfig, ServerConfig, ServerMode, StartupError,
-    prepare_server,
+    SandboxProbeConfig, ServerConfig, ServerMode, prepare_server,
 };
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-
-struct InjectedChecker {
-    failed_check: Option<SandboxCheck>,
-    calls: Arc<Mutex<usize>>,
-}
-
-impl InjectedChecker {
-    fn passing() -> Self {
-        Self {
-            failed_check: None,
-            calls: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    fn failing(check: SandboxCheck) -> Self {
-        Self {
-            failed_check: Some(check),
-            calls: Arc::new(Mutex::new(0)),
-        }
-    }
-}
-
-impl SandboxChecker for InjectedChecker {
-    fn check(&self, _config: &ServerConfig) -> Result<(), StartupError> {
-        *self.calls.lock().unwrap() += 1;
-        match self.failed_check {
-            Some(check) => Err(StartupError::sandbox_check_failed(
-                check,
-                "injected failure",
-            )),
-            None => Ok(()),
-        }
-    }
-}
-
-struct MustNotRunChecker;
-
-impl SandboxChecker for MustNotRunChecker {
-    fn check(&self, _config: &ServerConfig) -> Result<(), StartupError> {
-        panic!("LocalDevelopment must not invoke the Linux sandbox checker")
-    }
-}
 
 fn config(root: &TempDir, mode: ServerMode, address: SocketAddr) -> ServerConfig {
     ServerConfig {
@@ -74,95 +30,11 @@ fn unused_loopback_address() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
-#[test]
-fn every_failed_public_sandbox_gate_returns_before_the_address_can_be_bound() {
-    let checks = [
-        SandboxCheck::Filesystem,
-        SandboxCheck::Network,
-        SandboxCheck::CgroupControllers,
-        SandboxCheck::CgroupKill,
-        SandboxCheck::ServiceIdentity,
-        SandboxCheck::PrivateNamespace,
-        SandboxCheck::PlacementBarrier,
-    ];
-
-    for check in checks {
-        let root = tempfile::tempdir().unwrap();
-        let address = unused_loopback_address();
-        let checker = InjectedChecker::failing(check);
-        let error = match prepare_server(config(&root, ServerMode::Public, address), &checker) {
-            Err(error) => error,
-            Ok(_) => panic!("failed sandbox check {check:?} must reject public startup"),
-        };
-
-        assert!(error.to_string().contains(&format!("{check:?}")));
-        assert_eq!(*checker.calls.lock().unwrap(), 1);
-        assert!(
-            TcpListener::bind(address).is_ok(),
-            "{check:?} claimed {address}"
-        );
-    }
-}
-
-#[test]
-fn invalid_public_configuration_is_rejected_before_sandbox_checker_runs() {
-    let root = tempfile::tempdir().unwrap();
-    let address = unused_loopback_address();
-    let mut invalid = config(&root, ServerMode::Public, address);
-    invalid.public_origin = "not-an-origin".to_owned();
-    let checker = InjectedChecker::passing();
-
-    let error = match prepare_server(invalid, &checker) {
-        Err(error) => error,
-        Ok(_) => panic!("invalid Public configuration must be rejected"),
-    };
-
-    assert!(error.to_string().contains("configuration"));
-    assert_eq!(*checker.calls.lock().unwrap(), 0);
-    assert!(TcpListener::bind(address).is_ok());
-}
-
-#[test]
-fn malformed_public_probe_identity_is_rejected_before_sandbox_checker_runs() {
-    let root = tempfile::tempdir().unwrap();
-    let address = unused_loopback_address();
-    let mut invalid = config(&root, ServerMode::Public, address);
-    invalid.sandbox_probe.as_mut().unwrap().sha256 = "test-only".to_owned();
-    let checker = InjectedChecker::passing();
-
-    let error = match prepare_server(invalid, &checker) {
-        Err(error) => error,
-        Ok(_) => panic!("malformed probe identity must be rejected"),
-    };
-
-    assert!(error.to_string().contains("SHA-256"));
-    assert_eq!(*checker.calls.lock().unwrap(), 0);
-    assert!(TcpListener::bind(address).is_ok());
-}
-
-#[tokio::test]
-async fn passing_injected_checker_can_prepare_and_bind_public_mode() {
-    let root = tempfile::tempdir().unwrap();
-    let address = unused_loopback_address();
-    let checker = InjectedChecker::passing();
-
-    let prepared = prepare_server(config(&root, ServerMode::Public, address), &checker).unwrap();
-    assert_eq!(prepared.mode(), ServerMode::Public);
-    assert_eq!(*checker.calls.lock().unwrap(), 1);
-
-    let bound = prepared.bind().await.unwrap();
-    assert_eq!(bound.local_addr().unwrap(), address);
-}
-
 #[tokio::test]
 async fn explicit_local_development_binds_loopback_with_a_nonproduction_warning() {
     let root = tempfile::tempdir().unwrap();
     let address = unused_loopback_address();
-    let prepared = prepare_server(
-        config(&root, ServerMode::LocalDevelopment, address),
-        &MustNotRunChecker,
-    )
-    .unwrap();
+    let prepared = prepare_server(config(&root, ServerMode::LocalDevelopment, address)).unwrap();
 
     assert!(
         prepared
@@ -179,10 +51,7 @@ async fn explicit_local_development_binds_loopback_with_a_nonproduction_warning(
 fn local_development_rejects_non_loopback_addresses_instead_of_upgrading_to_public() {
     let root = tempfile::tempdir().unwrap();
     let address = SocketAddr::from(([0, 0, 0, 0], 43123));
-    let error = match prepare_server(
-        config(&root, ServerMode::LocalDevelopment, address),
-        &MustNotRunChecker,
-    ) {
+    let error = match prepare_server(config(&root, ServerMode::LocalDevelopment, address)) {
         Err(error) => error,
         Ok(_) => panic!("non-loopback LocalDevelopment must be rejected"),
     };
@@ -425,7 +294,7 @@ fn launch_native_server(
         .unwrap_or_else(|error| {
             panic!("BLOCKED: cannot open service cgroup.procs for process placement: {error}")
         });
-    let mut command = native_server_command(
+    let (mut command, _verified_server) = native_server_command(
         data_dir,
         address,
         delegated_cgroup_root,
@@ -476,8 +345,13 @@ fn native_server_command(
     probe: &std::path::Path,
     tool_directory: &std::path::Path,
     stderr: Stdio,
-) -> Command {
-    Command::new(native_server_binary())
+) -> (Command, std::fs::File) {
+    use std::os::fd::AsRawFd;
+
+    let verified_server = native_server_binary();
+    let executable = format!("/proc/self/fd/{}", verified_server.as_raw_fd());
+    let mut command = Command::new(executable);
+    command
         .env("FLUXFORM_SERVER_MODE", "public")
         .env("FLUXFORM_SERVER_LISTEN", address.to_string())
         .env("FLUXFORM_SERVER_DATA_DIR", data_dir)
@@ -498,13 +372,12 @@ fn native_server_command(
         .env_remove("FLUXFORM_TEST_SANDBOX_RELEASE_FILE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr)
+        .stderr(stderr);
+    (command, verified_server)
 }
 
 #[cfg(target_os = "linux")]
-fn native_server_binary() -> std::path::PathBuf {
-    use sha2::{Digest, Sha256};
-    use std::os::unix::fs::PermissionsExt;
+fn native_server_binary() -> std::fs::File {
     use std::process::Command as GitCommand;
 
     let binary = native_env_path("FLUXFORM_TEST_SERVER_BINARY");
@@ -512,17 +385,6 @@ fn native_server_binary() -> std::path::PathBuf {
         binary.file_name(),
         Some(std::ffi::OsStr::new("fluxform-server-probe")),
         "native process proof requires the packaged fluxform-server-probe binary"
-    );
-    let binary_metadata = fs::symlink_metadata(&binary)
-        .unwrap_or_else(|error| panic!("BLOCKED: cannot inspect packaged server binary: {error}"));
-    assert!(
-        binary_metadata.is_file() && !binary_metadata.file_type().is_symlink(),
-        "BLOCKED: packaged server binary must be a regular non-symlink file"
-    );
-    assert_ne!(
-        binary_metadata.permissions().mode() & 0o111,
-        0,
-        "BLOCKED: packaged server binary is not executable"
     );
     let expected_sha256 = native_env_string("FLUXFORM_TEST_SERVER_SHA256");
     assert!(
@@ -532,14 +394,10 @@ fn native_server_binary() -> std::path::PathBuf {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "BLOCKED: server SHA-256 identity must be 64 lowercase hexadecimal characters"
     );
-    let actual_sha256 = Sha256::digest(fs::read(&binary).unwrap())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    assert_eq!(
-        actual_sha256, expected_sha256,
-        "BLOCKED: packaged server binary identity is stale or wrong"
-    );
+    let verified_binary =
+        open_verified_executable(&binary, &expected_sha256).unwrap_or_else(|error| {
+            panic!("BLOCKED: packaged server binary failed identity check: {error}")
+        });
 
     let runner_os = native_env_string("FLUXFORM_TEST_RUNNER_OS");
     let runner_arch = native_env_string("FLUXFORM_TEST_RUNNER_ARCH");
@@ -573,7 +431,119 @@ fn native_server_binary() -> std::path::PathBuf {
         commit,
         "BLOCKED: native process evidence is stale for this checkout"
     );
-    binary
+    verified_binary
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_executable(
+    path: &std::path::Path,
+    expected_sha256: &str,
+) -> std::io::Result<std::fs::File> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.mode() & 0o111 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "verified executable must be a regular executable file",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual_sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let after = file.metadata()?;
+    if (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mtime(),
+        before.ctime(),
+    ) != (
+        after.dev(),
+        after.ino(),
+        after.len(),
+        after.mtime(),
+        after.ctime(),
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verified executable changed while its digest was checked",
+        ));
+    }
+    if actual_sha256 != expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verified executable digest is stale or wrong",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_native_artifact_is_executed_from_its_retained_descriptor_after_name_replacement() {
+    use sha2::{Digest, Sha256};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempfile::tempdir().expect("temporary artifact root");
+    let artifact_path = root.path().join("fluxform-server-probe");
+    let source = std::env::current_exe().expect("current integration-test artifact");
+    fs::copy(&source, &artifact_path).expect("copy artifact fixture");
+    let expected_sha256 = Sha256::digest(fs::read(&artifact_path).expect("read fixture digest"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let verified = open_verified_executable(&artifact_path, &expected_sha256)
+        .expect("open and verify exact artifact object");
+    let original = verified.metadata().expect("verified descriptor metadata");
+
+    fs::rename(&artifact_path, root.path().join("verified-original"))
+        .expect("retain original under a different name");
+    fs::write(
+        &artifact_path,
+        b"replacement is deliberately not executable",
+    )
+    .expect("replace the launch pathname");
+    let replacement = fs::metadata(&artifact_path).expect("replacement metadata");
+    assert_ne!(
+        (original.dev(), original.ino()),
+        (replacement.dev(), replacement.ino())
+    );
+
+    let executable = format!("/proc/self/fd/{}", verified.as_raw_fd());
+    let output = Command::new(executable)
+        .args(["--exact", "native_verified_exec_marker", "--nocapture"])
+        .env("FLUXFORM_TEST_EXEC_MARKER", "1")
+        .output()
+        .expect("execute retained verified object");
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("retained-verified-object"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_verified_exec_marker() {
+    if std::env::var_os("FLUXFORM_TEST_EXEC_MARKER").is_some() {
+        println!("retained-verified-object");
+    }
 }
 
 #[cfg(target_os = "linux")]

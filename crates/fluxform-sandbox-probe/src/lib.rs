@@ -1379,6 +1379,49 @@ impl Sandbox {
             Err(SandboxError::UnsupportedPlatform)
         }
     }
+
+    /// Launches only the file object whose digest was declared by the trusted
+    /// caller. The retained descriptor is checked against the pinned tool
+    /// path, then Task 7 executes the pinned object with `execveat`.
+    pub fn spawn_blocked_verified(
+        program: &Path,
+        verified_program: &std::fs::File,
+        expected_sha256: &str,
+        args: &[OsString],
+        policy: &SandboxPolicy,
+        placement: SpawnPlacement,
+    ) -> Result<SandboxChild, SandboxError> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            linux::spawn_blocked_verified(
+                program,
+                verified_program,
+                expected_sha256,
+                args,
+                policy,
+                placement,
+            )
+        }
+
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let _ = (
+                program,
+                verified_program,
+                expected_sha256,
+                args,
+                policy,
+                placement,
+            );
+            Err(SandboxError::UnsupportedPlatform)
+        }
+    }
 }
 
 #[cfg(not(all(
@@ -1502,10 +1545,11 @@ mod linux {
         ToolEntryEvidence, ToolInventory, network_namespace_is_private, validate_open_files_limit,
         validate_policy_path_identities, validate_tool_inventory,
     };
+    use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
     use std::ffi::CString;
     use std::fs::{self, File};
-    use std::io::{self, Read, Write};
+    use std::io::{self, Read, Seek, Write};
     use std::mem::{size_of, zeroed};
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -3960,6 +4004,33 @@ mod linux {
         program: &Path,
         args: &[std::ffi::OsString],
         policy: &SandboxPolicy,
+        placement: SpawnPlacement,
+    ) -> Result<SandboxChild, SandboxError> {
+        spawn_blocked_inner(program, None, args, policy, placement)
+    }
+
+    pub(super) fn spawn_blocked_verified(
+        program: &Path,
+        verified_program: &File,
+        expected_sha256: &str,
+        args: &[std::ffi::OsString],
+        policy: &SandboxPolicy,
+        placement: SpawnPlacement,
+    ) -> Result<SandboxChild, SandboxError> {
+        spawn_blocked_inner(
+            program,
+            Some((verified_program, expected_sha256)),
+            args,
+            policy,
+            placement,
+        )
+    }
+
+    fn spawn_blocked_inner(
+        program: &Path,
+        verified_program: Option<(&File, &str)>,
+        args: &[std::ffi::OsString],
+        policy: &SandboxPolicy,
         mut placement: SpawnPlacement,
     ) -> Result<SandboxChild, SandboxError> {
         ensure_spawn_allowed(&placement)?;
@@ -4026,6 +4097,9 @@ mod linux {
             return Err(SandboxError::InvalidPolicy(
                 "tool executable has no execute permission".into(),
             ));
+        }
+        if let Some((verified_program, expected_sha256)) = verified_program {
+            verify_pinned_program_digest(verified_program, &program_pin, expected_sha256)?;
         }
         let relative_program = program.strip_prefix(&policy.tool_dir).map_err(|_| {
             SandboxError::InvalidPolicy(
@@ -4598,6 +4672,74 @@ mod linux {
             ctime_sec: metadata.st_ctime,
             ctime_nsec: metadata.st_ctime_nsec,
         }
+    }
+
+    fn verify_pinned_program_digest(
+        verified_program: &File,
+        pinned_program: &PinnedPath,
+        expected_sha256: &str,
+    ) -> Result<(), SandboxError> {
+        if expected_sha256.len() != 64
+            || !expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SandboxError::InvalidPolicy(
+                "verified tool executable SHA-256 must be lowercase hexadecimal".into(),
+            ));
+        }
+
+        let before = stat_fd(verified_program.as_raw_fd())?;
+        let signature = signature_from_stat(&before);
+        if signature.identity != pinned_program.identity || signature != pinned_program.signature {
+            return Err(SandboxError::InvalidPolicy(
+                "verified tool executable no longer matches the pinned tool path".into(),
+            ));
+        }
+
+        let mut reader = verified_program
+            .try_clone()
+            .map_err(|source| SandboxError::Io {
+                operation: "clone verified tool executable handle",
+                source,
+            })?;
+        reader
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|source| SandboxError::Io {
+                operation: "rewind verified tool executable handle",
+                source,
+            })?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|source| SandboxError::Io {
+                    operation: "hash verified tool executable handle",
+                    source,
+                })?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual_sha256 = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let after = stat_fd(verified_program.as_raw_fd())?;
+        if signature_from_stat(&after) != signature {
+            return Err(SandboxError::InvalidPolicy(
+                "verified tool executable changed while its digest was checked".into(),
+            ));
+        }
+        if actual_sha256 != expected_sha256 {
+            return Err(SandboxError::InvalidPolicy(
+                "verified tool executable digest does not match the declared identity".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn mount_id_for_fd(fd: RawFd) -> Result<u64, SandboxError> {
@@ -6144,7 +6286,9 @@ mod linux {
     #[cfg(test)]
     mod race_tests {
         use super::*;
+        use sha2::{Digest, Sha256};
         use std::fs;
+        use std::fs::File;
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
@@ -6534,6 +6678,13 @@ mod linux {
             let inventory = collect_tool_inventory(&tool, input.identity).expect("inventory");
             let executable = open_pinned_path(&executable_path, false, "tool executable")
                 .expect("pin executable");
+            let verified_program = File::open(&executable_path).expect("retain verified object");
+            let expected_sha256 = Sha256::digest(fs::read(&executable_path).expect("read digest"))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            verify_pinned_program_digest(&verified_program, &executable, &expected_sha256)
+                .expect("digest must bind to the pinned executable object");
 
             fs::rename(&executable_path, tool_path.join("approved-original"))
                 .expect("rename approved executable");
@@ -6577,6 +6728,37 @@ mod linux {
                 libc::WEXITSTATUS(status),
                 0,
                 "pinned executable was not run"
+            );
+        }
+
+        #[test]
+        fn verified_digest_rejects_replacement_before_task7_pins_the_name() {
+            let root = tempfile::tempdir().expect("fixture root");
+            let tool_path = root.path().join("tool");
+            fs::create_dir(&tool_path).expect("tool directory");
+            let executable_path = tool_path.join("pinned-test");
+            let source = std::env::current_exe().expect("current test executable");
+            fs::copy(&source, &executable_path).expect("copy original executable");
+            fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o700))
+                .expect("make original executable runnable");
+
+            let verified = File::open(&executable_path).expect("retain verified object");
+            let expected_sha256 = Sha256::digest(fs::read(&executable_path).expect("read digest"))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+
+            fs::rename(&executable_path, tool_path.join("approved-original"))
+                .expect("replace pathname after retaining original");
+            fs::copy(&source, &executable_path).expect("install replacement executable");
+            fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o700))
+                .expect("make replacement executable runnable");
+
+            let pinned_replacement = open_pinned_path(&executable_path, false, "tool executable")
+                .expect("pin replacement pathname");
+            assert!(
+                verify_pinned_program_digest(&verified, &pinned_replacement, &expected_sha256,)
+                    .is_err()
             );
         }
     }

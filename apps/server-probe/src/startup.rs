@@ -6,14 +6,13 @@ use crate::routes::{self, RouteConfigurationError, ServerState};
 use crate::{LedgerLimits, UploadLedger};
 use fluxform_sandbox_probe::{
     CgroupEvidenceStatus, CgroupV2Job, FilesystemPrerequisites, NetworkPrerequisites, ProbeStatus,
-    ResourceBoundary, SandboxLimits,
+    SandboxLimits,
 };
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use fluxform_sandbox_probe::{Sandbox, SandboxPolicy};
-use sha2::{Digest, Sha256};
 use std::env;
 #[cfg(all(
     target_os = "linux",
@@ -21,6 +20,7 @@ use std::env;
 ))]
 use std::ffi::OsString;
 use std::fs;
+use std::fs::File;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,155 @@ const CAPABILITY_TTL: Duration = Duration::from_secs(60 * 60);
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+mod kill_evidence_tests {
+    use super::{KillProbeEvidence, validate_kill_probe_evidence};
+
+    #[test]
+    fn an_empty_cgroup_write_without_a_live_action_is_not_kill_evidence() {
+        let evidence = KillProbeEvidence {
+            action_started: false,
+            supervisor_live_before_kill: false,
+            populated_before_kill: false,
+            kill_all_succeeded: true,
+            supervisor_reaped: true,
+            empty_after_kill: true,
+        };
+
+        assert!(validate_kill_probe_evidence(evidence).is_err());
+    }
+
+    #[test]
+    fn live_action_killed_reaped_and_empty_is_sufficient_evidence() {
+        let evidence = KillProbeEvidence {
+            action_started: true,
+            supervisor_live_before_kill: true,
+            populated_before_kill: true,
+            kill_all_succeeded: true,
+            supervisor_reaped: true,
+            empty_after_kill: true,
+        };
+
+        assert!(validate_kill_probe_evidence(evidence).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod startup_authorization_tests {
+    use super::{
+        SandboxCheck, SandboxProbeConfig, ServerConfig, ServerMode, StartupError,
+        prepare_server_with_check,
+    };
+    use std::net::{SocketAddr, TcpListener};
+    use tempfile::TempDir;
+
+    fn config(root: &TempDir, address: SocketAddr) -> ServerConfig {
+        ServerConfig {
+            mode: ServerMode::Public,
+            listen_address: address,
+            data_dir: root.path().join("server-data"),
+            public_origin: format!("http://{address}"),
+            server_secret: [0x6d; 32],
+            trusted_proxy_cidrs: Vec::new(),
+            delegated_cgroup_root: Some(root.path().join("delegated-cgroup")),
+            sandbox_probe: Some(SandboxProbeConfig {
+                executable: root.path().join("tools").join("sandbox-child"),
+                tool_directory: root.path().join("tools"),
+                sha256: "0".repeat(64),
+            }),
+        }
+    }
+
+    fn unused_loopback_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+        listener.local_addr().expect("get loopback port")
+    }
+
+    #[test]
+    fn each_private_checker_failure_returns_before_the_address_can_be_bound() {
+        let checks = [
+            SandboxCheck::Filesystem,
+            SandboxCheck::Network,
+            SandboxCheck::CgroupControllers,
+            SandboxCheck::CgroupKill,
+            SandboxCheck::ServiceIdentity,
+            SandboxCheck::PrivateNamespace,
+            SandboxCheck::PlacementBarrier,
+        ];
+
+        for check in checks {
+            let root = tempfile::tempdir().expect("temporary root");
+            let address = unused_loopback_address();
+            let error = match prepare_server_with_check(config(&root, address), |requirements| {
+                assert_eq!(
+                    requirements.delegated_cgroup_root,
+                    root.path().join("delegated-cgroup")
+                );
+                assert_eq!(
+                    requirements.sandbox_probe.executable,
+                    root.path().join("tools/sandbox-child")
+                );
+                Err(StartupError::sandbox_check_failed(
+                    check,
+                    "injected failure",
+                ))
+            }) {
+                Err(error) => error,
+                Ok(_) => panic!("injected checker failure must reject Public startup"),
+            };
+
+            assert!(error.to_string().contains(&format!("{check:?}")));
+            assert!(
+                TcpListener::bind(address).is_ok(),
+                "{check:?} claimed {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_configuration_is_rejected_before_private_checker_runs() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let address = unused_loopback_address();
+        let mut invalid = config(&root, address);
+        invalid.public_origin = "not-an-origin".to_owned();
+
+        let error = match prepare_server_with_check(invalid, |_| panic!("checker must not run")) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid configuration must fail before checking"),
+        };
+
+        assert!(error.to_string().contains("configuration"));
+        assert!(TcpListener::bind(address).is_ok());
+    }
+
+    #[test]
+    fn malformed_probe_identity_is_rejected_before_private_checker_runs() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let address = unused_loopback_address();
+        let mut invalid = config(&root, address);
+        invalid.sandbox_probe.as_mut().unwrap().sha256 = "test-only".to_owned();
+
+        let error = match prepare_server_with_check(invalid, |_| panic!("checker must not run")) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed probe identity must fail before checking"),
+        };
+
+        assert!(error.to_string().contains("SHA-256"));
+        assert!(TcpListener::bind(address).is_ok());
+    }
+
+    #[tokio::test]
+    async fn private_positive_checker_can_prepare_public_server_for_deterministic_tests() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let address = unused_loopback_address();
+        let prepared = prepare_server_with_check(config(&root, address), |_| Ok(()))
+            .expect("unit-test-only positive checker");
+        assert_eq!(prepared.mode(), ServerMode::Public);
+        let bound = prepared.bind().await.expect("bind after private test seam");
+        assert_eq!(bound.local_addr().expect("bound address"), address);
+    }
+}
 
 /// The two supported service modes. Mode selection is explicit; there is no
 /// implicit fallback from a failed public check to LocalDevelopment.
@@ -96,19 +245,21 @@ pub struct ServerConfig {
     pub sandbox_probe: Option<SandboxProbeConfig>,
 }
 
-/// The checker seam supports deterministic unit tests. The executable's
-/// production startup path always supplies [`RealSandboxChecker`]; a test
-/// double is not persisted, serialized, or accepted as native evidence.
-pub trait SandboxChecker {
-    fn check(&self, config: &ServerConfig) -> Result<(), StartupError>;
+/// Least-privilege configuration passed to the private public-mode checker.
+/// In particular, this deliberately excludes the server secret and listener
+/// configuration.
+#[derive(Clone)]
+struct SandboxRequirements {
+    delegated_cgroup_root: PathBuf,
+    sandbox_probe: SandboxProbeConfig,
 }
 
 /// Active runtime verification of Task 7 filesystem, Task 8 network/seccomp,
 /// and Task 9 delegated cgroup/resource boundaries.
-pub struct RealSandboxChecker;
+struct RealSandboxChecker;
 
-impl SandboxChecker for RealSandboxChecker {
-    fn check(&self, config: &ServerConfig) -> Result<(), StartupError> {
+impl RealSandboxChecker {
+    fn check(&self, requirements: &SandboxRequirements) -> Result<(), StartupError> {
         let filesystem = FilesystemPrerequisites::inspect()
             .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::Filesystem, error))?;
         if !filesystem.all_passed() {
@@ -133,20 +284,9 @@ impl SandboxChecker for RealSandboxChecker {
             ));
         }
 
-        let delegated_root =
-            config
-                .delegated_cgroup_root
-                .as_deref()
-                .ok_or(StartupError::InvalidConfiguration(
-                    "Public mode requires FLUXFORM_SERVER_DELEGATED_CGROUP_ROOT",
-                ))?;
-        let sandbox_probe = config
-            .sandbox_probe
-            .as_ref()
-            .ok_or(StartupError::InvalidConfiguration(
-                "Public mode requires the packaged Task 7 sandbox-child executable and tool directory",
-            ))?;
-        validate_probe_binary(sandbox_probe)?;
+        let delegated_root = &requirements.delegated_cgroup_root;
+        let sandbox_probe = &requirements.sandbox_probe;
+        let verified_probe = open_probe_binary(sandbox_probe)?;
 
         let job_id = format!("startup-{}", Uuid::new_v4().simple());
         let job = CgroupV2Job::create(delegated_root, &job_id, SandboxLimits::default())
@@ -160,20 +300,37 @@ impl SandboxChecker for RealSandboxChecker {
 
         // Exercise the real child-side namespace/seccomp setup and Task 9
         // placement barrier before the HTTP server can obtain a listener.
-        run_placement_probe(&job, sandbox_probe)?;
-
-        job.kill_all()
-            .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
-        if !job
-            .is_empty()
-            .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?
-        {
-            return Err(StartupError::sandbox_check_failed(
-                SandboxCheck::CgroupKill,
-                "startup probe cgroup remained populated after cgroup.kill",
-            ));
-        }
+        let kill_evidence = run_placement_probe(&job, sandbox_probe, &verified_probe)?;
+        validate_kill_probe_evidence(kill_evidence).map_err(|detail| {
+            StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, detail)
+        })?;
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KillProbeEvidence {
+    action_started: bool,
+    supervisor_live_before_kill: bool,
+    populated_before_kill: bool,
+    kill_all_succeeded: bool,
+    supervisor_reaped: bool,
+    empty_after_kill: bool,
+}
+
+fn validate_kill_probe_evidence(evidence: KillProbeEvidence) -> Result<(), &'static str> {
+    if evidence.action_started
+        && evidence.supervisor_live_before_kill
+        && evidence.populated_before_kill
+        && evidence.kill_all_succeeded
+        && evidence.supervisor_reaped
+        && evidence.empty_after_kill
+    {
+        Ok(())
+    } else {
+        Err(
+            "startup cgroup.kill proof must kill and reap a live placed action before observing populated 0",
+        )
     }
 }
 
@@ -290,14 +447,42 @@ pub(crate) struct PublicListenerAuthorization {
 
 /// Validates every config value and all required security checks before
 /// returning a bind-capable server object.
-pub fn prepare_server(
+pub fn prepare_server(config: ServerConfig) -> Result<PreparedServer, StartupError> {
+    prepare_server_inner(config, |requirements| {
+        RealSandboxChecker.check(requirements)
+    })
+}
+
+#[cfg(test)]
+fn prepare_server_with_check(
     config: ServerConfig,
-    sandbox_checker: &dyn SandboxChecker,
+    check: impl FnOnce(&SandboxRequirements) -> Result<(), StartupError>,
+) -> Result<PreparedServer, StartupError> {
+    prepare_server_inner(config, check)
+}
+
+fn prepare_server_inner(
+    config: ServerConfig,
+    check: impl FnOnce(&SandboxRequirements) -> Result<(), StartupError>,
 ) -> Result<PreparedServer, StartupError> {
     validate_config(&config)?;
 
     if config.mode == ServerMode::Public {
-        sandbox_checker.check(&config)?;
+        let requirements = SandboxRequirements {
+            delegated_cgroup_root: config
+                .delegated_cgroup_root
+                .clone()
+                .ok_or(StartupError::InvalidConfiguration(
+                    "Public mode requires FLUXFORM_SERVER_DELEGATED_CGROUP_ROOT",
+                ))?,
+            sandbox_probe: config
+                .sandbox_probe
+                .clone()
+                .ok_or(StartupError::InvalidConfiguration(
+                    "Public mode requires the packaged Task 7 sandbox-child executable and tool directory",
+                ))?,
+        };
+        check(&requirements)?;
     }
 
     let state = build_server_state(&config)?;
@@ -475,21 +660,18 @@ fn create_private_directory(path: &Path) -> Result<(), StartupError> {
     Ok(())
 }
 
-fn validate_probe_binary(probe: &SandboxProbeConfig) -> Result<(), StartupError> {
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn open_probe_binary(probe: &SandboxProbeConfig) -> Result<File, StartupError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
     if probe.executable.file_name() != Some(std::ffi::OsStr::new("sandbox-child"))
         || probe.executable.parent() != Some(probe.tool_directory.as_path())
     {
         return Err(StartupError::InvalidConfiguration(
             "sandbox probe must be sandbox-child directly inside its declared tool directory",
-        ));
-    }
-    let metadata = fs::symlink_metadata(&probe.executable).map_err(|error| {
-        StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error)
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(StartupError::sandbox_check_failed(
-            SandboxCheck::PlacementBarrier,
-            "sandbox-child must be a regular non-symlink executable",
         ));
     }
     let tool_metadata = fs::symlink_metadata(&probe.tool_directory).map_err(|error| {
@@ -501,20 +683,34 @@ fn validate_probe_binary(probe: &SandboxProbeConfig) -> Result<(), StartupError>
             "sandbox tool directory must be a real directory, not a symlink",
         ));
     }
-    let binary = fs::read(&probe.executable).map_err(|error| {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&probe.executable)
+        .map_err(|error| {
+            StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error)
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error)
     })?;
-    let actual_sha256 = Sha256::digest(binary)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if actual_sha256 != probe.sha256 {
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
         return Err(StartupError::sandbox_check_failed(
             SandboxCheck::PlacementBarrier,
-            "sandbox-child SHA-256 does not match the declared packaged binary identity",
+            "sandbox-child must be a regular executable file",
         ));
     }
-    Ok(())
+    Ok(file)
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn open_probe_binary(_probe: &SandboxProbeConfig) -> Result<File, StartupError> {
+    Err(StartupError::sandbox_check_failed(
+        SandboxCheck::PlacementBarrier,
+        "BLOCKED: the Task 7 executable can only be pinned on supported Linux targets",
+    ))
 }
 
 fn classify_cgroup_error(error: impl std::fmt::Display) -> StartupError {
@@ -540,7 +736,11 @@ fn classify_cgroup_error(error: impl std::fmt::Display) -> StartupError {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[allow(clippy::too_many_lines)]
-fn run_placement_probe(job: &CgroupV2Job, probe: &SandboxProbeConfig) -> Result<(), StartupError> {
+fn run_placement_probe(
+    job: &CgroupV2Job,
+    probe: &SandboxProbeConfig,
+    verified_probe: &File,
+) -> Result<KillProbeEvidence, StartupError> {
     let placement = job.prepare_spawn().map_err(|error| {
         StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error)
     })?;
@@ -564,36 +764,88 @@ fn run_placement_probe(job: &CgroupV2Job, probe: &SandboxProbeConfig) -> Result<
         tool_dir: probe.tool_directory.clone(),
         limits: SandboxLimits::default(),
     };
-    let arguments = [OsString::from("write-task")];
-    let mut child = Sandbox::spawn_blocked(&probe.executable, &arguments, &policy, placement)
-        .map_err(|error| {
-            StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error)
-        })?;
-    let status = child
-        .wait_timeout(PROBE_TIMEOUT)
-        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error))?
-        .ok_or_else(|| {
-            StartupError::sandbox_check_failed(
+    let arguments = [OsString::from("resource-tree")];
+    let mut child = Sandbox::spawn_blocked_verified(
+        &probe.executable,
+        verified_probe,
+        &probe.sha256,
+        &arguments,
+        &policy,
+        placement,
+    )
+    .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error))?;
+
+    let action_marker = job_dir.join("tree-pids.txt");
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let action_started = loop {
+        if child
+            .try_wait()
+            .map_err(|error| {
+                StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error)
+            })?
+            .is_some()
+        {
+            return Err(StartupError::sandbox_check_failed(
                 SandboxCheck::PlacementBarrier,
-                "sandbox-child did not finish its startup placement probe",
-            )
-        })?;
-    if !status.success() {
-        return Err(StartupError::sandbox_check_failed(
-            SandboxCheck::PlacementBarrier,
-            format!("sandbox-child write-task exited with {status}"),
-        ));
-    }
-    let output = fs::read(job_dir.join("result.bin"))
-        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::Filesystem, error))?;
-    if output != b"task-output" {
-        return Err(StartupError::sandbox_check_failed(
-            SandboxCheck::Filesystem,
-            "sandbox-child did not produce the expected confined task output",
-        ));
-    }
-    drop(child);
-    Ok(())
+                "sandbox-child resource-tree action exited before cgroup.kill proof",
+            ));
+        }
+        let marker_ready = fs::read_to_string(&action_marker)
+            .ok()
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter(|line| line.parse::<u32>().is_ok())
+                    .count()
+                    >= 3
+            })
+            .unwrap_or(false);
+        let populated = !job
+            .is_empty()
+            .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+        if marker_ready && populated {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(StartupError::sandbox_check_failed(
+                SandboxCheck::PlacementBarrier,
+                "startup resource-tree action did not create a live placed process tree",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let supervisor_live_before_kill = child
+        .try_wait()
+        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::PlacementBarrier, error))?
+        .is_none();
+    let populated_before_kill = !job
+        .is_empty()
+        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+
+    job.kill_all()
+        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+    let reaped_status = child
+        .try_wait()
+        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+    #[cfg(unix)]
+    let supervisor_reaped = reaped_status.as_ref().is_some_and(|status| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(libc::SIGKILL)
+    });
+    #[cfg(not(unix))]
+    let supervisor_reaped = reaped_status.is_some_and(|status| !status.success());
+    let empty_after_kill = job
+        .is_empty()
+        .map_err(|error| StartupError::sandbox_check_failed(SandboxCheck::CgroupKill, error))?;
+
+    Ok(KillProbeEvidence {
+        action_started,
+        supervisor_live_before_kill,
+        populated_before_kill,
+        kill_all_succeeded: true,
+        supervisor_reaped,
+        empty_after_kill,
+    })
 }
 
 #[cfg(all(
@@ -619,7 +871,8 @@ impl Drop for StartupProbeDirectory {
 fn run_placement_probe(
     _job: &CgroupV2Job,
     _probe: &SandboxProbeConfig,
-) -> Result<(), StartupError> {
+    _verified_probe: &File,
+) -> Result<KillProbeEvidence, StartupError> {
     Err(StartupError::sandbox_check_failed(
         SandboxCheck::PlacementBarrier,
         "BLOCKED: the native Task 7 placement probe requires Linux x86_64 or aarch64",
