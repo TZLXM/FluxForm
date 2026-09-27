@@ -2,10 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Desktop probe window drag and event access",
-  "windows": ["*"],
+  "windows": ["probe-primary", "probe-secondary"],
   "permissions": [
-    "core:default",
-    "core:event:default",
-    "core:window:allow-start-dragging"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-start-dragging",
+    "allow-get-probe-snapshot",
+    "allow-record-probe-result",
+    "allow-close-probe-window"
   ]
 }

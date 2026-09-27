@@ -43,6 +43,7 @@
   let appDrops = 0;
   let dpiEvents = 0;
   let monitorMoves = 0;
+  let lastMonitorIdentity = null;
   let backgroundClicks = 0;
   let backgroundDrops = 0;
   let idleTimer = null;
@@ -69,15 +70,27 @@
       setText("window-count", snapshot.probeWindowCount);
       setText("backend-count", snapshot.backendProcessCount);
       setText("helper-count", snapshot.webviewHelperProcessCount);
+      setText("input-region-status", `Native input region: ${snapshot.inputHitRegionStatus}`);
+      setText("provenance-status", snapshot.provenanceVerified
+        ? `Installed package SHA-256: ${snapshot.installedArtifactSha256} · ${snapshot.installIdentity}`
+        : `Installed package provenance unverified: ${snapshot.provenanceError}`);
       const monitor = snapshot.currentMonitorName || "unnamed";
-      setText("display-info", `${Number(snapshot.scaleFactor).toFixed(2)}× / ${snapshot.availableMonitorCount} · ${monitor}`);
+      setText("display-info", `${Number(snapshot.scaleFactor).toFixed(2)}× / ${snapshot.availableMonitorCount} · ${monitor} · ${snapshot.windowPositionX},${snapshot.windowPositionY}`);
+      if (monitorIdentityChanged(lastMonitorIdentity, snapshot.currentMonitorIdentity)) monitorMoves += 1;
+      if (snapshot.currentMonitorIdentity !== null) lastMonitorIdentity = snapshot.currentMonitorIdentity;
       backgroundClicks = snapshot.backgroundClickCount;
       backgroundDrops = snapshot.backgroundDropCount;
       updateCounters();
       const warning = byId("build-warning");
-      if (snapshot.developmentBuild) {
+      if (!snapshot.nativeHitRegionSupported) {
+        warning.hidden = false;
+        warning.textContent = `Native circular input region is unsupported (${snapshot.inputHitRegionStatus}); using a rectangular/closed fallback. This mode cannot PASS.`;
+      } else if (snapshot.developmentBuild) {
         warning.hidden = false;
         warning.textContent = "Development build — not an installed-artifact result. Failed observations may be saved; PASS is blocked.";
+      } else if (!snapshot.provenanceVerified) {
+        warning.hidden = false;
+        warning.textContent = `Installed-package provenance is unavailable or mismatched (${snapshot.provenanceError}); failed observations may be saved, but PASS is blocked.`;
       } else if (snapshot.displayServer === "wayland") {
         warning.hidden = false;
         warning.textContent = "Wayland may restrict global positioning or always-on-top behavior; document these as degraded capabilities in Notes, not generic failures.";
@@ -119,10 +132,15 @@
       void refreshSnapshot();
     }
     if (payload.kind === "moved") {
-      monitorMoves += 1;
       void refreshSnapshot();
     }
     updateCounters();
+  });
+
+  void listen("probe://hit-region-unsupported", ({ payload }) => {
+    const warning = byId("build-warning");
+    warning.hidden = false;
+    warning.textContent = `Native input region failed closed: ${payload}`;
   });
 
   document.addEventListener("keydown", (event) => {
@@ -184,7 +202,13 @@
       os_version: snapshot.osVersion,
       display_server: snapshot.displayServer,
       installed_artifact_sha256: snapshot.installedArtifactSha256,
+      installed_executable_sha256: snapshot.installedExecutableSha256,
+      install_identity: snapshot.installIdentity,
+      provenance_verified: snapshot.provenanceVerified,
+      provenance_error: snapshot.provenanceError,
       installed_launch_path: snapshot.installedLaunchPath,
+      native_hit_region_supported: snapshot.nativeHitRegionSupported,
+      input_hit_region_status: snapshot.inputHitRegionStatus,
       network_disconnected: byId("network-disconnected").checked,
       first_launch_succeeded: byId("first-launch-succeeded").checked,
       transparent_pixels_visible: checks().transparent_pixels_visible,

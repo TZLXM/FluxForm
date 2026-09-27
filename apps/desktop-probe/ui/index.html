@@ -6,6 +6,7 @@
     <meta name="color-scheme" content="dark" />
     <title>FluxForm Desktop Probe</title>
     <link rel="stylesheet" href="styles.css" />
+    <script src="monitor-identity.js" defer></script>
     <script src="probe.js" defer></script>
   </head>
   <body class="probe-surface">
@@ -44,6 +45,8 @@
           <div><span>Background clicks / drops</span><strong id="background-count">0 / 0</strong></div>
           <div><span>DPI / monitor moves</span><strong id="dpi-monitor-count">0 / 0</strong></div>
         </div>
+        <p id="input-region-status" class="microcopy" aria-live="polite">Native input region: loading…</p>
+        <p id="provenance-status" class="microcopy" aria-live="polite">Installed package provenance: loading…</p>
         <p class="microcopy">* System-reported helpers are separate from the FluxForm Rust backend count.</p>
       </section>
 

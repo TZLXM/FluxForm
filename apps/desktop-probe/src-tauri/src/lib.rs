@@ -1,16 +1,20 @@
+use hit_region::{HitRegionController, HitRegionStatus, WindowGeometryEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use tauri::{
     AppHandle, DragDropEvent, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
     WindowEvent,
 };
+
+mod hit_region;
 
 const PROBE_MODES: [&str; 3] = [
     "transparent-orb",
@@ -20,8 +24,8 @@ const PROBE_MODES: [&str; 3] = [
 
 const DISPLAY_SERVERS: [&str; 4] = ["windows", "macos", "x11", "wayland"];
 const BACKGROUND_TARGET_LABEL: &str = "background-target";
+const INSTALLED_PROVENANCE_FILE: &str = "installed-provenance.json";
 
-static NEXT_WINDOW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BACKGROUND_CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -63,7 +67,13 @@ pub struct WindowProbeResult {
     pub os_version: String,
     pub display_server: String,
     pub installed_artifact_sha256: String,
+    pub installed_executable_sha256: String,
+    pub install_identity: String,
+    pub provenance_verified: bool,
+    pub provenance_error: String,
     pub installed_launch_path: String,
+    pub native_hit_region_supported: bool,
+    pub input_hit_region_status: String,
     pub network_disconnected: bool,
     pub first_launch_succeeded: bool,
     pub transparent_pixels_visible: bool,
@@ -101,13 +111,33 @@ impl WindowProbeResult {
         if self.installed_launch_path.trim().is_empty() {
             return Err("installed launch path is required");
         }
-        if self.installed_artifact_sha256.len() != 64
-            || !self
-                .installed_artifact_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        if !is_sha256_hex(&self.installed_executable_sha256) {
+            return Err("installed executable identity must be a SHA-256 hex digest");
+        }
+        if !self.installed_artifact_sha256.is_empty()
+            && !is_sha256_hex(&self.installed_artifact_sha256)
         {
-            return Err("installed artifact identity must be a SHA-256 hex digest");
+            return Err("installer package identity must be empty or a SHA-256 hex digest");
+        }
+        if self.provenance_verified
+            && (!is_sha256_hex(&self.installed_artifact_sha256)
+                || !is_install_identity(&self.install_identity))
+        {
+            return Err("verified provenance requires a package hash and install identity");
+        }
+        let valid_hit_region_status = [
+            "pending",
+            "circular-applied",
+            "rectangular-fallback-unsupported",
+            "rectangular-fallback-apply-failed",
+            "failed-closed",
+            "rectangular",
+            "opaque",
+            "unknown",
+        ]
+        .contains(&self.input_hit_region_status.as_str());
+        if !valid_hit_region_status {
+            return Err("unknown native input hit-region status");
         }
         if !self.idle_cpu_percent.is_finite()
             || self.idle_cpu_percent < 0.0
@@ -118,6 +148,21 @@ impl WindowProbeResult {
         }
         if !self.passed {
             return Ok(());
+        }
+        if !self.provenance_verified {
+            return Err("passing evidence requires a verified installed-package manifest");
+        }
+
+        let expected_hit_region_status = match self.probe_mode.as_str() {
+            "transparent-orb" => "circular-applied",
+            "transparent-window-with-rectangular-hit-region" => "rectangular",
+            "opaque-frameless-fallback" => "opaque",
+            _ => return Err("unknown probe mode"),
+        };
+        if !self.native_hit_region_supported
+            || self.input_hit_region_status != expected_hit_region_status
+        {
+            return Err("passing result requires the selected native input hit region");
         }
 
         if self.repeated_launch_backend_process_count != 1 {
@@ -166,6 +211,107 @@ impl WindowProbeResult {
 
         Ok(())
     }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_install_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledProvenance {
+    schema_version: u32,
+    installer_package_sha256: String,
+    installed_executable_path: String,
+    installed_executable_sha256: String,
+    probe_mode: String,
+    install_identity: String,
+}
+
+#[cfg(test)]
+fn write_installed_provenance_to(
+    directory: &Path,
+    manifest: &InstalledProvenance,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    let path = directory.join(INSTALLED_PROVENANCE_FILE);
+    let json = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let write_result = file
+        .write_all(&json)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all());
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn load_installed_provenance_from(
+    directory: &Path,
+    current_executable: &Path,
+    current_executable_sha256: &str,
+    current_mode: &str,
+) -> Result<InstalledProvenance, String> {
+    let manifest_path = directory.join(INSTALLED_PROVENANCE_FILE);
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("installed provenance manifest is unavailable: {error}"))?;
+    let manifest: InstalledProvenance = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("installed provenance manifest is invalid: {error}"))?;
+    if manifest.schema_version != 1 {
+        return Err("unsupported installed provenance manifest schema".to_owned());
+    }
+    if !is_sha256_hex(&manifest.installer_package_sha256) {
+        return Err("installer package SHA-256 is missing or invalid".to_owned());
+    }
+    if !is_sha256_hex(&manifest.installed_executable_sha256)
+        || !manifest
+            .installed_executable_sha256
+            .eq_ignore_ascii_case(current_executable_sha256)
+    {
+        return Err(
+            "installed executable SHA-256 does not match the running executable".to_owned(),
+        );
+    }
+    if !is_install_identity(&manifest.install_identity) {
+        return Err("installed provenance identity is missing or invalid".to_owned());
+    }
+    if manifest.probe_mode != current_mode {
+        return Err("installed provenance mode does not match this build".to_owned());
+    }
+    let current_path = fs::canonicalize(current_executable)
+        .map_err(|error| format!("could not resolve running executable path: {error}"))?;
+    let recorded_path = PathBuf::from(&manifest.installed_executable_path);
+    if !recorded_path.is_absolute() {
+        return Err("installed provenance executable path must be absolute".to_owned());
+    }
+    let recorded_path = fs::canonicalize(&recorded_path)
+        .map_err(|error| format!("could not resolve recorded executable path: {error}"))?;
+    let paths_match = if cfg!(target_os = "windows") {
+        current_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&recorded_path.to_string_lossy())
+    } else {
+        current_path == recorded_path
+    };
+    if !paths_match {
+        return Err("installed provenance path does not match the running executable".to_owned());
+    }
+    Ok(manifest)
 }
 
 fn write_probe_result_to(directory: &Path, result: &WindowProbeResult) -> io::Result<PathBuf> {
@@ -222,7 +368,13 @@ struct ProbeSnapshot {
     os_version: String,
     display_server: String,
     installed_artifact_sha256: String,
+    installed_executable_sha256: String,
+    install_identity: String,
+    provenance_verified: bool,
+    provenance_error: String,
     installed_launch_path: String,
+    native_hit_region_supported: bool,
+    input_hit_region_status: HitRegionStatus,
     backend_process_count: u32,
     webview_helper_process_count: u32,
     probe_window_count: usize,
@@ -231,6 +383,9 @@ struct ProbeSnapshot {
     background_drop_count: u64,
     available_monitor_count: usize,
     current_monitor_name: Option<String>,
+    current_monitor_identity: Option<String>,
+    window_position_x: i32,
+    window_position_y: i32,
     scale_factor: f64,
     window_label: String,
     development_build: bool,
@@ -241,11 +396,131 @@ struct ProbeIdentity {
     os: String,
     os_version: String,
     display_server: String,
-    artifact_sha256: String,
+    executable_sha256: String,
     executable: PathBuf,
 }
 
 static PROBE_IDENTITY: OnceLock<Result<ProbeIdentity, String>> = OnceLock::new();
+static HIT_REGION_CONTROLLERS: OnceLock<Mutex<HashMap<String, HitRegionController>>> =
+    OnceLock::new();
+
+fn hit_region_controllers() -> &'static Mutex<HashMap<String, HitRegionController>> {
+    HIT_REGION_CONTROLLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn update_hit_region_for_window(
+    window: &WebviewWindow,
+    event: WindowGeometryEvent,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+) -> HitRegionStatus {
+    let mut controllers = hit_region_controllers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let controller = controllers
+        .entry(window.label().to_owned())
+        .or_insert_with(|| HitRegionController::new(PROBE_MODE, std::env::consts::OS));
+    controller.on_window_geometry(
+        event,
+        width,
+        height,
+        scale_factor,
+        |bounds| apply_platform_circle_region(window, bounds),
+        || clear_platform_window_region(window),
+    );
+    controller.status()
+}
+
+fn hit_region_controller_for(window_label: &str) -> HitRegionController {
+    hit_region_controllers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(window_label)
+        .copied()
+        .unwrap_or_else(|| HitRegionController::new(PROBE_MODE, std::env::consts::OS))
+}
+
+fn should_exit_after_probe_destroyed<'a>(
+    window_labels: impl IntoIterator<Item = &'a str>,
+    destroyed_label: &str,
+) -> bool {
+    !window_labels
+        .into_iter()
+        .any(|label| label.starts_with("probe-") && label != destroyed_label)
+}
+
+fn next_probe_window_label<'a>(
+    window_labels: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static str> {
+    let labels = window_labels.into_iter().collect::<Vec<_>>();
+    if !labels.contains(&"probe-primary") {
+        Some("probe-primary")
+    } else if !labels.contains(&"probe-secondary") {
+        Some("probe-secondary")
+    } else {
+        None
+    }
+}
+
+fn is_background_target_window(window_label: &str) -> bool {
+    window_label == BACKGROUND_TARGET_LABEL
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn CreateEllipticRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut std::ffi::c_void;
+    fn DeleteObject(object: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetWindowRgn(
+        window: *mut std::ffi::c_void,
+        region: *mut std::ffi::c_void,
+        redraw: i32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn apply_platform_circle_region(
+    window: &WebviewWindow,
+    (left, top, right, bottom): (i32, i32, i32, i32),
+) -> bool {
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    let region = unsafe { CreateEllipticRgn(left, top, right, bottom) };
+    if region.is_null() {
+        return false;
+    }
+    if unsafe { SetWindowRgn(hwnd.0, region, 1) } == 0 {
+        let _ = unsafe { DeleteObject(region) };
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_platform_circle_region(_window: &WebviewWindow, _bounds: (i32, i32, i32, i32)) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn clear_platform_window_region(window: &WebviewWindow) -> bool {
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    unsafe { SetWindowRgn(hwnd.0, std::ptr::null_mut(), 1) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clear_platform_window_region(_window: &WebviewWindow) -> bool {
+    false
+}
 
 fn command_stdout(program: &str, arguments: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
@@ -285,19 +560,38 @@ fn current_display_server() -> Result<String, String> {
 fn probe_identity() -> Result<ProbeIdentity, String> {
     PROBE_IDENTITY
         .get_or_init(|| {
-            let executable = std::env::current_exe()
-                .map_err(|error| format!("could not resolve running executable: {error}"))?;
-            let executable_bytes = fs::read(&executable)
+            let executable = fs::canonicalize(
+                std::env::current_exe()
+                    .map_err(|error| format!("could not resolve running executable: {error}"))?,
+            )
+            .map_err(|error| format!("could not canonicalize running executable: {error}"))?;
+            let executable_sha256 = sha256_file(&executable)
                 .map_err(|error| format!("could not hash running executable: {error}"))?;
             Ok(ProbeIdentity {
                 os: std::env::consts::OS.to_owned(),
                 os_version: current_os_version()?,
                 display_server: current_display_server()?,
-                artifact_sha256: format!("{:x}", Sha256::digest(executable_bytes)),
+                executable_sha256,
                 executable,
             })
         })
         .clone()
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(target_os = "macos")]
@@ -391,10 +685,24 @@ fn probe_snapshot(app: &AppHandle, window: &WebviewWindow) -> Result<ProbeSnapsh
     let identity = probe_identity()?;
     let (backend_process_count, webview_helper_process_count) =
         process_counts(&identity.executable)?;
-    let current_monitor_name = window
+    let current_monitor = window
         .current_monitor()
-        .map_err(|error| format!("could not read current monitor: {error}"))?
+        .map_err(|error| format!("could not read current monitor: {error}"))?;
+    let current_monitor_name = current_monitor
+        .as_ref()
         .and_then(|monitor| monitor.name().cloned());
+    let current_monitor_identity = current_monitor.as_ref().map(|monitor| {
+        let position = monitor.position();
+        format!(
+            "{}|{}|{}",
+            monitor.name().map(String::as_str).unwrap_or("unnamed"),
+            position.x,
+            position.y
+        )
+    });
+    let window_position = window
+        .outer_position()
+        .map_err(|error| format!("could not read window position: {error}"))?;
     let available_monitor_count = window
         .available_monitors()
         .map_err(|error| format!("could not enumerate monitors: {error}"))?
@@ -402,19 +710,47 @@ fn probe_snapshot(app: &AppHandle, window: &WebviewWindow) -> Result<ProbeSnapsh
     let scale_factor = window
         .scale_factor()
         .map_err(|error| format!("could not read window scale factor: {error}"))?;
+    let provenance = match app.path().app_local_data_dir() {
+        Ok(directory) => load_installed_provenance_from(
+            &directory,
+            &identity.executable,
+            &identity.executable_sha256,
+            PROBE_MODE,
+        ),
+        Err(error) => Err(format!(
+            "could not resolve app-local data directory: {error}"
+        )),
+    };
+    let (installed_artifact_sha256, install_identity, provenance_verified, provenance_error) =
+        match provenance {
+            Ok(manifest) => (
+                manifest.installer_package_sha256.to_ascii_lowercase(),
+                manifest.install_identity,
+                true,
+                String::new(),
+            ),
+            Err(error) => (String::new(), String::new(), false, error),
+        };
     let webview_windows = app.webview_windows();
     let probe_window_count = webview_windows
         .keys()
         .filter(|label| label.starts_with("probe-"))
         .count();
+    let hit_region_controller = hit_region_controller_for(window.label());
 
     Ok(ProbeSnapshot {
         probe_mode: PROBE_MODE,
         os: identity.os,
         os_version: identity.os_version,
         display_server: identity.display_server,
-        installed_artifact_sha256: identity.artifact_sha256,
+        installed_artifact_sha256,
+        installed_executable_sha256: identity.executable_sha256,
+        install_identity,
+        provenance_verified,
+        provenance_error,
         installed_launch_path: identity.executable.to_string_lossy().into_owned(),
+        native_hit_region_supported: hit_region_controller.can_pass(),
+        input_hit_region_status: hit_region_controller.status(),
         backend_process_count,
         webview_helper_process_count,
         probe_window_count,
@@ -423,6 +759,9 @@ fn probe_snapshot(app: &AppHandle, window: &WebviewWindow) -> Result<ProbeSnapsh
         background_drop_count: BACKGROUND_DROP_COUNT.load(Ordering::Relaxed),
         available_monitor_count,
         current_monitor_name,
+        current_monitor_identity,
+        window_position_x: window_position.x,
+        window_position_y: window_position.y,
         scale_factor,
         window_label: window.label().to_owned(),
         development_build: cfg!(debug_assertions),
@@ -434,6 +773,61 @@ fn track_window_events(window: &WebviewWindow, app: &AppHandle) {
     let app_handle = app.clone();
     let event_label = window.label().to_owned();
     window.on_window_event(move |event| {
+        if event_label.starts_with("probe-") {
+            match event {
+                WindowEvent::Resized(size) => {
+                    let scale_factor = event_window.scale_factor().unwrap_or(1.0);
+                    let status = update_hit_region_for_window(
+                        &event_window,
+                        WindowGeometryEvent::Resized,
+                        size.width,
+                        size.height,
+                        scale_factor,
+                    );
+                    if status == HitRegionStatus::FailedClosed {
+                        let _ = event_window.hide();
+                        let _ = app_handle.emit(
+                            "probe://hit-region-unsupported",
+                            "Could not apply or clear the native input region; probe window hidden.",
+                        );
+                    }
+                }
+                WindowEvent::ScaleFactorChanged {
+                    scale_factor,
+                    new_inner_size,
+                    ..
+                } => {
+                    let status = update_hit_region_for_window(
+                        &event_window,
+                        WindowGeometryEvent::ScaleFactorChanged,
+                        new_inner_size.width,
+                        new_inner_size.height,
+                        *scale_factor,
+                    );
+                    if status == HitRegionStatus::FailedClosed {
+                        let _ = event_window.hide();
+                        let _ = app_handle.emit(
+                            "probe://hit-region-unsupported",
+                            "Could not apply or clear the native input region; probe window hidden.",
+                        );
+                    }
+                }
+                WindowEvent::Moved(_) => {
+                    if let (Ok(size), Ok(scale_factor)) =
+                        (event_window.inner_size(), event_window.scale_factor())
+                    {
+                        let _ = update_hit_region_for_window(
+                            &event_window,
+                            WindowGeometryEvent::Moved,
+                            size.width,
+                            size.height,
+                            scale_factor,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         let event_payload = match event {
             WindowEvent::Focused(focused) => Some(json!({"kind": "focused", "focused": focused})),
             WindowEvent::Resized(size) => Some(json!({"kind": "resized", "width": size.width, "height": size.height})),
@@ -484,12 +878,15 @@ fn track_window_events(window: &WebviewWindow, app: &AppHandle) {
         }
 
         if event_label.starts_with("probe-") && matches!(event, WindowEvent::Destroyed) {
-            let remaining_probe_windows = app_handle
-                .webview_windows()
-                .keys()
-                .filter(|label| label.starts_with("probe-"))
-                .count();
-            if remaining_probe_windows <= 1 {
+            hit_region_controllers()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&event_label);
+            let windows = app_handle.webview_windows();
+            if should_exit_after_probe_destroyed(
+                windows.keys().map(String::as_str),
+                &event_label,
+            ) {
                 if let Some(background_target) = app_handle.get_webview_window(BACKGROUND_TARGET_LABEL) {
                     let _ = background_target.close();
                 }
@@ -525,15 +922,28 @@ fn create_background_target(app: &AppHandle) -> tauri::Result<()> {
 pub fn create_probe_window(app: &AppHandle, launch_id: &str) -> tauri::Result<WebviewWindow> {
     create_background_target(app)?;
 
-    let sequence = NEXT_WINDOW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let label = format!("probe-{sequence}");
+    let windows = app.webview_windows();
+    let existing_labels = windows.keys().map(String::as_str).collect::<Vec<_>>();
+    let Some(label) = next_probe_window_label(existing_labels) else {
+        let window = app
+            .get_webview_window("probe-secondary")
+            .or_else(|| app.get_webview_window("probe-primary"))
+            .expect("one of the two fixed probe windows exists");
+        let _ = window.set_focus();
+        return Ok(window);
+    };
+    let is_secondary = label == "probe-secondary";
     let launch_id_script = format!(
         "window.__PROBE_LAUNCH_ID__ = {};",
         serde_json::to_string(launch_id).expect("string serialization is infallible")
     );
     let transparent = PROBE_MODE != "opaque-frameless-fallback";
-    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
-        .title(format!("FluxForm Probe {sequence}"))
+    let window = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+        .title(if is_secondary {
+            "FluxForm Probe 2"
+        } else {
+            "FluxForm Probe 1"
+        })
         .inner_size(360.0, 360.0)
         .min_inner_size(360.0, 360.0)
         .max_inner_size(360.0, 360.0)
@@ -542,20 +952,32 @@ pub fn create_probe_window(app: &AppHandle, launch_id: &str) -> tauri::Result<We
         .transparent(transparent)
         .always_on_top(true)
         .center()
-        .visible(true)
+        .visible(false)
         .focused(true)
         .initialization_script(launch_id_script)
         .build()?;
-    if sequence > 1 {
-        if let Ok(position) = window.outer_position() {
-            let offset = (sequence.saturating_sub(1).min(8) * 28) as i32;
-            let _ = window.set_position(tauri::PhysicalPosition::new(
-                position.x.saturating_add(offset),
-                position.y.saturating_add(offset),
-            ));
-        }
+    if is_secondary && let Ok(position) = window.outer_position() {
+        let offset = 28;
+        let _ = window.set_position(tauri::PhysicalPosition::new(
+            position.x.saturating_add(offset),
+            position.y.saturating_add(offset),
+        ));
     }
     track_window_events(&window, app);
+    let inner_size = window.inner_size()?;
+    let scale_factor = window.scale_factor()?;
+    let status = update_hit_region_for_window(
+        &window,
+        WindowGeometryEvent::Created,
+        inner_size.width,
+        inner_size.height,
+        scale_factor,
+    );
+    if status == HitRegionStatus::FailedClosed {
+        let _ = window.close();
+        return Ok(window);
+    }
+    window.show()?;
     Ok(window)
 }
 
@@ -579,7 +1001,40 @@ fn record_probe_result(
     result.os_version = snapshot.os_version;
     result.display_server = snapshot.display_server;
     result.installed_artifact_sha256 = snapshot.installed_artifact_sha256;
+    result.installed_executable_sha256 = snapshot.installed_executable_sha256;
+    result.install_identity = snapshot.install_identity;
+    result.provenance_verified = snapshot.provenance_verified;
+    result.provenance_error = snapshot.provenance_error.clone();
     result.installed_launch_path = snapshot.installed_launch_path;
+    result.native_hit_region_supported = snapshot.native_hit_region_supported;
+    result.input_hit_region_status = snapshot.input_hit_region_status.as_str().to_owned();
+    if snapshot.development_build {
+        result.passed = false;
+        append_note(
+            &mut result.notes,
+            "development build cannot produce PASS evidence",
+        );
+    }
+    if !snapshot.provenance_verified {
+        result.passed = false;
+        append_note(
+            &mut result.notes,
+            &format!(
+                "installed provenance unverified ({}); PASS disabled",
+                snapshot.provenance_error
+            ),
+        );
+    }
+    if !snapshot.native_hit_region_supported {
+        result.passed = false;
+        append_note(
+            &mut result.notes,
+            &format!(
+                "native input hit region unsupported ({}); PASS disabled",
+                snapshot.input_hit_region_status.as_str()
+            ),
+        );
+    }
     result.repeated_launch_backend_process_count = snapshot.backend_process_count;
     result.webview_helper_process_count = snapshot.webview_helper_process_count;
 
@@ -593,8 +1048,18 @@ fn record_probe_result(
     Ok(path.to_string_lossy().into_owned())
 }
 
+fn append_note(notes: &mut String, note: &str) {
+    if !notes.trim().is_empty() {
+        notes.push_str(" | ");
+    }
+    notes.push_str(note);
+}
+
 #[tauri::command]
-fn record_background_interaction(corner: String) -> Result<u64, String> {
+fn record_background_interaction(window: WebviewWindow, corner: String) -> Result<u64, String> {
+    if !is_background_target_window(window.label()) {
+        return Err("background clicks may only be counted by the background target".to_owned());
+    }
     match corner.as_str() {
         "top-left" | "top-right" | "bottom-left" | "bottom-right" => {
             Ok(BACKGROUND_CLICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1)
@@ -615,9 +1080,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(
             |app, args, _working_directory| {
                 let launch_id = args
-                    .iter()
-                    .skip(1)
-                    .next()
+                    .get(1)
                     .cloned()
                     .unwrap_or_else(|| "secondary-launch".to_owned());
                 if let Err(error) = create_probe_window(app, &launch_id) {
@@ -671,6 +1134,12 @@ mod tests {
     fn passing_result(mode: &str) -> WindowProbeResult {
         let transparent = mode != "opaque-frameless-fallback";
         let orb_hit_testing = mode == "transparent-orb";
+        let hit_region_status = match mode {
+            "transparent-orb" => "circular-applied",
+            "transparent-window-with-rectangular-hit-region" => "rectangular",
+            "opaque-frameless-fallback" => "opaque",
+            _ => "unknown",
+        };
 
         WindowProbeResult {
             probe_mode: mode.to_owned(),
@@ -678,8 +1147,14 @@ mod tests {
             os_version: "Windows 11".to_owned(),
             display_server: "windows".to_owned(),
             installed_artifact_sha256: "0".repeat(64),
+            installed_executable_sha256: "1".repeat(64),
+            install_identity: "task16-test-install".to_owned(),
+            provenance_verified: true,
+            provenance_error: String::new(),
             installed_launch_path: r"C:\Program Files\FluxFormProbe\FluxFormDesktopProbe.exe"
                 .to_owned(),
+            native_hit_region_supported: true,
+            input_hit_region_status: hit_region_status.to_owned(),
             network_disconnected: true,
             first_launch_succeeded: true,
             transparent_pixels_visible: transparent,
@@ -702,6 +1177,270 @@ mod tests {
             passed: true,
             webview_helper_process_count: 3,
         }
+    }
+
+    #[test]
+    fn closing_one_of_two_probe_windows_does_not_exit_before_or_after_registry_removal() {
+        assert!(!should_exit_after_probe_destroyed(
+            ["probe-primary", "probe-secondary"],
+            "probe-primary"
+        ));
+        assert!(!should_exit_after_probe_destroyed(
+            ["probe-secondary"],
+            "probe-primary"
+        ));
+    }
+
+    #[test]
+    fn closing_last_probe_window_exits_before_or_after_registry_removal() {
+        assert!(should_exit_after_probe_destroyed(
+            ["probe-primary"],
+            "probe-primary"
+        ));
+        assert!(should_exit_after_probe_destroyed([], "probe-primary"));
+    }
+
+    #[test]
+    fn fixed_probe_window_labels_are_only_primary_secondary_and_background() {
+        assert_eq!(
+            next_probe_window_label([BACKGROUND_TARGET_LABEL]),
+            Some("probe-primary")
+        );
+        assert_eq!(
+            next_probe_window_label(["probe-primary", BACKGROUND_TARGET_LABEL]),
+            Some("probe-secondary")
+        );
+        assert_eq!(
+            next_probe_window_label(["probe-primary", "probe-secondary", BACKGROUND_TARGET_LABEL]),
+            None
+        );
+    }
+
+    #[test]
+    fn background_click_command_is_restricted_to_the_background_target_window() {
+        assert!(is_background_target_window(BACKGROUND_TARGET_LABEL));
+        assert!(!is_background_target_window("probe-primary"));
+        assert!(!is_background_target_window("probe-secondary"));
+    }
+
+    #[test]
+    fn renderer_capability_is_limited_to_exact_windows_and_never_allows_event_emission() {
+        let probe_capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let target_capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/background-target.json")).unwrap();
+        let windows = probe_capability["windows"].as_array().unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            [Some("probe-primary"), Some("probe-secondary")]
+        );
+        assert_eq!(
+            target_capability["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            [Some(BACKGROUND_TARGET_LABEL)]
+        );
+
+        let probe_permissions = probe_capability["permissions"].as_array().unwrap();
+        let probe_permission_names = probe_permissions
+            .iter()
+            .map(|permission| permission.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let target_permissions = target_capability["permissions"].as_array().unwrap();
+        let target_permission_names = target_permissions
+            .iter()
+            .map(|permission| permission.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            probe_permission_names,
+            [
+                "core:event:allow-listen",
+                "core:event:allow-unlisten",
+                "core:window:allow-start-dragging",
+                "allow-get-probe-snapshot",
+                "allow-record-probe-result",
+                "allow-close-probe-window",
+            ]
+        );
+        assert_eq!(
+            target_permission_names,
+            [
+                "core:event:allow-listen",
+                "core:event:allow-unlisten",
+                "allow-record-background-interaction"
+            ]
+        );
+        for permission_names in [&probe_permission_names, &target_permission_names] {
+            assert!(permission_names.iter().all(|permission| {
+                !permission.ends_with(":default")
+                    && !permission.contains("allow-emit")
+                    && *permission != "core:default"
+            }));
+        }
+        assert!(!probe_permission_names.contains(&"allow-record-background-interaction"));
+        assert!(!target_permission_names.contains(&"allow-record-probe-result"));
+    }
+
+    #[test]
+    fn build_script_autogenerates_acl_for_only_the_registered_probe_commands() {
+        let build_script = include_str!("../build.rs");
+        let commands_section = build_script
+            .split(".commands(&[")
+            .nth(1)
+            .expect("build script must use an explicit app-command manifest")
+            .split("]));")
+            .next()
+            .expect("build script command manifest must close");
+        let commands = commands_section
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|command| command.strip_suffix("\","))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            [
+                "get_probe_snapshot",
+                "record_probe_result",
+                "record_background_interaction",
+                "close_probe_window"
+            ]
+        );
+    }
+
+    fn test_provenance(
+        directory: &Path,
+        executable_path: &Path,
+        executable_hash: &str,
+    ) -> InstalledProvenance {
+        InstalledProvenance {
+            schema_version: 1,
+            installer_package_sha256: "a".repeat(64),
+            installed_executable_path: executable_path.to_string_lossy().into_owned(),
+            installed_executable_sha256: executable_hash.to_owned(),
+            probe_mode: "transparent-orb".to_owned(),
+            install_identity: format!(
+                "task16-{}",
+                directory.file_name().unwrap().to_string_lossy()
+            ),
+        }
+    }
+
+    #[test]
+    fn installed_provenance_matches_package_executable_mode_and_install_identity() {
+        let directory = fresh_temp_dir();
+        let executable = directory.join("installed-probe.exe");
+        fs::write(&executable, b"the exact installed test executable").unwrap();
+        let executable = fs::canonicalize(executable).unwrap();
+        let executable_hash = format!(
+            "{:x}",
+            Sha256::digest(b"the exact installed test executable")
+        );
+        let manifest = test_provenance(&directory, &executable, &executable_hash);
+        write_installed_provenance_to(&directory, &manifest).unwrap();
+
+        let verified = load_installed_provenance_from(
+            &directory,
+            &executable,
+            &executable_hash,
+            "transparent-orb",
+        )
+        .unwrap();
+
+        assert_eq!(verified.installer_package_sha256, "a".repeat(64));
+        assert_eq!(verified.install_identity, manifest.install_identity);
+        remove_temp_dir(directory);
+    }
+
+    #[test]
+    fn missing_external_manifest_keeps_direct_build_tree_execution_unverified() {
+        let directory = fresh_temp_dir();
+        let executable = directory.join("release-build-tree.exe");
+        fs::write(&executable, b"release build tree").unwrap();
+        let executable = fs::canonicalize(executable).unwrap();
+        let executable_hash = format!("{:x}", Sha256::digest(b"release build tree"));
+
+        assert!(
+            load_installed_provenance_from(
+                &directory,
+                &executable,
+                &executable_hash,
+                "transparent-orb",
+            )
+            .is_err()
+        );
+        remove_temp_dir(directory);
+    }
+
+    #[test]
+    fn provenance_tampering_of_package_executable_path_mode_or_install_identity_is_rejected() {
+        let directory = fresh_temp_dir();
+        let executable = directory.join("installed-probe.exe");
+        fs::write(&executable, b"the exact installed test executable").unwrap();
+        let executable = fs::canonicalize(executable).unwrap();
+        let executable_hash = format!(
+            "{:x}",
+            Sha256::digest(b"the exact installed test executable")
+        );
+        let original = test_provenance(&directory, &executable, &executable_hash);
+
+        for tamper in ["package", "executable", "path", "mode", "install"] {
+            let mut manifest = original.clone();
+            match tamper {
+                "package" => manifest.installer_package_sha256 = "not-a-hash".to_owned(),
+                "executable" => manifest.installed_executable_sha256 = "b".repeat(64),
+                "path" => {
+                    manifest.installed_executable_path =
+                        directory.join("other.exe").to_string_lossy().into_owned()
+                }
+                "mode" => manifest.probe_mode = "opaque-frameless-fallback".to_owned(),
+                "install" => manifest.install_identity = "../different-install".to_owned(),
+                _ => unreachable!(),
+            }
+            write_installed_provenance_to(&directory, &manifest).unwrap();
+            assert!(
+                load_installed_provenance_from(
+                    &directory,
+                    &executable,
+                    &executable_hash,
+                    "transparent-orb"
+                )
+                .is_err(),
+                "tampered {tamper} provenance was accepted"
+            );
+            fs::remove_file(directory.join(INSTALLED_PROVENANCE_FILE)).unwrap();
+        }
+
+        remove_temp_dir(directory);
+    }
+
+    #[test]
+    fn external_provenance_manifest_uses_create_new_and_never_overwrites() {
+        let directory = fresh_temp_dir();
+        let executable = directory.join("installed-probe.exe");
+        fs::write(&executable, b"the exact installed test executable").unwrap();
+        let executable = fs::canonicalize(executable).unwrap();
+        let executable_hash = format!(
+            "{:x}",
+            Sha256::digest(b"the exact installed test executable")
+        );
+        let manifest = test_provenance(&directory, &executable, &executable_hash);
+        let path = write_installed_provenance_to(&directory, &manifest).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let error = write_installed_provenance_to(&directory, &manifest).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(path).unwrap(), original);
+        remove_temp_dir(directory);
     }
 
     #[test]
@@ -802,7 +1541,8 @@ mod tests {
 
     #[test]
     fn passing_records_require_each_shared_manual_behavior() {
-        let required_behaviors: [(&str, fn(&mut WindowProbeResult)); 11] = [
+        type BehaviorMutation = (&'static str, fn(&mut WindowProbeResult));
+        let required_behaviors: [BehaviorMutation; 11] = [
             ("network disconnection", |r| r.network_disconnected = false),
             ("first launch", |r| r.first_launch_succeeded = false),
             ("frameless drag", |r| r.frameless_drag_works = false),
@@ -872,6 +1612,18 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_native_hit_region_cannot_pass_but_failed_observation_is_recordable() {
+        let mut result = passing_result("transparent-orb");
+        result.native_hit_region_supported = false;
+        result.input_hit_region_status = "rectangular-fallback-unsupported".to_owned();
+
+        assert!(result.validate().is_err());
+
+        result.passed = false;
+        assert!(result.validate().is_ok());
+    }
+
+    #[test]
     fn failed_observations_remain_recordable_for_fallback_decisions() {
         let mut result = passing_result("transparent-orb");
         result.passed = false;
@@ -895,6 +1647,20 @@ mod tests {
         result.installed_artifact_sha256 = "../outside.json".to_owned();
 
         assert!(result.validate().is_err());
+    }
+
+    #[test]
+    fn unverified_package_provenance_cannot_pass_but_failed_observations_remain_recordable() {
+        let mut result = passing_result("transparent-orb");
+        result.provenance_verified = false;
+        result.provenance_error = "manifest missing".to_owned();
+
+        assert!(result.validate().is_err());
+
+        result.passed = false;
+        result.installed_artifact_sha256.clear();
+        result.install_identity.clear();
+        assert!(result.validate().is_ok());
     }
 
     #[test]
