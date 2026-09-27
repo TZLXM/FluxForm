@@ -10,6 +10,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $PSScriptRoot 'Task16WindowsSafety.psm1') -Force
 
 $expectedInstallerSha256 = '42b5ee0d33ca1b0b3379d916388f083a4844b7dde303459975e7222531d87491'
 $task15StandaloneExecutableSha256 = 'd0ef712d4adc71c3a6a3ecaab7a0e7821323246cdb1c07cbef10c032f2f32b19'
@@ -24,26 +25,11 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
 }
 
 function Get-FullPath([string]$Path) {
-    return [IO.Path]::GetFullPath($Path)
+    return Get-Task16CanonicalPath $Path
 }
 
 function Assert-NoReparsePoints([string]$Path, [switch]$MustExist) {
-    $fullPath = Get-FullPath $Path
-    $root = [IO.Path]::GetPathRoot($fullPath)
-    $current = $root
-    $remainder = $fullPath.Substring($root.Length)
-    foreach ($part in ($remainder -split '[\\/]+' | Where-Object { $_ })) {
-        $current = Join-Path $current $part
-        if (Test-Path -LiteralPath $current) {
-            $attributes = [IO.File]::GetAttributes($current)
-            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Refusing a reparse-point path component: $current"
-            }
-        } elseif ($MustExist) {
-            throw "Required path component does not exist: $current"
-        }
-    }
-    return $fullPath
+    return Assert-Task16NoReparsePoints $Path -MustExist:$MustExist
 }
 
 function Test-PathWithin([string]$Child, [string]$Parent) {
@@ -107,7 +93,8 @@ $installerFullPath = Assert-NoReparsePoints $InstallerPath -MustExist
 if (-not (Test-Path -LiteralPath $installerFullPath -PathType Leaf)) {
     throw "Installer file is missing: $installerFullPath"
 }
-$installerHash = (Get-FileHash -LiteralPath $installerFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$installerHandle = Open-Task16PinnedReadHandle -Path $installerFullPath
+$installerHash = Get-Task16PinnedSha256 -Handle $installerHandle
 if ($installerHash -ne $expectedInstallerSha256) {
     throw "Installer SHA-256 mismatch; expected $expectedInstallerSha256, got $installerHash"
 }
@@ -190,7 +177,7 @@ if ($ResumeFinalize) {
     # NSIS requires /D as the final option. The generated target path contains no spaces.
     $installArgument = '/D=' + $installDirectory
     $installCommand = '"' + $installerFullPath + '" /S ' + $installArgument
-    $installerProcess = Start-Process -FilePath $installerFullPath -ArgumentList @('/S', $installArgument) -PassThru -WindowStyle Hidden
+    $installerProcess = Start-Task16PinnedProcess -Path $installerFullPath -Handle $installerHandle -ExpectedSha256 $expectedInstallerSha256 -ArgumentList @('/S', $installArgument) -WindowStyle Hidden
     $installerProcess.WaitForExit()
     $installerProcessId = $installerProcess.Id
     $installerExitCode = $installerProcess.ExitCode
@@ -222,11 +209,12 @@ if (-not (Test-PathWithin $canonicalExecutable $canonicalInstallDirectory) -or
 }
 Assert-NotBuildTreePath $canonicalExecutable $repositoryRoot
 
-$installedExecutableHash = (Get-FileHash -LiteralPath $canonicalExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+$executableHandle = Open-Task16PinnedReadHandle -Path $canonicalExecutable
+$installedExecutableHash = Get-Task16PinnedSha256 -Handle $executableHandle
 $installedUninstallerHash = (Get-FileHash -LiteralPath $canonicalUninstaller -Algorithm SHA256).Hash.ToLowerInvariant()
 
 # Recheck package identity and shared app-local state immediately before writing either record.
-$finalInstallerHash = (Get-FileHash -LiteralPath $installerFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$finalInstallerHash = Get-Task16PinnedSha256 -Handle $installerHandle
 if ($finalInstallerHash -ne $expectedInstallerSha256 -or $finalInstallerHash -ne $installerHash) {
     throw 'Installer identity changed during verification; refusing to write provenance or launch.'
 }
@@ -275,9 +263,13 @@ $manifest = [ordered]@{
 }
 Write-JsonCreateNew $manifestPath $manifest
 
-# Start only the verified installed path. The machine's WebView2 runtime/network state are not
-# modified or inferred by this verifier.
-$applicationProcess = Start-Process -FilePath $canonicalExecutable -PassThru
+# Start only the verified installed path while its measured file remains open with sharing
+# limited to read access. This prevents write/delete/rename replacement from hash through launch.
+# The machine's WebView2 runtime/network state are not modified or inferred by this verifier.
+$applicationProcess = Start-Task16PinnedProcess -Path $canonicalExecutable -Handle $executableHandle -ExpectedSha256 $installedExecutableHash
+$verifiedApplicationImagePath = Get-Task16ProcessImagePath -Process $applicationProcess
+$executableHandle.Dispose()
+$installerHandle.Dispose()
 
 [ordered]@{
     verifier_status = 'PASS'
@@ -297,6 +289,8 @@ $applicationProcess = Start-Process -FilePath $canonicalExecutable -PassThru
     provenance_create_mode = 'CreateNew'
     launched_pid = $applicationProcess.Id
     launched_path = $canonicalExecutable
+    launched_image_path_verified = $verifiedApplicationImagePath
+    hash_to_launch_lock = 'FileShare.Read handle denied write/delete across hash, process creation, and image-path verification'
     probe_mode = $expectedMode
     network_disconnected_verified = $false
     clean_offline_vm_verified = $false

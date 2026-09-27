@@ -2,11 +2,13 @@
 param(
     [int]$ExpectedProcessId = 40800,
     [string]$InstallId = 'task16-d259e385be404ac78d5191891e100df8',
+    [string]$ObservationId = ('task16-observation-' + [Guid]::NewGuid().ToString('N')),
     [switch]$InventoryOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $PSScriptRoot 'Task16WindowsSafety.psm1') -Force
 
 $expectedInstallerSha256 = '42b5ee0d33ca1b0b3379d916388f083a4844b7dde303459975e7222531d87491'
 $expectedExecutableSha256 = 'b82553e959fe44adfa158839a80da1a3f924998bf0e8fa1286f56707f6dc9949'
@@ -131,13 +133,18 @@ function Write-JsonCreateNew([string]$Path, [object]$Value) {
 }
 
 function Get-Canonical([string]$Path) {
-    return [IO.Path]::GetFullPath($Path)
+    return Get-Task16CanonicalPath $Path
 }
 
 function Get-InstalledProbeProcesses([string]$ExpectedPath) {
-    return @(Get-Process -Name 'fluxform-desktop-probe' -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and $_.Path.Equals($ExpectedPath, [StringComparison]::OrdinalIgnoreCase)
-    })
+    $matches = [Collections.Generic.List[Diagnostics.Process]]::new()
+    foreach ($candidate in @(Get-Process -Name 'fluxform-desktop-probe' -ErrorAction SilentlyContinue)) {
+        $imagePath = Get-Task16ProcessImagePath -Process $candidate
+        if ($imagePath.Equals($ExpectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            $matches.Add($candidate)
+        }
+    }
+    return @($matches)
 }
 
 function Get-ProcessSnapshot([int]$RootProcessId, [string]$ExpectedPath) {
@@ -196,33 +203,73 @@ function Wait-ForCondition([scriptblock]$Condition, [int]$TimeoutSeconds = 10) {
     return (& $Condition)
 }
 
+function Wait-ForNoLateInstalledProcess([string]$ExpectedPath, [int]$WindowSeconds = 5) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($WindowSeconds)
+    $pollCount = 0
+    $lateProcesses = [Collections.Generic.List[object]]::new()
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $current = @(Get-InstalledProbeProcesses $ExpectedPath)
+        $pollCount++
+        if ($current.Count -gt 0) {
+            foreach ($process in $current) {
+                $lateProcesses.Add([pscustomobject]@{ pid = $process.Id; path = Get-Task16ProcessImagePath $process })
+            }
+            return [pscustomobject]@{ passed = $false; poll_count = $pollCount; observed_processes = @($lateProcesses) }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return [pscustomobject]@{ passed = $true; poll_count = $pollCount; observed_processes = @() }
+}
+
 if ($InstallId -ne 'task16-d259e385be404ac78d5191891e100df8') {
     throw 'This observation helper is limited to the exact Task16-created install identity.'
 }
 
-$installDirectory = Get-Canonical (Join-Path $env:LOCALAPPDATA ("Programs\FluxForm-Task16\$InstallId"))
-$executablePath = Get-Canonical (Join-Path $installDirectory $expectedExecutableName)
-$appDataDirectory = Join-Path $env:LOCALAPPDATA 'com.fluxform.desktop-probe'
-$manifestPath = Join-Path $appDataDirectory 'installed-provenance.json'
+$localAppData = Assert-Task16NoReparsePoints -Path $env:LOCALAPPDATA -MustExist
+$installDirectory = Assert-Task16PathWithin -Candidate (Join-Path $localAppData ("Programs\FluxForm-Task16\$InstallId")) -Root $localAppData -MustExist
+$executablePath = Assert-Task16PathWithin -Candidate (Join-Path $installDirectory $expectedExecutableName) -Root $installDirectory -MustExist
+$appDataDirectory = Assert-Task16PathWithin -Candidate (Join-Path $localAppData 'com.fluxform.desktop-probe') -Root $localAppData -MustExist
+$manifestPath = Assert-Task16PathWithin -Candidate (Join-Path $appDataDirectory 'installed-provenance.json') -Root $appDataDirectory -MustExist
 $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-$installerPath = Join-Path $PSScriptRoot '..\target\release\bundle\nsis\FluxForm Desktop Probe_0.1.0_x64-setup.exe'
-$installerHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
-$executableHash = (Get-FileHash -LiteralPath $executablePath -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($installerHash -ne $expectedInstallerSha256 -or $executableHash -ne $expectedExecutableSha256) {
-    throw 'Installed package or executable identity changed after provenance creation.'
+$repositoryRoot = Get-Canonical (Join-Path $PSScriptRoot '..')
+$installerPath = Assert-Task16NoReparsePoints -Path (Join-Path $repositoryRoot 'target\release\bundle\nsis\FluxForm Desktop Probe_0.1.0_x64-setup.exe') -MustExist
+$installerPath = Assert-Task16PathWithin -Candidate $installerPath -Root $repositoryRoot -MustExist
+$installerHandle = Open-Task16PinnedReadHandle -Path $installerPath
+$installerHash = Get-Task16PinnedSha256 -Handle $installerHandle
+if ($installerHash -ne $expectedInstallerSha256) {
+    $installerHandle.Dispose()
+    throw 'Installed package identity changed after provenance creation.'
+}
+if ($manifest.installer_package_sha256 -ne $expectedInstallerSha256 -or
+    -not ([string]$manifest.installed_executable_path).Equals($executablePath, [StringComparison]::OrdinalIgnoreCase) -or
+    $manifest.install_identity -ne $InstallId) {
+    $installerHandle.Dispose()
+    throw 'The fixed provenance manifest no longer matches the exact Task16 install identity.'
+}
+$executableHandle = Open-Task16PinnedReadHandle -Path $executablePath
+$executableHash = Get-Task16PinnedSha256 -Handle $executableHandle
+if ($executableHash -ne $expectedExecutableSha256) {
+    $executableHandle.Dispose()
+    $installerHandle.Dispose()
+    throw 'Installed executable identity changed after provenance creation.'
 }
 if ($manifest.installer_package_sha256 -ne $expectedInstallerSha256 -or
     $manifest.installed_executable_sha256 -ne $expectedExecutableSha256 -or
-    -not ([string]$manifest.installed_executable_path).Equals($executablePath, [StringComparison]::OrdinalIgnoreCase) -or
-    $manifest.install_identity -ne $InstallId) {
+    $manifest.installed_executable_sha256 -ne $executableHash) {
+    $executableHandle.Dispose()
+    $installerHandle.Dispose()
     throw 'The fixed provenance manifest no longer matches the exact Task16 install identity.'
 }
 $process = Get-Process -Id $ExpectedProcessId -ErrorAction Stop
-if (-not $process.Path.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+if (-not (Get-Task16ProcessImagePath -Process $process).Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+    $executableHandle.Dispose()
+    $installerHandle.Dispose()
     throw 'The supplied PID does not resolve to the exact installed executable path.'
 }
 $initialProcesses = @(Get-InstalledProbeProcesses $executablePath)
 if ($initialProcesses.Count -ne 1 -or $initialProcesses[0].Id -ne $ExpectedProcessId) {
+    $executableHandle.Dispose()
+    $installerHandle.Dispose()
     throw "Expected exactly the one task-created installed PID $ExpectedProcessId before observation."
 }
 if ($InventoryOnly) {
@@ -231,12 +278,15 @@ if ($InventoryOnly) {
         process_snapshot = Get-ProcessSnapshot $ExpectedProcessId $executablePath
         top_level_windows = Get-TopLevelWindows $ExpectedProcessId
     } | ConvertTo-Json -Depth 8
+    $executableHandle.Dispose()
+    $installerHandle.Dispose()
     exit 0
 }
 
-$resultDirectory = Join-Path $appDataDirectory 'probe-results'
-$resultPath = Join-Path $resultDirectory ("$expectedMode-windows-$expectedInstallerSha256.json")
-$observationPath = Join-Path $appDataDirectory ("task16-native-observations-$InstallId.json")
+$resultPaths = Get-Task16StructuralPaths -AppDataDirectory $appDataDirectory -ObservationId $ObservationId
+$resultDirectory = Assert-Task16PathWithin -Candidate $resultPaths.Directory -Root $appDataDirectory
+$resultPath = Assert-Task16PathWithin -Candidate $resultPaths.SummaryPath -Root $resultDirectory
+$observationPath = Assert-Task16PathWithin -Candidate $resultPaths.RawPath -Root $resultDirectory
 if (Test-Path -LiteralPath $resultPath) { throw "Refusing to overwrite an existing probe result: $resultPath" }
 if (Test-Path -LiteralPath $observationPath) { throw "Refusing to overwrite existing native observations: $observationPath" }
 
@@ -248,6 +298,8 @@ $repeatLaunchPassed = $false
 $singleClosePassed = $false
 $lastClosePassed = $false
 $forcedTermination = $false
+$noBackendRestartOrLateProcessAfterClose = $false
+$lateProcessMonitor = [pscustomobject]@{ passed = $false; poll_count = 0; observed_processes = @() }
 $lastProcessSnapshot = $null
 $secondProcessSnapshot = $null
 $lastProbeWindowCount = 0
@@ -265,7 +317,7 @@ try {
         throw "Expected one top-level probe window before second launch; observed $($baselineProbeWindows.Count)."
     }
 
-    $secondProcess = Start-Process -FilePath $executablePath -PassThru
+    $secondProcess = Start-Task16PinnedProcess -Path $executablePath -Handle $executableHandle -ExpectedSha256 $executableHash
     $secondProcessId = $secondProcess.Id
     $repeatLaunchPassed = Wait-ForCondition {
         $probeWindows = @(Get-ProbeWindows $ExpectedProcessId)
@@ -311,10 +363,16 @@ try {
             @(Get-InstalledProbeProcesses $executablePath).Count -eq 0
         } 15
     }
+    if ($lastClosePassed) {
+        $lateProcessMonitor = Wait-ForNoLateInstalledProcess -ExpectedPath $executablePath -WindowSeconds 5
+        $noBackendRestartOrLateProcessAfterClose = [bool]$lateProcessMonitor.passed
+    }
     $steps.Add([pscustomobject]@{
         action = 'wm_close_last_probe'
         closed_window = if ($remainingProbeWindows.Count -eq 1) { $remainingProbeWindows[0] } else { $null }
         backend_process_exited = $lastClosePassed
+        no_backend_restart_or_late_process_for_5_seconds = $noBackendRestartOrLateProcessAfterClose
+        late_process_monitor = $lateProcessMonitor
         remaining_probe_processes = @(Get-InstalledProbeProcesses $executablePath | ForEach-Object { [pscustomobject]@{ pid = $_.Id; path = $_.Path } })
     })
     if (-not $lastClosePassed) {
@@ -327,7 +385,12 @@ try {
     # Graceful cleanup is restricted to this exact installed path and task-created process ID(s).
     foreach ($candidateId in @($ExpectedProcessId, $secondProcessId) | Where-Object { $_ }) {
         $candidate = Get-Process -Id ([int]$candidateId) -ErrorAction SilentlyContinue
-        if ($candidate -and $candidate.Path -and $candidate.Path.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+        $candidatePath = $null
+        if ($candidate) {
+            try { $candidatePath = Get-Task16ProcessImagePath -Process $candidate }
+            catch { $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'WM_CLOSE skipped'; reason = 'could not verify process image path' }) }
+        }
+        if ($candidate -and $candidatePath -and $candidatePath.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
             $windows = @([FluxFormTask16.Native]::GetWindowsForProcess([uint32]$candidate.Id))
             foreach ($window in $windows) {
                 if ([FluxFormTask16.Native]::PostClose([long]$window.Handle)) {
@@ -342,7 +405,9 @@ try {
     }
     $allTaskProcesses = @(Get-InstalledProbeProcesses $executablePath)
     foreach ($candidate in $allTaskProcesses) {
-        if ($candidate.Id -in @($ExpectedProcessId, $secondProcessId) -and $candidate.Path -and $candidate.Path.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+        $candidatePath = $null
+        try { $candidatePath = Get-Task16ProcessImagePath -Process $candidate } catch { }
+        if ($candidate.Id -in @($ExpectedProcessId, $secondProcessId) -and $candidatePath -and $candidatePath.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Process -Id $candidate.Id -Force
             $forcedTermination = $true
             $finalCleanup.Add([pscustomobject]@{ pid = $candidate.Id; method = 'Stop-Process -Force'; exact_path_reverified = $true })
@@ -358,12 +423,19 @@ if ($remainingProcesses.Count -gt 0) {
 if ($forcedTermination) {
     $notes.Add('A task-created process required exact-PID forced termination after graceful WM_CLOSE cleanup; see raw observations.')
 }
+if (-not $noBackendRestartOrLateProcessAfterClose) {
+    $notes.Add('No post-close stability interval proved absence of an exact installed backend restart or late process; structural observation PASS is disabled.')
+}
 
 $lastProcessSnapshot = [pscustomobject]@{
     exact_installed_process_count = $remainingProcesses.Count
     exact_installed_process_ids = @($remainingProcesses | ForEach-Object { $_.Id })
     process_closed_after_observation = ($remainingProcesses.Count -eq 0)
     forced_termination_used = $forcedTermination
+    no_backend_restart_or_late_process_after_close = $noBackendRestartOrLateProcessAfterClose
+    post_close_monitor_window_seconds = 5
+    post_close_monitor_poll_count = [int]$lateProcessMonitor.poll_count
+    post_close_process_observations = @($lateProcessMonitor.observed_processes)
     cleanup_actions = @($finalCleanup)
 }
 $nativeRegionPresent = @($regionObservations | Where-Object { $_.get_window_rgn_result -gt 0 }).Count -gt 0
@@ -377,47 +449,43 @@ $notes.Add('The host had WebView2 Runtime 141.0.3537.71 before installation. Net
 $notes.Add('The installed path/process and provenance hashes were checked externally; the probe UI provenance status was not directly observed.')
 $notes.Add('Unobserved fields remain false; idle CPU/GPU values are 0.0 placeholders because the result schema requires numbers, not measurements.')
 
-$probeResult = [ordered]@{
+$observationPassed = Test-Task16ObservationPass -SecondLaunchPassed $repeatLaunchPassed -SingleClosePassed $singleClosePassed -LastClosePassed $lastClosePassed -ProcessClosed ($remainingProcesses.Count -eq 0) -ForcedTermination $forcedTermination -NoLateProcess $noBackendRestartOrLateProcessAfterClose
+$observationResult = [ordered]@{
+    schema_version = 1
+    evidence_type = 'task16.windows.structural-observation'
+    observation_id = $ObservationId
     probe_mode = $expectedMode
-    os = 'windows'
-    os_version = 'Windows 11 Pro for Workstations 25H2 (10.0.26200; 64-bit)'
-    display_server = 'windows'
+    platform = 'windows-x64'
+    observed_at_utc = $startUtc
     installed_artifact_sha256 = $expectedInstallerSha256
-    installed_executable_sha256 = $expectedExecutableSha256
+    installed_executable_path = $executablePath
+    installed_executable_sha256 = $executableHash
     install_identity = $InstallId
-    provenance_verified = $false
-    provenance_error = 'External manifest/path/hash independently verified; in-app provenance status was not readable through the available UI controller.'
-    installed_launch_path = $executablePath
-    native_hit_region_supported = $false
-    input_hit_region_status = 'unknown'
-    network_disconnected = $false
-    first_launch_succeeded = $false
-    transparent_pixels_visible = $false
-    transparent_pixels_click_through = $false
-    frameless_drag_works = $false
-    file_drop_works = $false
-    outside_orb_drop_reached_background_target = $false
-    outside_orb_drop_reached_fluxform = $false
-    focus_recovery_works = $false
-    keyboard_input_works = $false
     repeated_launch_created_second_window = $repeatLaunchPassed
-    repeated_launch_backend_process_count = if ($secondProcessSnapshot) { [uint32]$secondProcessSnapshot.exact_installed_process_count } else { [uint32]0 }
-    single_window_close_works = $singleClosePassed
-    last_window_close_works = $lastClosePassed -and ($remainingProcesses.Count -eq 0)
-    dpi_change_works = $false
-    multi_monitor_move_works = $false
-    idle_cpu_percent = [single]0.0
-    idle_gpu_percent = [single]0.0
-    notes = ($notes -join ' ')
-    passed = $false
-    webview_helper_process_count = if ($secondProcessSnapshot) { [uint32]$secondProcessSnapshot.webview_helper_process_count } else { [uint32]0 }
+    one_backend_after_second_launch = if ($secondProcessSnapshot) { $secondProcessSnapshot.exact_installed_process_count -eq 1 } else { $false }
+    non_last_window_close_left_backend_alive = $singleClosePassed
+    last_window_close_exited_backend = $lastClosePassed -and ($remainingProcesses.Count -eq 0)
+    no_backend_restart_or_late_process_after_close = $noBackendRestartOrLateProcessAfterClose
+    post_close_monitor_window_seconds = 5
+    post_close_monitor_poll_count = [int]$lateProcessMonitor.poll_count
+    forced_termination_used = $forcedTermination
+    process_closed_after_observation = ($remainingProcesses.Count -eq 0)
+    native_region_observations = @($regionObservations)
+    app_window_probe_result_written = $false
+    observation_passed = $observationPassed
+    notes = 'Structural evidence only; visual transparency/input/focus/DPI/multi-monitor/idle-resource and clean offline first launch are not asserted. This journal is not the canonical WindowProbeResult.'
 }
 
 if (-not (Test-Path -LiteralPath $resultDirectory -PathType Container)) {
     [IO.Directory]::CreateDirectory($resultDirectory) | Out-Null
 }
+$null = Assert-Task16PathWithin -Candidate $resultDirectory -Root $appDataDirectory -MustExist
+$null = Assert-Task16PathWithin -Candidate $resultPath -Root $resultDirectory
+$null = Assert-Task16PathWithin -Candidate $observationPath -Root $resultDirectory
 $rawObservations = [ordered]@{
     schema_version = 1
+    evidence_type = 'task16.windows.process-observations'
+    observation_id = $ObservationId
     observed_at_utc = $startUtc
     install_identity = $InstallId
     installer_path = $installerPath
@@ -429,6 +497,9 @@ $rawObservations = [ordered]@{
     second_launch_backend_count_and_window_check_passed = $repeatLaunchPassed
     non_last_wm_close_passed = $singleClosePassed
     last_wm_close_passed = $lastClosePassed -and ($remainingProcesses.Count -eq 0)
+    no_backend_restart_or_late_process_after_close = $noBackendRestartOrLateProcessAfterClose
+    post_close_monitor = $lateProcessMonitor
+    forced_termination_used = $forcedTermination
     native_region_observations = @($regionObservations)
     steps = @($steps)
     cleanup = $lastProcessSnapshot
@@ -436,14 +507,25 @@ $rawObservations = [ordered]@{
     prohibited_inferences = @('visual transparency', 'transparent-pixel click-through', 'drag/drop delivery', 'focus/keyboard', 'DPI/multi-monitor', '60-second idle CPU/GPU', 'network-disconnected first launch')
 }
 Write-JsonCreateNew $observationPath $rawObservations
-Write-JsonCreateNew $resultPath $probeResult
+$null = Assert-Task16PathWithin -Candidate $observationPath -Root $resultDirectory -MustExist
+$null = Assert-Task16PathWithin -Candidate $resultPath -Root $resultDirectory
+Write-JsonCreateNew $resultPath $observationResult
+$null = Assert-Task16PathWithin -Candidate $resultPath -Root $resultDirectory -MustExist
 
-$resultHash = (Get-FileHash -LiteralPath $resultPath -Algorithm SHA256).Hash.ToLowerInvariant()
-$observationsHash = (Get-FileHash -LiteralPath $observationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$resultHashHandle = Open-Task16PinnedReadHandle -Path $resultPath
+$resultHash = Get-Task16PinnedSha256 -Handle $resultHashHandle
+$resultHashHandle.Dispose()
+$observationsHashHandle = Open-Task16PinnedReadHandle -Path $observationPath
+$observationsHash = Get-Task16PinnedSha256 -Handle $observationsHashHandle
+$observationsHashHandle.Dispose()
+$executableHandle.Dispose()
+$installerHandle.Dispose()
+$observationPassed = Test-Task16ObservationPass -SecondLaunchPassed $repeatLaunchPassed -SingleClosePassed $singleClosePassed -LastClosePassed $lastClosePassed -ProcessClosed ($remainingProcesses.Count -eq 0) -ForcedTermination $forcedTermination -NoLateProcess $noBackendRestartOrLateProcessAfterClose
 [ordered]@{
-    observation_status = if ($remainingProcesses.Count -gt 0) { 'FAIL' } elseif ($failure) { 'BLOCKED' } elseif ($repeatLaunchPassed -and $singleClosePassed -and $lastClosePassed) { 'PASS' } else { 'FAIL' }
-    window_probe_result_status = 'BLOCKED'
+    observation_status = if ($failure) { 'BLOCKED' } elseif ($observationPassed) { 'PASS' } else { 'FAIL' }
+    app_window_probe_result_status = 'NOT_WRITTEN'
     passed = $false
+    observation_passed = $observationPassed
     expected_process_id = $ExpectedProcessId
     installed_executable_path = $executablePath
     installed_executable_sha256 = $executableHash
@@ -451,12 +533,16 @@ $observationsHash = (Get-FileHash -LiteralPath $observationPath -Algorithm SHA25
     one_backend_after_second_launch = if ($secondProcessSnapshot) { $secondProcessSnapshot.exact_installed_process_count -eq 1 } else { $false }
     non_last_window_close_left_backend_alive = $singleClosePassed
     last_window_close_exited_backend = $lastClosePassed
+    no_backend_restart_or_late_process_after_close = $noBackendRestartOrLateProcessAfterClose
+    post_close_monitor_window_seconds = 5
+    post_close_monitor_poll_count = [int]$lateProcessMonitor.poll_count
     process_closed_after_observation = ($remainingProcesses.Count -eq 0)
     forced_termination_used = $forcedTermination
     region_observation_count = @($regionObservations).Count
     webview_helper_process_count = if ($secondProcessSnapshot) { $secondProcessSnapshot.webview_helper_process_count } else { 0 }
-    probe_result_path = $resultPath
-    probe_result_sha256 = $resultHash
+    observation_id = $ObservationId
+    structural_result_path = $resultPath
+    structural_result_sha256 = $resultHash
     raw_observations_path = $observationPath
     raw_observations_sha256 = $observationsHash
 } | ConvertTo-Json -Depth 5
