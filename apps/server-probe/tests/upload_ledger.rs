@@ -696,7 +696,7 @@ fn opening_a_legacy_database_applies_a_schema_versioned_migration() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 8,
+        version, 9,
         "the database needs the current committed schema version"
     );
 }

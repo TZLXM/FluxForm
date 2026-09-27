@@ -16,7 +16,7 @@ use crate::auth::Capability;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IP_TEXT_BYTES: usize = 45;
 const MAX_SECRET_ROTATION_KEYS: usize = 4;
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const MAX_CLEANUP_JOBS_PER_PASS: usize = 64;
 const MAX_IDENTITY_SCAN_ENTRIES: usize = 64;
 const MAX_RESERVATION_DIRECTORY_ENTRIES: usize = 4096;
@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS settlement_outbox (
     day INTEGER NOT NULL CHECK (day >= 0),
     actual_bytes INTEGER NOT NULL CHECK (actual_bytes >= 0),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
-    delivery_possible INTEGER NOT NULL DEFAULT 0 CHECK (delivery_possible IN (0, 1))
+    delivery_possible INTEGER NOT NULL DEFAULT 0 CHECK (delivery_possible IN (0, 1)),
+    delivery_attempt_id TEXT
 );
 "#;
 
@@ -456,6 +457,8 @@ impl UploadLedger {
         let had_settlement_outbox = table_exists(&transaction, "settlement_outbox")?;
         let had_delivery_possible = had_settlement_outbox
             && table_has_column(&transaction, "settlement_outbox", "delivery_possible")?;
+        let had_delivery_attempt_id = had_settlement_outbox
+            && table_has_column(&transaction, "settlement_outbox", "delivery_attempt_id")?;
         let had_ip_hashes = table_exists(&transaction, "ip_hashes")?;
         let had_key_id = had_ip_hashes && table_has_column(&transaction, "ip_hashes", "key_id")?;
         transaction.execute_batch(SCHEMA)?;
@@ -494,6 +497,12 @@ impl UploadLedger {
             transaction.execute(
                 "UPDATE settlement_outbox SET delivery_possible = 1 \
                  WHERE session_id IN (SELECT id FROM uploads WHERE state = 'uploaded')",
+                [],
+            )?;
+        }
+        if had_settlement_outbox && !had_delivery_attempt_id {
+            transaction.execute(
+                "ALTER TABLE settlement_outbox ADD COLUMN delivery_attempt_id TEXT",
                 [],
             )?;
         }
@@ -549,12 +558,14 @@ impl UploadLedger {
             None,
             MAX_STARTUP_SETTLEMENT_RECOVERIES,
             true,
+            None,
         )?;
         expire_abandoned_sessions_in_transaction(&transaction, current_unix_seconds())?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         ledger.validate_startup_invariants(&transaction)?;
         transaction.commit()?;
-        ledger.acknowledge_delivery_possible_settlements(MAX_STARTUP_SETTLEMENT_RECOVERIES)?;
+        ledger
+            .acknowledge_delivery_possible_settlements(MAX_STARTUP_SETTLEMENT_RECOVERIES, true)?;
         ledger.reconcile_cleanup_jobs()?;
         ledger.reconcile_unreferenced_files()?;
         Ok(ledger)
@@ -1182,13 +1193,72 @@ impl UploadLedger {
         Ok(receipt)
     }
 
-    /// Records that Hyper may now deliver a 204 response. Once this durable
-    /// marker is committed, recovery preserves the Uploaded row and retries
-    /// only the identity-verified acknowledgment.
+    /// Reserves this Uploaded settlement for one HTTP delivery attempt.
+    ///
+    /// Persisting the attempt before the delivery marker lets timeout handling
+    /// choose a durable abort outcome. A competing request cannot claim the
+    /// same settlement while that outcome is being classified.
+    pub(crate) fn begin_settlement_delivery_attempt(
+        &self,
+        session_id: i64,
+        attempt_id: &str,
+    ) -> Result<(), LimitError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String = transaction.query_row(
+            "SELECT state FROM uploads WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if UploadState::from_str(&state)? != UploadState::Uploaded {
+            return Err(LimitError::InvalidTransition);
+        }
+        let changed = transaction.execute(
+            "UPDATE settlement_outbox SET delivery_attempt_id = ?1 \
+             WHERE session_id = ?2 AND delivery_attempt_id IS NULL AND delivery_possible = 0",
+            params![attempt_id, session_id],
+        )?;
+        if changed != 1 {
+            return Err(LimitError::InvalidTransition);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Records that Hyper may now deliver a 204 response. Once this conditional
+    /// marker commits, recovery preserves the Uploaded row and retries only
+    /// the identity-verified acknowledgment. `attempt_id` makes the marker
+    /// mutually exclusive with a timeout abort for the same delivery.
     pub(crate) fn mark_settlement_delivery_possible(
         &self,
         session_id: i64,
+        attempt_id: &str,
     ) -> Result<(), LimitError> {
+        self.mark_settlement_delivery_possible_inner(session_id, attempt_id, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_settlement_delivery_possible_with_hook<F>(
+        &self,
+        session_id: i64,
+        attempt_id: &str,
+        before_commit: F,
+    ) -> Result<(), LimitError>
+    where
+        F: FnOnce(),
+    {
+        self.mark_settlement_delivery_possible_inner(session_id, attempt_id, before_commit)
+    }
+
+    fn mark_settlement_delivery_possible_inner<F>(
+        &self,
+        session_id: i64,
+        attempt_id: &str,
+        before_commit: F,
+    ) -> Result<(), LimitError>
+    where
+        F: FnOnce(),
+    {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, relative_path): (String, Option<String>) = transaction.query_row(
@@ -1203,14 +1273,74 @@ impl UploadLedger {
         let file =
             self.open_verified_reservation_file(relative_path.as_deref(), &expected_file_identity)?;
         let changed = transaction.execute(
-            "UPDATE settlement_outbox SET delivery_possible = 1 WHERE session_id = ?1",
-            [session_id],
+            "UPDATE settlement_outbox SET delivery_possible = 1 \
+             WHERE session_id = ?1 AND delivery_attempt_id = ?2 AND delivery_possible = 0",
+            params![session_id, attempt_id],
         )?;
         if changed != 1 {
             return Err(LimitError::InvalidTransition);
         }
+        before_commit();
         transaction.commit()?;
         drop(file);
+        Ok(())
+    }
+
+    /// Durably classifies an unsuccessful delivery attempt and refunds its
+    /// settlement. The marker and this abort serialize in SQLite's immediate
+    /// transaction: either abort removes the pending row before a marker can
+    /// commit, or it observes and compensates a late marker. A caller may send
+    /// a definitive 503 only after this transaction commits.
+    pub(crate) fn abort_settlement_delivery_attempt(
+        &self,
+        session_id: i64,
+        attempt_id: &str,
+        deadline: Instant,
+    ) -> Result<(), LimitError> {
+        if Instant::now() >= deadline {
+            return Err(LimitError::OperationTimedOut);
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // BEGIN IMMEDIATE can itself wait behind a non-cancellable marker
+        // transaction. Never let that late waiter turn an already-ambiguous
+        // transport outcome into a durable abort after its response deadline.
+        if Instant::now() >= deadline {
+            return Err(LimitError::OperationTimedOut);
+        }
+        let changed = transaction.execute(
+            "UPDATE settlement_outbox SET delivery_possible = 0 \
+             WHERE session_id = ?1 AND delivery_attempt_id = ?2",
+            params![session_id, attempt_id],
+        )?;
+        if changed == 0 {
+            let already_compensated: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM uploads \
+                 WHERE id = ?1 AND state = 'expired' AND actual_bytes IS NULL AND reserved_bytes = 0) \
+                 AND NOT EXISTS(SELECT 1 FROM settlement_outbox WHERE session_id = ?1)",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            if already_compensated {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(LimitError::InvalidTransition);
+        }
+        let compensated = recover_unacknowledged_settlements_in_transaction(
+            &transaction,
+            None,
+            1,
+            true,
+            Some(session_id),
+        )?;
+        if compensated != 1 {
+            return Err(LimitError::AccountingInvariant);
+        }
+        if Instant::now() >= deadline {
+            return Err(LimitError::OperationTimedOut);
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1252,16 +1382,20 @@ impl UploadLedger {
     fn acknowledge_delivery_possible_settlements(
         &self,
         maximum: usize,
+        include_crash_ambiguous_attempts: bool,
     ) -> Result<usize, LimitError> {
         let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
         let session_ids = {
             let connection = self.connect()?;
             let mut statement = connection.prepare(
-                "SELECT session_id FROM settlement_outbox WHERE delivery_possible = 1 \
-                 ORDER BY created_at, session_id LIMIT ?1",
+                "SELECT session_id FROM settlement_outbox \
+                 WHERE delivery_possible = 1 AND (?1 = 1 OR delivery_attempt_id IS NULL) \
+                 ORDER BY created_at, session_id LIMIT ?2",
             )?;
             statement
-                .query_map([limit], |row| row.get::<_, i64>(0))?
+                .query_map(params![include_crash_ambiguous_attempts, limit], |row| {
+                    row.get::<_, i64>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         if session_ids.len() > maximum {
@@ -1773,10 +1907,11 @@ impl UploadLedger {
             Some(now.saturating_sub(SETTLEMENT_ACK_GRACE_SECONDS)),
             MAX_CLEANUP_JOBS_PER_PASS,
             false,
+            None,
         )?;
         expire_abandoned_sessions_excluding_in_transaction(&transaction, now, active_uploads)?;
         transaction.commit()?;
-        self.acknowledge_delivery_possible_settlements(MAX_CLEANUP_JOBS_PER_PASS)?;
+        self.acknowledge_delivery_possible_settlements(MAX_CLEANUP_JOBS_PER_PASS, false)?;
         self.reconcile_cleanup_jobs()
     }
 
@@ -2567,15 +2702,18 @@ fn recover_unacknowledged_settlements_in_transaction(
     created_at_before: Option<i64>,
     maximum: usize,
     fail_closed_on_overflow: bool,
+    only_session_id: Option<i64>,
 ) -> Result<usize, LimitError> {
     let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
     let rows = {
         let mut statement = transaction.prepare(
             "SELECT session_id, day, actual_bytes, delivery_possible FROM settlement_outbox \
-             WHERE (?1 IS NULL OR created_at <= ?1) ORDER BY created_at, session_id LIMIT ?2",
+             WHERE (?1 IS NULL OR created_at <= ?1) \
+               AND (?2 IS NULL OR session_id = ?2) \
+             ORDER BY created_at, session_id LIMIT ?3",
         )?;
         statement
-            .query_map(params![created_at_before, limit], |row| {
+            .query_map(params![created_at_before, only_session_id, limit], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,

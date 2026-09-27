@@ -8,6 +8,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -167,6 +169,12 @@ pub struct ServerState {
     resources: Arc<Mutex<ResourceCatalog>>,
     #[cfg(test)]
     test_acknowledgement_gate: Option<(Arc<Notify>, Arc<Semaphore>)>,
+    #[cfg(test)]
+    test_delivery_marker_transaction_gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
+    #[cfg(test)]
+    test_delivery_marker_result_gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
+    #[cfg(test)]
+    test_delivery_abort_started: Option<Arc<Notify>>,
 }
 
 impl ServerState {
@@ -214,6 +222,12 @@ impl ServerState {
             resources: Arc::new(Mutex::new(ResourceCatalog::default())),
             #[cfg(test)]
             test_acknowledgement_gate: None,
+            #[cfg(test)]
+            test_delivery_marker_transaction_gate: None,
+            #[cfg(test)]
+            test_delivery_marker_result_gate: None,
+            #[cfg(test)]
+            test_delivery_abort_started: None,
         })
     }
 
@@ -1044,11 +1058,69 @@ where
                                 .get::<SettlementAckCandidate>()
                             {
                                 let session_id = candidate.0;
+                                let attempt_id = Uuid::new_v4().to_string();
                                 let ledger = state.ledger.clone();
+                                let begin_attempt_id = attempt_id.clone();
+                                let begin_deadline = tokio::time::Instant::now()
+                                    + state.storage_operation_timeout;
+                                let delivery_attempt = run_storage(
+                                    &state,
+                                    begin_deadline,
+                                    move || {
+                                        ledger.begin_settlement_delivery_attempt(
+                                            session_id,
+                                            &begin_attempt_id,
+                                        )
+                                    },
+                                )
+                                .await;
+                                if !matches!(delivery_attempt, Ok(Ok(()))) {
+                                    return Err::<Response<HttpBody>, io::Error>(io::Error::other(
+                                        "upload delivery attempt could not be durably started",
+                                    ));
+                                }
+
+                                let ledger = state.ledger.clone();
+                                #[cfg(test)]
+                                let transaction_gate =
+                                    state.test_delivery_marker_transaction_gate.clone();
+                                #[cfg(test)]
+                                let result_gate = state.test_delivery_marker_result_gate.clone();
+                                let marker_attempt_id = attempt_id.clone();
                                 let deadline = tokio::time::Instant::now()
                                     + state.storage_operation_timeout;
                                 let delivery_marker = run_storage(&state, deadline, move || {
-                                    ledger.mark_settlement_delivery_possible(session_id)
+                                    let attempt_id = marker_attempt_id;
+                                    #[cfg(test)]
+                                    let result = if let Some((entered, release)) = transaction_gate {
+                                        ledger.mark_settlement_delivery_possible_with_hook(
+                                            session_id,
+                                            &attempt_id,
+                                            move || {
+                                                entered.wait();
+                                                release.wait();
+                                            },
+                                        )
+                                    } else {
+                                        ledger.mark_settlement_delivery_possible(
+                                            session_id,
+                                            &attempt_id,
+                                        )
+                                    };
+                                    #[cfg(not(test))]
+                                    let result = ledger.mark_settlement_delivery_possible(
+                                        session_id,
+                                        &attempt_id,
+                                    );
+
+                                    #[cfg(test)]
+                                    if result.is_ok()
+                                        && let Some((entered, release)) = result_gate
+                                    {
+                                        entered.wait();
+                                        release.wait();
+                                    }
+                                    result
                                 })
                                 .await;
                                 let marked = matches!(delivery_marker, Ok(Ok(())));
@@ -1061,11 +1133,51 @@ where
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .push(session_id);
                                 } else {
-                                    response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
-                                    add_common_headers(&mut response);
+                                    #[cfg(test)]
+                                    if let Some(abort_started) =
+                                        &state.test_delivery_abort_started
+                                    {
+                                        abort_started.notify_one();
+                                    }
+                                    let ledger = state.ledger.clone();
+                                    let abort_attempt_id = attempt_id.clone();
+                                    let abort_deadline = tokio::time::Instant::now()
+                                        + state.storage_operation_timeout;
+                                    let abort_std_deadline = abort_deadline.into_std();
+                                    let abort = run_storage(
+                                        &state,
+                                        abort_deadline,
+                                        move || {
+                                            ledger.abort_settlement_delivery_attempt(
+                                                session_id,
+                                                &abort_attempt_id,
+                                                abort_std_deadline,
+                                            )
+                                        },
+                                    )
+                                    .await;
+                                    if matches!(abort, Ok(Ok(()))) {
+                                        response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+                                        add_common_headers(&mut response);
+                                        response.headers_mut().insert(
+                                            CONNECTION,
+                                            HeaderValue::from_static("close"),
+                                        );
+                                    } else {
+                                        // Without a committed abort the marker may
+                                        // still win after this task returns. An
+                                        // HTTP failure would falsely classify that
+                                        // ambiguous outcome, so terminate transport
+                                        // without a response instead.
+                                        return Err::<Response<HttpBody>, io::Error>(
+                                            io::Error::other(
+                                                "upload delivery outcome could not be durably classified",
+                                            ),
+                                        );
+                                    }
                                 }
                             }
-                            Ok::<_, Infallible>(response)
+                            Ok::<_, io::Error>(response)
                         }
                     });
                     let mut builder = http1::Builder::new();
@@ -2396,6 +2508,255 @@ mod late_completion_tests {
 
         shutdown.send(()).unwrap();
         assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn marker_timeout_returns_closed_503_and_does_not_preserve_late_commit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (temp, ledger, mut state) = test_state();
+        state.storage_operation_timeout = Duration::from_millis(100);
+        let abort_started = Arc::new(Notify::new());
+        state.test_delivery_abort_started = Some(Arc::clone(&abort_started));
+        let marker_entered = Arc::new(Barrier::new(2));
+        let marker_release = Arc::new(Barrier::new(2));
+        state.test_delivery_marker_transaction_gate =
+            Some((Arc::clone(&marker_entered), Arc::clone(&marker_release)));
+        let (reservation, capability) = ledger
+            .reserve_with_upload_capability(
+                "127.0.0.1",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_with_shutdown(listener, state.clone(), async move {
+            let _ = shutdown_receiver.await;
+        }));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "PUT /v1/upload-sessions/{}/content HTTP/1.1\r\nHost: localhost\r\nOrigin: https://flux.test\r\nAuthorization: Bearer {}\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\nxGET /v1/upload-sessions/999/content HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            reservation.session_id,
+            capability.token()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let entered = Arc::clone(&marker_entered);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || entered.wait()),
+        )
+        .await
+        .expect("delivery marker transaction must reach its deterministic pause")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), abort_started.notified())
+            .await
+            .expect("timeout handling must begin its durable abort before releasing the marker");
+        let release = Arc::clone(&marker_release);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .expect("the classified failure must close the connection")
+            .unwrap();
+        let response_text = String::from_utf8_lossy(&response);
+        let header = response_text.split("\r\n\r\n").next().unwrap_or_default();
+        assert!(
+            header.starts_with("HTTP/1.1 503 "),
+            "unexpected response: {header}"
+        );
+        assert!(
+            header
+                .to_ascii_lowercase()
+                .contains("\r\nconnection: close"),
+            "the replacement response must close the connection: {header}"
+        );
+        assert_eq!(response_text.matches("HTTP/1.1 ").count(), 1);
+
+        let worker_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        assert!(state.worker_tracker.wait_until_idle(worker_deadline).await);
+        ledger
+            .reconcile_cleanup_job(reservation.session_id)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            crate::ledger::UploadState::Expired,
+            "a failed delivery attempt must not remain Uploaded"
+        );
+        let (reserved, actual, expires_at, settlement_rows, cleanup_rows, used):
+            (i64, Option<i64>, i64, i64, i64, i64) = Connection::open(ledger.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT uploads.reserved_bytes, uploads.actual_bytes, capabilities.expires_at, \
+                 (SELECT COUNT(*) FROM settlement_outbox WHERE session_id = uploads.id), \
+                 (SELECT COUNT(*) FROM cleanup_outbox WHERE session_id = uploads.id), \
+                 COALESCE((SELECT SUM(used_bytes) FROM daily_usage), 0) \
+                 FROM uploads JOIN capabilities ON capabilities.token_hash = uploads.capability_hash \
+                 WHERE uploads.id = ?1",
+                [reservation.session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                reserved,
+                actual,
+                expires_at,
+                settlement_rows,
+                cleanup_rows,
+                used
+            ),
+            (0, None, 0, 0, 0, 0)
+        );
+        assert!(!reservation.upload_path.exists());
+
+        shutdown.send(()).unwrap();
+        assert!(server.await.unwrap().is_ok());
+        drop(temp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unclassifiable_marker_timeout_closes_without_status_and_reopens_as_ambiguous() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (temp, ledger, mut state) = test_state();
+        state.storage_operation_timeout = Duration::from_millis(100);
+        let marker_entered = Arc::new(Barrier::new(2));
+        let marker_release = Arc::new(Barrier::new(2));
+        state.test_delivery_marker_result_gate =
+            Some((Arc::clone(&marker_entered), Arc::clone(&marker_release)));
+        let (reservation, capability) = ledger
+            .reserve_with_upload_capability(
+                "127.0.0.1",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_with_shutdown(listener, state.clone(), async move {
+            let _ = shutdown_receiver.await;
+        }));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "PUT /v1/upload-sessions/{}/content HTTP/1.1\r\nHost: localhost\r\nOrigin: https://flux.test\r\nAuthorization: Bearer {}\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\nx",
+            reservation.session_id,
+            capability.token()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let entered = Arc::clone(&marker_entered);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || entered.wait()),
+        )
+        .await
+        .expect("the delivery marker must commit before its result is paused")
+        .unwrap();
+
+        let (possible, attempt_id): (i64, Option<String>) =
+            Connection::open(ledger.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT delivery_possible, delivery_attempt_id FROM settlement_outbox \
+                 WHERE session_id = ?1",
+                    [reservation.session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(possible, 1, "the marker has committed before the pause");
+        assert!(attempt_id.is_some(), "the route attempt must remain pinned");
+        ledger.reconcile_expired_sessions().unwrap();
+        let settlement_rows: i64 = Connection::open(ledger.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_outbox WHERE session_id = ?1",
+                [reservation.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            settlement_rows, 1,
+            "periodic reconciliation must not ACK an in-flight delivery attempt"
+        );
+        let lock = Connection::open(ledger.database_path()).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .expect("an unclassifiable outcome must close promptly")
+            .unwrap();
+        assert!(
+            response.is_empty(),
+            "no definitive HTTP failure is safe here"
+        );
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        let release = Arc::clone(&marker_release);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        let worker_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        assert!(state.worker_tracker.wait_until_idle(worker_deadline).await);
+        shutdown.send(()).unwrap();
+        assert!(server.await.unwrap().is_ok());
+        drop(state);
+        drop(ledger);
+
+        let database_path = temp.path().join("ledger.sqlite3");
+        let upload_root = temp.path().join("uploads");
+        let reopened = UploadLedger::open(
+            database_path,
+            upload_root,
+            LedgerLimits {
+                max_file_bytes: 4,
+                daily_quota_bytes: 20,
+                max_active_sessions_per_ip: 4,
+                max_global_reserved_bytes: 20,
+                disk_safety_margin_bytes: 0,
+            },
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .state(reservation.session_id, &reservation.session_token)
+                .unwrap(),
+            crate::ledger::UploadState::Uploaded,
+            "without a durable abort, restart must preserve delivery ambiguity"
+        );
+        assert!(reservation.upload_path.exists());
+        assert_eq!(reopened.reserved_bytes().unwrap(), 0);
+        let usage: i64 = Connection::open(reopened.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(used_bytes), 0) FROM daily_usage",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 1);
+        drop(reopened);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
