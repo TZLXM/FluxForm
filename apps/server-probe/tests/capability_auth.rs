@@ -26,6 +26,7 @@ const DEFAULT_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
 struct Harness {
     _temp: TempDir,
     database_path: PathBuf,
+    artifact_root: PathBuf,
     ledger: UploadLedger,
     capabilities: CapabilityStore,
     state: ServerState,
@@ -62,6 +63,7 @@ impl Harness {
             vec![[0x41; 32]],
         )
         .unwrap();
+        let artifact_root = std::fs::canonicalize(upload_root.join(".fluxform-artifacts")).unwrap();
         let capabilities = CapabilityStore::open(&database_path).unwrap();
         let state = ServerState::new(
             ledger.clone(),
@@ -75,6 +77,7 @@ impl Harness {
         Self {
             _temp: temp,
             database_path,
+            artifact_root,
             ledger,
             capabilities,
             state,
@@ -331,8 +334,8 @@ async fn every_protected_route_enforces_scope_subject_and_expiration() {
                     ("job-a".to_owned(), None)
                 }
                 Endpoint::Download => {
-                    let first = harness._temp.path().join("first.bin");
-                    let second = harness._temp.path().join("second.bin");
+                    let first = harness.artifact_root.join("first.bin");
+                    let second = harness.artifact_root.join("second.bin");
                     std::fs::write(&first, b"first artifact").unwrap();
                     std::fs::write(&second, b"second artifact").unwrap();
                     harness
@@ -886,7 +889,7 @@ async fn bearer_tokens_are_rejected_in_paths_and_queries() {
 #[tokio::test]
 async fn artifact_download_returns_the_registered_file_with_secure_headers() {
     let harness = Harness::new(8, vec![]);
-    let artifact_path = harness._temp.path().join("result.bin");
+    let artifact_path = harness.artifact_root.join("result.bin");
     std::fs::write(&artifact_path, b"download bytes").unwrap();
     harness
         .state

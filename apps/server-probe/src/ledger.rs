@@ -289,7 +289,7 @@ pub struct LedgerLimits {
     pub disk_safety_margin_bytes: u64,
 }
 
-struct SecureReservationDirectory {
+pub(crate) struct SecureReservationDirectory {
     handle: fs::File,
 }
 
@@ -311,6 +311,7 @@ impl DiskSpaceProvider for SystemDiskSpace {
 pub struct UploadLedger {
     database_path: PathBuf,
     upload_root: PathBuf,
+    artifact_root: PathBuf,
     upload_root_directory: Arc<SecureReservationDirectory>,
     reservation_directory: Arc<SecureReservationDirectory>,
     limits: LedgerLimits,
@@ -425,10 +426,25 @@ impl UploadLedger {
         let reservation_directory = Arc::new(
             SecureReservationDirectory::open(&reservations_dir).map_err(LimitError::Filesystem)?,
         );
+        let artifact_root = upload_root.join(".fluxform-artifacts");
+        match fs::create_dir(&artifact_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(LimitError::Filesystem(error)),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700))
+                .map_err(LimitError::Filesystem)?;
+        }
+        // Verify and pin a non-reparse managed root before the service starts.
+        let _ = SecureReservationDirectory::open(&artifact_root).map_err(LimitError::Filesystem)?;
 
         let ledger = Self {
             database_path: database_path.as_ref().to_path_buf(),
             upload_root,
+            artifact_root,
             upload_root_directory,
             reservation_directory,
             limits,
@@ -654,6 +670,10 @@ impl UploadLedger {
 
     pub(crate) fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    pub(crate) fn artifact_root(&self) -> &Path {
+        &self.artifact_root
     }
 
     fn reserve_internal_until(
@@ -2448,7 +2468,7 @@ where
     let mut before_unlink = Some(before_unlink);
     let scan_deadline = Instant::now() + IDENTITY_SCAN_TIMEOUT;
 
-    match directory.open_file(preferred_leaf, false) {
+    match directory.open_readonly_file(preferred_leaf) {
         Ok(file) if file_identity(&file)? == expected_identity => {
             if file_link_count(&file)? > 1 {
                 return Err(io::Error::new(
@@ -2481,7 +2501,7 @@ where
                 "pinned upload identity scan exceeded its time bound",
             ));
         }
-        match directory.open_file(candidate, false) {
+        match directory.open_readonly_file(candidate) {
             Ok(file) if file_identity(&file)? == expected_identity => {
                 matches.push(candidate.clone())
             }
@@ -2574,7 +2594,7 @@ where
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         }
-        let moved = match directory.open_file(&quarantine, false) {
+        let moved = match directory.open_readonly_file(&quarantine) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -2600,7 +2620,7 @@ where
         if let Some(before_unlink) = before_unlink.take() {
             before_unlink();
         }
-        let verified = match directory.open_file(&quarantine, false) {
+        let verified = match directory.open_readonly_file(&quarantine) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -2917,7 +2937,7 @@ fn is_managed_reservation_leaf(leaf: &str) -> bool {
 
 impl SecureReservationDirectory {
     #[cfg(unix)]
-    fn open(path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
 
         let handle = fs::OpenOptions::new()
@@ -2968,6 +2988,21 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(unix)]
+    pub(crate) fn open_readonly_file(&self, leaf: &str) -> io::Result<fs::File> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let leaf = CString::new(leaf)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"))?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(self.handle.as_raw_fd(), leaf.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    #[cfg(unix)]
     fn rename_file(&self, from: &str, to: &str) -> io::Result<()> {
         use std::ffi::CString;
         use std::os::fd::AsRawFd;
@@ -2992,7 +3027,7 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(windows)]
-    fn open(path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::FromRawHandle;
 
@@ -3077,6 +3112,11 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(windows)]
+    pub(crate) fn open_readonly_file(&self, leaf: &str) -> io::Result<fs::File> {
+        windows_open_relative_file(&self.handle, leaf, false, false, true)
+    }
+
+    #[cfg(windows)]
     fn open_file_for_delete(&self, leaf: &str) -> io::Result<fs::File> {
         windows_open_relative_file(&self.handle, leaf, false, true, false)
     }
@@ -3087,7 +3127,7 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn open(_path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "secure reservation directory handles are unsupported",
@@ -3111,6 +3151,14 @@ impl SecureReservationDirectory {
     }
 
     #[cfg(not(any(unix, windows)))]
+    pub(crate) fn open_readonly_file(&self, _leaf: &str) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure relative file access is unsupported",
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn open_directory_child(&self, _leaf: &str) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -3126,6 +3174,36 @@ impl SecureReservationDirectory {
 
     fn remove_file(&self, leaf: &str) -> io::Result<()> {
         secure_unlink(&self.handle, leaf)
+    }
+
+    pub(crate) fn remove_named_file_if_identity(
+        &self,
+        leaf: &str,
+        expected_identity: &[u8],
+    ) -> io::Result<()> {
+        if expected_identity.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed artifact has no pinned file identity",
+            ));
+        }
+        let pinned = self.open_readonly_file(leaf)?;
+        if file_identity(&pinned)? != expected_identity || file_link_count(&pinned)? > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed artifact identity changed or is ambiguous",
+            ));
+        }
+        drop(pinned);
+        let mut before_unlink = Some(|| {});
+        if remove_identity_entry(self, leaf, expected_identity, &mut before_unlink)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "managed artifact disappeared before cleanup",
+            ))
+        }
     }
 
     #[cfg(unix)]
@@ -3454,7 +3532,7 @@ fn windows_open_relative_file(
     let desired_access = if delete_access {
         0x0001_0000 | 0x0080 | 0x0010_0000
     } else {
-        0x0002 | 0x0080 | 0x0100 | 0x0010_0000
+        0x0001 | 0x0002 | 0x0080 | 0x0100 | 0x0010_0000
     };
     let status = unsafe {
         NtCreateFile(
@@ -4019,7 +4097,7 @@ fn current_unix_seconds() -> i64 {
 }
 
 #[cfg(unix)]
-fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
+pub(crate) fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
@@ -4031,7 +4109,7 @@ fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
+pub(crate) fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -4087,7 +4165,7 @@ fn file_identity(file: &fs::File) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_file: &fs::File) -> io::Result<Vec<u8>> {
+pub(crate) fn file_identity(_file: &fs::File) -> io::Result<Vec<u8>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "stable file identities are unsupported on this platform",
@@ -4095,14 +4173,14 @@ fn file_identity(_file: &fs::File) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn file_link_count(file: &fs::File) -> io::Result<u64> {
+pub(crate) fn file_link_count(file: &fs::File) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
 
     Ok(file.metadata()?.nlink())
 }
 
 #[cfg(windows)]
-fn file_link_count(file: &fs::File) -> io::Result<u64> {
+pub(crate) fn file_link_count(file: &fs::File) -> io::Result<u64> {
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -4153,7 +4231,7 @@ fn file_link_count(file: &fs::File) -> io::Result<u64> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_link_count(_file: &fs::File) -> io::Result<u64> {
+pub(crate) fn file_link_count(_file: &fs::File) -> io::Result<u64> {
     Ok(1)
 }
 

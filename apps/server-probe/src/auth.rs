@@ -113,18 +113,6 @@ impl CapabilityStore {
         }
         Ok(found)
     }
-
-    pub(crate) fn latest_expiry_for_subject(
-        &self,
-        subject: &str,
-    ) -> Result<Option<i64>, CapabilityError> {
-        let connection = self.connect()?;
-        Ok(connection.query_row(
-            "SELECT MAX(expires_at) FROM capabilities WHERE subject = ?1",
-            [subject],
-            |row| row.get(0),
-        )?)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

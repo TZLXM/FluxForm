@@ -198,7 +198,7 @@ impl ServerState {
         if trusted_proxy_cidrs.len() > MAX_TRUSTED_PROXY_CIDRS {
             return Err(RouteConfigurationError::InvalidConfiguration);
         }
-        let events = EventStore::open(ledger.database_path())
+        let events = EventStore::open(ledger.database_path(), ledger.artifact_root())
             .map_err(|_| RouteConfigurationError::StorageUnavailable)?;
         if !events.shares_database_with(ledger.database_path()) {
             return Err(RouteConfigurationError::InvalidConfiguration);
@@ -363,12 +363,7 @@ impl ServerState {
         let content_type = HeaderValue::from_str(content_type)
             .map_err(|_| RouteConfigurationError::InvalidConfiguration)?;
         let filename = safe_download_filename(filename);
-        let artifact_subject = format!("artifact:{artifact_id}");
-        let expires_at = self
-            .capabilities
-            .latest_expiry_for_subject(&artifact_subject)
-            .map_err(|_| RouteConfigurationError::StorageUnavailable)?
-            .unwrap_or(self.default_event_expiry()?);
+        let expires_at = self.default_event_expiry()?;
         self.events
             .register_job_artifact(
                 job_id,
@@ -1729,18 +1724,10 @@ async fn cancel_job(
     let events = state.events.clone();
     let owned_job_id = job_id.to_owned();
     let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
-    run_storage(state, deadline, move || {
-        let snapshot = events.snapshot(&owned_job_id)?;
-        if snapshot.data.get("state").and_then(Value::as_str) == Some("cancelled") {
-            return Ok(());
-        }
-        let data = json!({"job_id": owned_job_id, "state": "cancelled"});
-        events.append(&owned_job_id, "job.state_changed", &data, &data)?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| HttpError::storage_unavailable())?
-    .map_err(map_event_store_error)?;
+    run_storage(state, deadline, move || events.cancel(&owned_job_id))
+        .await
+        .map_err(|_| HttpError::storage_unavailable())?
+        .map_err(map_event_store_error)?;
     Ok(empty_response(StatusCode::ACCEPTED))
 }
 
@@ -1756,11 +1743,12 @@ async fn download_artifact(
     let events = state.events.clone();
     let owned_artifact_id = artifact_id.to_owned();
     let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
-    let artifact = run_storage(state, deadline, move || events.artifact(&owned_artifact_id))
-        .await
-        .map_err(|_| HttpError::storage_unavailable())?
-        .map_err(map_event_store_error)?;
-    let bytes = std::fs::read(&artifact.path).map_err(|_| HttpError::storage_unavailable())?;
+    let (artifact, bytes) = run_storage(state, deadline, move || {
+        events.read_artifact(&owned_artifact_id)
+    })
+    .await
+    .map_err(|_| HttpError::storage_unavailable())?
+    .map_err(map_event_store_error)?;
     let mut response = Response::new(full_body(Bytes::from(bytes)));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -2295,20 +2283,25 @@ fn map_event_store_error(error: EventStoreError) -> HttpError {
         | EventStoreError::Capacity
         | EventStoreError::RevisionExhausted
         | EventStoreError::InvalidRecord
+        | EventStoreError::InvalidTransition
+        | EventStoreError::Filesystem(_)
+        | EventStoreError::CapabilityMissing
         | EventStoreError::Corrupt => HttpError::storage_unavailable(),
     }
 }
 
 fn map_event_configuration_error(error: EventStoreError) -> RouteConfigurationError {
     match error {
-        EventStoreError::InvalidRecord | EventStoreError::JobNotFound => {
-            RouteConfigurationError::InvalidConfiguration
-        }
+        EventStoreError::InvalidRecord
+        | EventStoreError::InvalidTransition
+        | EventStoreError::CapabilityMissing
+        | EventStoreError::JobNotFound => RouteConfigurationError::InvalidConfiguration,
         EventStoreError::Storage(_)
         | EventStoreError::FutureRevision
         | EventStoreError::Expired
         | EventStoreError::Capacity
         | EventStoreError::RevisionExhausted
+        | EventStoreError::Filesystem(_)
         | EventStoreError::Corrupt => RouteConfigurationError::StorageUnavailable,
     }
 }
