@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::ledger::{SecureReservationDirectory, file_identity};
+use crate::ledger::{IdentityCleanupPage, SecureReservationDirectory, file_identity};
 
 // SQLite serializes writers. The bounded listener storage deadline is five
 // seconds; allow short bursts of independent event workers to queue without
@@ -25,10 +25,12 @@ const MAX_EVENT_TYPE_BYTES: usize = 64;
 const MAX_FILENAME_BYTES: usize = 255;
 const MAX_CONTENT_TYPE_BYTES: usize = 256;
 const MAX_ARTIFACT_PATH_BYTES: usize = 4096;
+const MAX_IDENTITY_SCAN_CURSOR_BYTES: usize = 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_CLEANUPS: i64 = 4096;
 const MAX_EXPIRY_BATCH: usize = 32;
 const MAX_LINK_CAPABILITY_ROWS: i64 = 256;
+const IDENTITY_REVIEW_BACKOFF_SECONDS: i64 = 24 * 60 * 60;
 
 const EVENT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS event_jobs (
@@ -65,6 +67,8 @@ CREATE TABLE IF NOT EXISTS event_expiry_outbox (
     file_identity BLOB NOT NULL CHECK (length(file_identity) BETWEEN 1 AND 64),
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     next_attempt_at INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_at >= 0),
+    scan_cursor TEXT CHECK (scan_cursor IS NULL OR length(CAST(scan_cursor AS BLOB)) <= 1024),
+    scan_pass INTEGER NOT NULL DEFAULT 0 CHECK (scan_pass IN (0, 1)),
     PRIMARY KEY (job_id, artifact_id)
 );
 "#;
@@ -182,6 +186,10 @@ impl EventStore {
             && table_has_column(&transaction, "event_expiry_outbox", "attempt_count")?;
         let has_outbox_next_attempt = has_expiry_outbox
             && table_has_column(&transaction, "event_expiry_outbox", "next_attempt_at")?;
+        let has_outbox_scan_cursor = has_expiry_outbox
+            && table_has_column(&transaction, "event_expiry_outbox", "scan_cursor")?;
+        let has_outbox_scan_pass = has_expiry_outbox
+            && table_has_column(&transaction, "event_expiry_outbox", "scan_pass")?;
         transaction.execute_batch(EVENT_SCHEMA)?;
         if has_jobs && !has_worker_lease {
             transaction.execute(
@@ -240,6 +248,18 @@ impl EventStore {
         if has_expiry_outbox && !has_outbox_next_attempt {
             transaction.execute(
                 "ALTER TABLE event_expiry_outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if has_expiry_outbox && !has_outbox_scan_cursor {
+            transaction.execute(
+                "ALTER TABLE event_expiry_outbox ADD COLUMN scan_cursor TEXT",
+                [],
+            )?;
+        }
+        if has_expiry_outbox && !has_outbox_scan_pass {
+            transaction.execute(
+                "ALTER TABLE event_expiry_outbox ADD COLUMN scan_pass INTEGER NOT NULL DEFAULT 0 CHECK (scan_pass IN (0, 1))",
                 [],
             )?;
         }
@@ -929,6 +949,8 @@ impl EventStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut report = ExpiryReport::default();
+        let cleanup_capacity_available =
+            i64::from(pending_cleanup_count(&transaction)? < MAX_PENDING_CLEANUPS);
 
         let expired_jobs = {
             let mut statement = transaction.prepare(
@@ -936,15 +958,21 @@ impl EventStore {
                         event_jobs.retain_until, event_jobs.retention_seconds, \
                         event_artifacts.artifact_id, event_artifacts.path, event_artifacts.file_identity \
                  FROM event_jobs LEFT JOIN event_artifacts ON event_artifacts.job_id = event_jobs.job_id \
-                 WHERE (event_jobs.worker_lease_until > 0 AND event_jobs.worker_lease_until <= ?1) \
-                    OR (event_jobs.worker_lease_until = 0 AND event_jobs.retain_until <= ?1) \
+                 WHERE ((event_jobs.worker_lease_until > 0 AND event_jobs.worker_lease_until <= ?1) \
+                    OR (event_jobs.worker_lease_until = 0 AND event_jobs.retain_until <= ?1)) \
+                 AND (?2 = 1 OR event_artifacts.file_identity IS NULL \
+                      OR (event_jobs.worker_lease_until > 0 AND event_jobs.worker_lease_until <= ?1)) \
                  ORDER BY CASE WHEN event_jobs.worker_lease_until > 0 \
                                THEN event_jobs.worker_lease_until ELSE event_jobs.retain_until END, \
-                          event_jobs.job_id LIMIT ?2",
+                          event_jobs.job_id LIMIT ?3",
             )?;
             statement
                 .query_map(
-                    params![now, i64::try_from(MAX_EXPIRY_BATCH).unwrap_or(i64::MAX)],
+                    params![
+                        now,
+                        cleanup_capacity_available,
+                        i64::try_from(MAX_EXPIRY_BATCH).unwrap_or(i64::MAX)
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1036,11 +1064,17 @@ impl EventStore {
         let standalone_artifacts = {
             let mut statement = transaction.prepare(
                 "SELECT artifact_id, path, file_identity FROM event_artifacts \
-                 WHERE job_id IS NULL AND expires_at <= ?1 ORDER BY expires_at, artifact_id LIMIT ?2",
+                 WHERE job_id IS NULL AND expires_at <= ?1 \
+                   AND (?2 = 1 OR file_identity IS NULL) \
+                 ORDER BY expires_at, artifact_id LIMIT ?3",
             )?;
             statement
                 .query_map(
-                    params![now, i64::try_from(MAX_EXPIRY_BATCH).unwrap_or(i64::MAX)],
+                    params![
+                        now,
+                        cleanup_capacity_available,
+                        i64::try_from(MAX_EXPIRY_BATCH).unwrap_or(i64::MAX)
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1091,7 +1125,7 @@ impl EventStore {
         let pending = {
             let connection = self.connect()?;
             let mut statement = connection.prepare(
-                "SELECT job_id, artifact_id, path, file_identity, attempt_count \
+                "SELECT job_id, artifact_id, path, file_identity, attempt_count, scan_cursor, scan_pass \
                  FROM event_expiry_outbox WHERE file_identity IS NOT NULL AND next_attempt_at <= ?1 \
                  ORDER BY next_attempt_at, job_id, artifact_id LIMIT ?2",
             )?;
@@ -1105,6 +1139,8 @@ impl EventStore {
                             row.get::<_, String>(2)?,
                             row.get::<_, Vec<u8>>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, i64>(6)?,
                         ))
                     },
                 )?
@@ -1112,17 +1148,74 @@ impl EventStore {
         };
         let mut deleted = 0usize;
         let mut retryable = 0usize;
-        for (job_id, artifact_id, path, identity, attempt_count) in pending {
+        for (job_id, artifact_id, path, identity, attempt_count, scan_cursor, scan_pass) in pending
+        {
+            if !(0..=1).contains(&scan_pass)
+                || scan_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.len() > MAX_IDENTITY_SCAN_CURSOR_BYTES)
+            {
+                return Err(EventStoreError::Corrupt);
+            }
             let leaf = Path::new(&path)
                 .file_name()
                 .and_then(|leaf| leaf.to_str())
                 .ok_or(EventStoreError::Corrupt)?;
-            match self
-                .artifact_directory
-                .remove_named_file_if_identity(leaf, &identity)
-            {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            let cleanup = self.artifact_directory.remove_named_file_if_identity_page(
+                leaf,
+                &identity,
+                scan_cursor.as_deref(),
+            );
+            match cleanup {
+                Ok(IdentityCleanupPage::Removed) => {}
+                Ok(IdentityCleanupPage::Continue(next_cursor)) => {
+                    retryable = retryable.saturating_add(1);
+                    if next_cursor.is_some() {
+                        let connection = self.connect()?;
+                        connection.execute(
+                            "UPDATE event_expiry_outbox SET scan_cursor = ?1, next_attempt_at = ?2 \
+                             WHERE job_id = ?3 AND artifact_id = ?4",
+                            params![next_cursor, now, job_id, artifact_id],
+                        )?;
+                    } else if scan_cursor.is_some() && scan_pass == 0 {
+                        // The sorted scan reached its end; make one bounded
+                        // wraparound pass before classifying the identity as
+                        // absent, so directory changes cannot hide earlier names.
+                        let connection = self.connect()?;
+                        connection.execute(
+                            "UPDATE event_expiry_outbox SET scan_cursor = NULL, scan_pass = 1, next_attempt_at = ?1 \
+                             WHERE job_id = ?2 AND artifact_id = ?3",
+                            params![now, job_id, artifact_id],
+                        )?;
+                    } else {
+                        let next_attempt = attempt_count.saturating_add(1);
+                        let next_at = now.saturating_add(IDENTITY_REVIEW_BACKOFF_SECONDS);
+                        let connection = self.connect()?;
+                        connection.execute(
+                            "UPDATE event_expiry_outbox SET attempt_count = ?1, next_attempt_at = ?2, \
+                                 scan_cursor = NULL, scan_pass = 0 \
+                             WHERE job_id = ?3 AND artifact_id = ?4",
+                            params![next_attempt, next_at, job_id, artifact_id],
+                        )?;
+                    }
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // NotFound means the bounded scan completed and did not
+                    // find the pinned identity. Keep the durable intent for
+                    // manual recovery; absence is never proof of deletion.
+                    retryable = retryable.saturating_add(1);
+                    let next_attempt = attempt_count.saturating_add(1);
+                    let next_at = now.saturating_add(IDENTITY_REVIEW_BACKOFF_SECONDS);
+                    let connection = self.connect()?;
+                    connection.execute(
+                        "UPDATE event_expiry_outbox SET attempt_count = ?1, next_attempt_at = ?2, \
+                             scan_cursor = NULL, scan_pass = 0 \
+                         WHERE job_id = ?3 AND artifact_id = ?4",
+                        params![next_attempt, next_at, job_id, artifact_id],
+                    )?;
+                    continue;
+                }
                 Err(_) => {
                     retryable = retryable.saturating_add(1);
                     let next_attempt = attempt_count.saturating_add(1);

@@ -49,3 +49,25 @@
 - `cargo test --offline --target-dir E:\aicode\FluxForm\target\task13-final --workspace -- --skip every_approved_native_profile_has_a_current_sample_report`: exited 0. The separate native-profile evidence sentinel was explicitly skipped; the approved-ffprobe integration test remains ignored pending approved artifact/sample evidence.
 - `cargo fmt --all -- --check`, workspace Clippy with `--all-targets -- -D warnings`, and `git diff --check`: passed.
 - Tests ran on the Windows native filesystem. No network or new dependencies were used. No native deployment/artifact evidence is claimed.
+
+## Task 13 review fix 2 — 2026-09-27
+
+### Changes and recovery guarantees
+
+- Artifact cleanup now tries the recorded normalized leaf first, then reuses Task 12's pinned-root, bounded identity scan. It deletes only the persisted exact identity, including after a pure rename; replacements and unrelated files remain untouched. The bounded page cursor and scan phase are persisted so a restart resumes after the last inspected page and wraps once before classifying a missing identity.
+- A complete identity-absence scan no longer drops the outbox record. It preserves the cleanup intent, resets scan state, records an attempt, and backs off for 24 hours for manual recovery. Intermediate pages are immediately eligible on a later bounded pass; transient filesystem failures retain their scan position and use retry backoff.
+- Expiry selection now detects a full cleanup outbox and filters out linked identity-bearing terminal records before the 32-row batch limit. Stale worker lease transitions, artifact-free terminal records, and legacy metadata without an identity remain eligible. Identity-bearing expiry still checks capacity in the same immediate transaction before revoking capabilities or deleting metadata, so a blocked row remains atomic. Repeated reopened passes make progress after capacity returns.
+- Cursor storage is byte-bounded, and the cleanup queue and directory scan remain bounded. No dependencies or lockfiles changed.
+
+### RED / GREEN evidence
+
+- Before implementation, four new recovery cases failed as expected: pure rename left the artifact behind; the restart/page test found no `scan_cursor` column; true identity absence deleted its outbox intent; and a 4,096-row full backlog left a stale worker running behind its first 32 blocked links.
+- GREEN verifies pure-rename cleanup, later-page cleanup after reopening, a full multi-page absent-identity scan followed by long backoff and continued artifact registration, and a full-backlog test with 40 linked rows plus later stale/no-file records. It checks fair progress over 40 fresh-store passes. The replacement-file test now asserts the renamed pinned original is removed while the replacement remains.
+
+### Verification
+
+- `cargo test --offline --target-dir E:\aicode\FluxForm\target\task13-final -p fluxform-server-probe --test sse_recovery`: passed, 25/25.
+- `cargo test --offline --target-dir E:\aicode\FluxForm\target\task13-final -p fluxform-server-probe`: passed, 130 tests across unit and integration suites (27 unit, 22 capability/auth, 25 SSE recovery, 24 upload HTTP, 32 upload ledger).
+- `cargo test --offline --target-dir E:\aicode\FluxForm\target\task13-final --workspace -- --skip every_approved_native_profile_has_a_current_sample_report`: exited 0. The native-profile sentinel was explicitly skipped; the approved-ffprobe artifact test remains ignored pending approved artifact/sample evidence.
+- `cargo fmt --all -- --check`, workspace Clippy with `--all-targets -- -D warnings`, and `git diff --check`: passed.
+- Tests ran on the Windows native filesystem. No network or new dependencies were used. No native deployment/artifact evidence is claimed.

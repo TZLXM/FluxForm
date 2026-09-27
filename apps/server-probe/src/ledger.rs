@@ -2444,7 +2444,7 @@ where
     }
 }
 
-enum IdentityCleanupPage {
+pub(crate) enum IdentityCleanupPage {
     Removed,
     Continue(Option<String>),
 }
@@ -3176,34 +3176,13 @@ impl SecureReservationDirectory {
         secure_unlink(&self.handle, leaf)
     }
 
-    pub(crate) fn remove_named_file_if_identity(
+    pub(crate) fn remove_named_file_if_identity_page(
         &self,
         leaf: &str,
         expected_identity: &[u8],
-    ) -> io::Result<()> {
-        if expected_identity.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed artifact has no pinned file identity",
-            ));
-        }
-        let pinned = self.open_readonly_file(leaf)?;
-        if file_identity(&pinned)? != expected_identity || file_link_count(&pinned)? > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed artifact identity changed or is ambiguous",
-            ));
-        }
-        drop(pinned);
-        let mut before_unlink = Some(|| {});
-        if remove_identity_entry(self, leaf, expected_identity, &mut before_unlink)? {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "managed artifact disappeared before cleanup",
-            ))
-        }
+        scan_cursor: Option<&str>,
+    ) -> io::Result<IdentityCleanupPage> {
+        remove_file_if_identity_page(self, leaf, expected_identity, scan_cursor, || {})
     }
 
     #[cfg(unix)]

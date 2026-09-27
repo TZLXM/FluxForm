@@ -865,8 +865,186 @@ async fn artifact_download_refuses_a_replacement_file_after_store_reopen() {
         "cleanup must not delete a replacement"
     );
     assert!(
-        moved_original.exists(),
-        "cleanup does not guess a renamed pathname"
+        !moved_original.exists(),
+        "cleanup removes the exact pinned identity from its renamed path"
+    );
+}
+
+#[test]
+fn cleanup_follows_a_purely_renamed_artifact_by_persisted_identity() {
+    let harness = Harness::new(Duration::from_secs(3600));
+    let original_path = harness.artifact_root.join("original.bin");
+    let renamed_path = harness.artifact_root.join("renamed.bin");
+    std::fs::write(&original_path, b"exact artifact identity").unwrap();
+    let store = event_store(&harness);
+    store
+        .register_artifact(
+            "artifact-renamed",
+            PathBuf::from("original.bin").as_path(),
+            "artifact.bin",
+            "application/octet-stream",
+            0,
+        )
+        .unwrap();
+    std::fs::rename(&original_path, &renamed_path).unwrap();
+
+    let report = store.reconcile_expired().unwrap();
+
+    assert!(
+        !renamed_path.exists(),
+        "cleanup follows only the pinned identity"
+    );
+    assert_eq!(report.cleanup_pending, 0);
+}
+
+#[test]
+fn cleanup_cursor_survives_reopen_until_a_renamed_identity_is_found() {
+    let harness = Harness::new(Duration::from_secs(3600));
+    for index in 0..96 {
+        std::fs::write(
+            harness.artifact_root.join(format!("a-{index:03}.bin")),
+            b"unrelated",
+        )
+        .unwrap();
+    }
+    let original_path = harness.artifact_root.join("origin.bin");
+    let renamed_path = harness.artifact_root.join("z-renamed.bin");
+    std::fs::write(&original_path, b"exact late-page identity").unwrap();
+    let store = event_store(&harness);
+    store
+        .register_artifact(
+            "artifact-late-rename",
+            PathBuf::from("origin.bin").as_path(),
+            "artifact.bin",
+            "application/octet-stream",
+            0,
+        )
+        .unwrap();
+    std::fs::rename(&original_path, &renamed_path).unwrap();
+
+    store.reconcile_expired().unwrap();
+    let connection = Connection::open(&harness.database_path).unwrap();
+    let cursor: Option<String> = connection
+        .query_row(
+            "SELECT scan_cursor FROM event_expiry_outbox WHERE artifact_id = 'artifact-late-rename'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        cursor.is_some(),
+        "first bounded page persists its continuation"
+    );
+    drop(store);
+
+    event_store(&harness).reconcile_expired().unwrap();
+
+    assert!(
+        !renamed_path.exists(),
+        "reopened cleanup reaches the later page"
+    );
+    let pending: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_expiry_outbox WHERE artifact_id = 'artifact-late-rename'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[test]
+fn complete_identity_absence_keeps_a_long_backoff_intent_without_blocking_registration() {
+    let harness = Harness::new(Duration::from_secs(3600));
+    for index in 0..96 {
+        std::fs::write(
+            harness
+                .artifact_root
+                .join(format!("unrelated-{index:03}.bin")),
+            b"must remain untouched",
+        )
+        .unwrap();
+    }
+    let missing_path = harness.artifact_root.join("missing.bin");
+    std::fs::write(&missing_path, b"gone before cleanup").unwrap();
+    let store = event_store(&harness);
+    store
+        .register_artifact(
+            "artifact-missing",
+            PathBuf::from("missing.bin").as_path(),
+            "missing.bin",
+            "application/octet-stream",
+            0,
+        )
+        .unwrap();
+    std::fs::remove_file(&missing_path).unwrap();
+
+    let first_report = store.reconcile_expired().unwrap();
+    let connection = Connection::open(&harness.database_path).unwrap();
+    let (first_cursor, first_pass): (Option<String>, i64) = connection
+        .query_row(
+            "SELECT scan_cursor, scan_pass FROM event_expiry_outbox WHERE artifact_id = 'artifact-missing'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(first_cursor.is_some());
+    assert_eq!(first_pass, 0);
+    event_store(&harness).reconcile_expired().unwrap();
+    let wrapped_pass: (Option<String>, i64) = connection
+        .query_row(
+            "SELECT scan_cursor, scan_pass FROM event_expiry_outbox WHERE artifact_id = 'artifact-missing'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(wrapped_pass, (None, 1));
+    event_store(&harness).reconcile_expired().unwrap();
+    event_store(&harness).reconcile_expired().unwrap();
+    let (attempt_count, next_attempt_at): (i64, i64) = connection
+        .query_row(
+            "SELECT attempt_count, next_attempt_at FROM event_expiry_outbox \
+             WHERE artifact_id = 'artifact-missing'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    assert_eq!(first_report.cleanup_pending, 1);
+    assert_eq!(attempt_count, 1);
+    assert!(
+        next_attempt_at > now + 3600,
+        "complete absence backs off for manual recovery"
+    );
+
+    event_store(&harness).reconcile_expired().unwrap();
+    let attempts_after_backoff_pass: i64 = connection
+        .query_row(
+            "SELECT attempt_count FROM event_expiry_outbox WHERE artifact_id = 'artifact-missing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts_after_backoff_pass, 1);
+
+    let live_path = harness.artifact_root.join("later-live.bin");
+    std::fs::write(&live_path, b"service still admits work").unwrap();
+    assert!(
+        store
+            .register_artifact(
+                "artifact-later-live",
+                PathBuf::from("later-live.bin").as_path(),
+                "later-live.bin",
+                "application/octet-stream",
+                now + 3600,
+            )
+            .is_ok()
     );
 }
 
@@ -937,6 +1115,145 @@ fn full_cleanup_backlog_defers_expiry_without_partially_revoking_a_linked_artifa
     assert_eq!(jobs, 1);
     assert_eq!(artifacts, 1);
     assert_eq!(linked_capabilities, 3);
+}
+
+#[test]
+fn full_cleanup_backlog_scans_past_blocked_links_and_reopens_fairly() {
+    const BLOCKED_LINKS: usize = 40;
+    let harness = Harness::new(Duration::from_secs(3600));
+    for index in 0..BLOCKED_LINKS {
+        let job_id = format!("blocked-job-{index:03}");
+        let artifact_id = format!("blocked-artifact-{index:03}");
+        harness.state.register_job(&job_id, "completed").unwrap();
+        harness.issue(&format!("job:{job_id}"), Scope::Status);
+        harness.issue(&format!("job:{job_id}"), Scope::Events);
+        harness.issue(&format!("artifact:{artifact_id}"), Scope::Download);
+        let artifact_path = harness
+            .artifact_root
+            .join(format!("blocked-{index:03}.bin"));
+        std::fs::write(&artifact_path, b"retained while cleanup is full").unwrap();
+        harness
+            .state
+            .register_job_artifact(
+                &job_id,
+                &artifact_id,
+                &artifact_path,
+                "blocked.bin",
+                "application/octet-stream",
+            )
+            .unwrap();
+    }
+    harness
+        .state
+        .register_job("z-stale-worker", "running")
+        .unwrap();
+    harness
+        .state
+        .register_job("zz-terminal-without-artifact", "completed")
+        .unwrap();
+
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let mut connection = Connection::open(&harness.database_path).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE event_jobs SET retain_until = 0 WHERE job_id LIKE 'blocked-job-%' \
+                 OR job_id = 'zz-terminal-without-artifact'; \
+             UPDATE event_artifacts SET expires_at = 0 WHERE artifact_id LIKE 'blocked-artifact-%';",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE event_jobs SET worker_lease_until = ?1 WHERE job_id = 'z-stale-worker'",
+            [now.saturating_sub(1)],
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..4096 {
+        transaction
+            .execute(
+                "INSERT INTO event_expiry_outbox(job_id, artifact_id, path, file_identity, attempt_count, next_attempt_at) \
+                 VALUES (?1, ?2, 'blocked.bin', X'01', 0, ?3)",
+                rusqlite::params![
+                    format!("backlog-{index:04}"),
+                    format!("backlog-{index:04}"),
+                    now.saturating_add(3600),
+                ],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+
+    event_store(&harness).reconcile_expired().unwrap();
+
+    let stale_state: String = connection
+        .query_row(
+            "SELECT json_extract(snapshot_json, '$.state') FROM event_jobs WHERE job_id = 'z-stale-worker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stale_state, "failed",
+        "stale workers remain eligible behind a full outbox"
+    );
+    let artifact_free_jobs: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_jobs WHERE job_id = 'zz-terminal-without-artifact'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        artifact_free_jobs, 0,
+        "no-file terminal rows need no cleanup slot"
+    );
+    let first_blocked_jobs: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_jobs WHERE job_id LIKE 'blocked-job-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(first_blocked_jobs, i64::try_from(BLOCKED_LINKS).unwrap());
+
+    connection
+        .execute(
+            "DELETE FROM event_expiry_outbox WHERE job_id = 'backlog-0000'",
+            [],
+        )
+        .unwrap();
+    for _ in 0..BLOCKED_LINKS {
+        // A fresh EventStore per pass exercises persisted fairness state across
+        // process-style reopen boundaries.
+        event_store(&harness).reconcile_expired().unwrap();
+    }
+
+    let blocked_jobs_remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_jobs WHERE job_id LIKE 'blocked-job-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_jobs_remaining, 0,
+        "later linked rows progress across reopen passes"
+    );
+    for index in 0..BLOCKED_LINKS {
+        assert!(
+            !harness
+                .artifact_root
+                .join(format!("blocked-{index:03}.bin"))
+                .exists(),
+            "eligible artifact {index} is eventually removed"
+        );
+    }
 }
 
 #[test]
