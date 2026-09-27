@@ -390,7 +390,7 @@ fn expiration_releases_once_and_deletion_runs_only_through_the_reconciler() {
 }
 
 #[test]
-fn failed_cleanup_remains_pending_and_succeeds_on_a_later_retry() {
+fn missing_pinned_identity_keeps_cleanup_job_pending_after_retry() {
     let temp_dir = TempDir::new().unwrap();
     let ledger = open(&temp_dir, limits(), vec![SECRET_A]);
     let session = ledger.reserve("192.0.2.10", Some(1)).unwrap();
@@ -411,8 +411,9 @@ fn failed_cleanup_remains_pending_and_succeeds_on_a_later_retry() {
     fs::remove_dir(blocked_path.join("child")).unwrap();
     fs::remove_dir(&blocked_path).unwrap();
     let second = ledger.reconcile_cleanup_jobs().unwrap();
-    assert_eq!(second.completed, 1);
-    assert_eq!(second.retryable, 0);
+    assert_eq!(second.completed, 0);
+    assert_eq!(second.retryable, 1);
+    assert_eq!(cleanup_job_attempts(&temp_dir), 2);
     assert!(!blocked_path.exists());
 }
 

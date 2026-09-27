@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
@@ -50,6 +50,81 @@ impl TestDiskSpace {
     }
 }
 
+#[derive(Clone)]
+struct BlockingGate {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl BlockingGate {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Barrier::new(2)),
+            release: Arc::new(Barrier::new(2)),
+        }
+    }
+
+    fn block(&self) {
+        self.entered.wait();
+        self.release.wait();
+    }
+
+    async fn wait_until_entered(&self) {
+        let entered = Arc::clone(&self.entered);
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+    }
+
+    async fn release(&self) {
+        let release = Arc::clone(&self.release);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+    }
+}
+
+struct GatedDiskSpace {
+    available_bytes: u64,
+    block_next: AtomicUsize,
+    gate: BlockingGate,
+}
+
+impl GatedDiskSpace {
+    fn new(available_bytes: u64) -> Self {
+        Self {
+            available_bytes,
+            block_next: AtomicUsize::new(0),
+            gate: BlockingGate::new(),
+        }
+    }
+
+    fn block_next(&self) {
+        self.block_next.store(1, Ordering::SeqCst);
+    }
+}
+
+impl DiskSpaceProvider for GatedDiskSpace {
+    fn available_bytes(&self, _path: &std::path::Path) -> io::Result<u64> {
+        if self.block_next.swap(0, Ordering::SeqCst) != 0 {
+            self.gate.block();
+        }
+        Ok(self.available_bytes)
+    }
+}
+
+#[derive(Clone)]
+struct GatedUploadWriter {
+    gate: BlockingGate,
+}
+
+impl UploadChunkWriter for GatedUploadWriter {
+    fn write_chunk(&self, file: &mut File, chunk: &[u8]) -> io::Result<()> {
+        self.gate.block();
+        file.write_all(chunk)
+    }
+}
+
 impl DiskSpaceProvider for TestDiskSpace {
     fn available_bytes(&self, _path: &std::path::Path) -> io::Result<u64> {
         Ok(self.0.load(Ordering::SeqCst))
@@ -75,11 +150,41 @@ impl Harness {
         disk_safety_margin_bytes: u64,
         max_active_sessions_per_ip: u32,
     ) -> Self {
+        let disk_space = TestDiskSpace::new(1024 * 1024);
+        Self::with_disk_space_provider_and_test_disk(
+            max_global_reserved_bytes,
+            disk_safety_margin_bytes,
+            max_active_sessions_per_ip,
+            Arc::new(disk_space.clone()),
+            disk_space,
+        )
+    }
+
+    fn with_provider(
+        max_global_reserved_bytes: u64,
+        disk_safety_margin_bytes: u64,
+        provider: Arc<dyn DiskSpaceProvider>,
+    ) -> Self {
+        Self::with_disk_space_provider_and_test_disk(
+            max_global_reserved_bytes,
+            disk_safety_margin_bytes,
+            8,
+            provider,
+            TestDiskSpace::new(1024 * 1024),
+        )
+    }
+
+    fn with_disk_space_provider_and_test_disk(
+        max_global_reserved_bytes: u64,
+        disk_safety_margin_bytes: u64,
+        max_active_sessions_per_ip: u32,
+        provider: Arc<dyn DiskSpaceProvider>,
+        disk_space: TestDiskSpace,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let database_path = temp.path().join("server.sqlite3");
         let upload_root = temp.path().join("uploads");
         std::fs::create_dir(&upload_root).unwrap();
-        let disk_space = TestDiskSpace::new(1024 * 1024);
         let ledger = UploadLedger::open_with_disk_space(
             &database_path,
             &upload_root,
@@ -91,7 +196,7 @@ impl Harness {
                 disk_safety_margin_bytes,
             },
             vec![[0x41; 32]],
-            Arc::new(disk_space.clone()),
+            provider,
         )
         .unwrap();
         let capabilities = CapabilityStore::open(&database_path).unwrap();
@@ -629,9 +734,126 @@ async fn replacement_of_open_staging_entry_cannot_be_reported_as_a_successful_up
     assert_eq!(std::fs::read(&path).unwrap(), b"unrelated replacement");
     assert_eq!(harness.reserved_bytes(), 0);
     assert!(
-        displaced.exists(),
-        "pinned original handle remains distinguishable"
+        !displaced.exists(),
+        "cleanup must remove the pinned original even after its name is displaced"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_bootstrap_reservation_is_compensated_before_server_shutdown() {
+    let provider = Arc::new(GatedDiskSpace::new(1024 * 1024));
+    let harness = Harness::with_provider(64, 0, provider.clone());
+    provider.block_next();
+    let state = harness
+        .state
+        .clone()
+        .with_storage_operation_timeout(Duration::from_millis(100))
+        .unwrap();
+    let (address, shutdown, server) = start_server_with_shutdown(state).await;
+    let mut stream = connect(address).await;
+    let bootstrap_body = br#"{"declared_bytes":4,"output_target":{"type":"managed_artifact"}}"#;
+    let content_length = bootstrap_body.len().to_string();
+    send_request(
+        &mut stream,
+        "POST",
+        "/v1/upload-sessions",
+        &[
+            ("Origin", PUBLIC_ORIGIN),
+            ("Content-Length", content_length.as_str()),
+        ],
+        bootstrap_body,
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), provider.gate.wait_until_entered())
+        .await
+        .expect("bootstrap should enter its injected blocking storage operation");
+    let (status, _, body) = read_response(&mut stream).await.unwrap();
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT.as_u16());
+    assert_error_code(&body, "upload_timeout");
+
+    provider.gate.release().await;
+    shutdown.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(6), server)
+        .await
+        .expect("shutdown tracks the late bootstrap storage worker")
+        .unwrap();
+    assert!(result.is_ok());
+    assert_eq!(harness.reserved_bytes(), 0);
+    assert_eq!(harness.reservation_file_count(), 0);
+    let uploads: i64 = Connection::open(&harness.database_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM uploads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        uploads, 0,
+        "a timed-out bootstrap must not publish a session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_settlement_does_not_publish_uploaded_after_timeout_response() {
+    let harness = Harness::new(64, 0);
+    let (session_id, token) = harness.create_upload(1).await;
+    let path = harness.upload_path(session_id);
+    let gate = BlockingGate::new();
+    let state = harness
+        .state
+        .clone()
+        .with_upload_timeouts(Duration::from_secs(2), Duration::from_secs(3))
+        .unwrap()
+        .with_storage_operation_timeout(Duration::from_millis(150))
+        .unwrap()
+        .with_upload_chunk_writer(Arc::new(GatedUploadWriter { gate: gate.clone() }));
+    let (address, shutdown, server) = start_server_with_shutdown(state).await;
+    let mut stream = connect(address).await;
+    send_request(
+        &mut stream,
+        "PUT",
+        &format!("/v1/upload-sessions/{session_id}/content"),
+        &[
+            ("Origin", PUBLIC_ORIGIN),
+            ("Authorization", &format!("Bearer {token}")),
+            ("Content-Length", "1"),
+        ],
+        b"x",
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+        .await
+        .expect("upload should reach its injected blocking write");
+    let lock = Connection::open(&harness.database_path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold the ledger write lock across the settlement deadline");
+    gate.release().await;
+
+    let (status, headers, body) =
+        tokio::time::timeout(Duration::from_secs(2), read_response(&mut stream))
+            .await
+            .expect("HTTP handler should return at the storage deadline")
+            .unwrap();
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT.as_u16());
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "connection" && value == "close")
+    );
+    assert_error_code(&body, "upload_timeout");
+    lock.execute_batch("ROLLBACK").unwrap();
+
+    shutdown.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(6), server)
+        .await
+        .expect("shutdown waits for the delayed settlement/cleanup worker")
+        .unwrap();
+    assert!(result.is_ok());
+    assert_ne!(harness.state(session_id, &token), UploadState::Uploaded);
+    assert!(
+        !path.exists(),
+        "timed-out upload allocation should be cleaned after the worker returns"
+    );
+    assert_eq!(harness.reserved_bytes(), 0);
 }
 
 #[tokio::test]
@@ -723,16 +945,16 @@ async fn renewed_receiving_lease_prevents_cleanup_from_claiming_an_active_stream
     let path = harness.upload_path(session_id);
     let first_expiry = harness
         .ledger
-        .claim_receiving_lease(session_id, &session_token, Duration::from_secs(2))
+        .claim_receiving_lease(session_id, &session_token, Duration::from_secs(5))
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let renewed_expiry = harness
         .ledger
-        .renew_receiving_lease(session_id, &session_token, Duration::from_secs(4))
+        .renew_receiving_lease(session_id, &session_token, Duration::from_secs(8))
         .unwrap();
     assert!(renewed_expiry > first_expiry);
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    tokio::time::sleep(Duration::from_millis(4_100)).await;
 
     let cleanup = harness.ledger.reconcile_expired_sessions().unwrap();
 

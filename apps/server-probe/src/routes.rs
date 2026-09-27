@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
@@ -38,7 +39,7 @@ use tower::service_fn;
 use uuid::Uuid;
 
 use crate::auth::{Capability, CapabilityError, CapabilityStore, Scope};
-use crate::ledger::{LimitError, SessionToken, UploadLedger};
+use crate::ledger::{LimitError, SessionToken, UploadLedger, UploadReservation};
 
 const MAX_BOOTSTRAP_BODY_BYTES: usize = 16 * 1024;
 const DEFAULT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -297,6 +298,7 @@ impl ServerState {
 #[derive(Default)]
 struct WorkerTracker {
     active: AtomicUsize,
+    failed_late_compensations: AtomicUsize,
     finished: Notify,
 }
 
@@ -304,6 +306,10 @@ impl WorkerTracker {
     fn begin(self: &Arc<Self>) -> WorkerGuard {
         self.active.fetch_add(1, Ordering::AcqRel);
         WorkerGuard(Arc::clone(self))
+    }
+
+    fn has_failed_late_compensations(&self) -> bool {
+        self.failed_late_compensations.load(Ordering::Acquire) > 0
     }
 
     async fn wait_until_idle(&self, deadline: tokio::time::Instant) -> bool {
@@ -345,6 +351,42 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_storage_with_late_completion(state, deadline, operation, |_| async { true }).await
+}
+
+async fn compensate_late_bootstrap_result(
+    ledger: UploadLedger,
+    result: Result<(UploadReservation, Capability), LimitError>,
+) -> bool {
+    let pending = match result {
+        Ok((reservation, _capability)) => Some((reservation.session_id, reservation.session_token)),
+        Err(LimitError::LateReservationCompensationRequired {
+            session_id,
+            capability,
+        }) => Some((session_id, capability)),
+        _ => None,
+    };
+    if let Some((session_id, token)) = pending {
+        tokio::task::spawn_blocking(move || ledger.compensate_late_reservation(session_id, &token))
+            .await
+            .is_ok_and(|result| result.is_ok())
+    } else {
+        true
+    }
+}
+
+async fn run_storage_with_late_completion<T, F, L, LFut>(
+    state: &ServerState,
+    deadline: tokio::time::Instant,
+    operation: F,
+    late_completion: L,
+) -> Result<T, StorageTaskError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    L: FnOnce(T) -> LFut + Send + 'static,
+    LFut: Future<Output = bool> + Send + 'static,
+{
     let permit: OwnedSemaphorePermit =
         tokio::time::timeout_at(deadline, Arc::clone(&state.storage_workers).acquire_owned())
             .await
@@ -353,12 +395,27 @@ where
     let worker_guard = state.worker_tracker.begin();
     let (sender, receiver) = oneshot::channel();
     let worker = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let _worker_guard = worker_guard;
-        (tokio::time::Instant::now() < deadline).then(operation)
+        let result = (tokio::time::Instant::now() < deadline).then(operation);
+        (worker_guard, permit, result)
     });
     tokio::spawn(async move {
-        let _ = sender.send(worker.await);
+        match worker.await {
+            Ok((worker_guard, permit, result)) => {
+                if let Err(Ok(Some(value))) = sender.send(Ok(result))
+                    && !late_completion(value).await
+                {
+                    worker_guard
+                        .0
+                        .failed_late_compensations
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                drop(permit);
+                drop(worker_guard);
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+            }
+        }
     });
     match tokio::time::timeout_at(deadline, receiver).await {
         Err(_) => Err(StorageTaskError::Timeout),
@@ -708,10 +765,8 @@ fn run_upload_worker(
                     }
                     Ok(reserved_bytes)
                 })();
-                if result.is_ok() {
-                    file = Some(pinned_file);
-                } else {
-                    drop(pinned_file);
+                file = Some(pinned_file);
+                if result.is_err() {
                     cleanup_upload_worker(&ledger, session_id, &token, &mut file);
                 }
                 let success = result.is_ok();
@@ -728,11 +783,12 @@ fn run_upload_worker(
                 deadline,
                 response,
             } => {
+                let mut settlement_receipt = None;
                 let result = if tokio::time::Instant::now() >= deadline {
                     Err(UploadWorkerError::Timeout)
                 } else {
-                    match file.take() {
-                        Some(mut pinned_file) => match pinned_file
+                    match file.as_mut() {
+                        Some(pinned_file) => match pinned_file
                             .set_len(actual_bytes)
                             .map_err(LimitError::Filesystem)
                         {
@@ -745,20 +801,58 @@ fn run_upload_worker(
                                 Ok(()) if tokio::time::Instant::now() >= deadline => {
                                     Err(UploadWorkerError::Timeout)
                                 }
-                                Ok(()) => ledger
-                                    .settle_pinned(session_id, &token, &pinned_file, actual_bytes)
-                                    .map_err(UploadWorkerError::Storage),
+                                Ok(()) => match ledger.settle_pinned_until(
+                                    session_id,
+                                    &token,
+                                    pinned_file,
+                                    actual_bytes,
+                                    deadline.into_std(),
+                                ) {
+                                    Ok(receipt) => {
+                                        settlement_receipt = Some(receipt);
+                                        Ok(())
+                                    }
+                                    Err(LimitError::OperationTimedOut) => {
+                                        Err(UploadWorkerError::Timeout)
+                                    }
+                                    Err(LimitError::LateSettlementCompensationRequired(
+                                        receipt,
+                                    )) => {
+                                        settlement_receipt = Some(receipt);
+                                        Err(UploadWorkerError::Timeout)
+                                    }
+                                    Err(error) => Err(UploadWorkerError::Storage(error)),
+                                },
                             },
                         },
                         None => Err(UploadWorkerError::Storage(LimitError::InvalidTransition)),
                     }
                 };
-                if result.is_ok() {
-                    settled = true;
+                if let Some(receipt) = settlement_receipt {
+                    let (successful, delivered) = match result {
+                        Ok(()) => (true, response.send(Ok(()))),
+                        Err(error) => (false, response.send(Err(error))),
+                    };
+                    if successful && delivered.is_ok() {
+                        settled = true;
+                        drop(file.take());
+                    } else {
+                        // A late commit or a completed commit whose HTTP
+                        // waiter timed out is revoked before releasing the
+                        // pinned handle. The durable compensation is retryable
+                        // and remains covered by the tracked actor until complete.
+                        while ledger
+                            .compensate_late_settlement(session_id, &token, receipt)
+                            .is_err()
+                        {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        drop(file.take());
+                    }
                 } else {
+                    let _ = response.send(result);
                     cleanup_upload_worker(&ledger, session_id, &token, &mut file);
                 }
-                let _ = response.send(result);
                 break;
             }
             UploadWorkerCommand::Abort(reply) => {
@@ -785,9 +879,9 @@ fn cleanup_upload_worker(
     token: &SessionToken,
     file: &mut Option<File>,
 ) {
-    drop(file.take());
     let _ = ledger.expire(session_id, token);
     let _ = ledger.reconcile_cleanup_jobs();
+    drop(file.take());
 }
 
 async fn recover_upload_worker(state: &ServerState, session_id: i64, token: SessionToken) {
@@ -955,6 +1049,11 @@ where
             "server shutdown grace elapsed with non-cancellable storage workers still active",
         ));
     }
+    if state.worker_tracker.has_failed_late_compensations() {
+        return Err(io::Error::other(
+            "server shutdown observed incomplete late storage compensation",
+        ));
+    }
     if let Some(error) = serve_error {
         return Err(error);
     }
@@ -1086,11 +1185,23 @@ async fn create_upload_session(
         .checked_add(state.capability_ttl)
         .ok_or_else(HttpError::storage_unavailable)?;
     let ledger = state.ledger.clone();
+    let late_ledger = state.ledger.clone();
     let client_ip = client_ip.to_string();
     let storage_deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
-    let (reservation, capability) = run_storage(state, storage_deadline, move || {
-        ledger.reserve_with_upload_capability(&client_ip, declared_bytes, expires_at)
-    })
+    let deadline = storage_deadline.into_std();
+    let (reservation, capability) = run_storage_with_late_completion(
+        state,
+        storage_deadline,
+        move || {
+            ledger.reserve_with_upload_capability_until(
+                &client_ip,
+                declared_bytes,
+                expires_at,
+                deadline,
+            )
+        },
+        move |result| compensate_late_bootstrap_result(late_ledger, result),
+    )
     .await
     .map_err(|error| match error {
         StorageTaskError::Timeout => UPLOAD_TIMEOUT_ERROR,
@@ -1743,6 +1854,7 @@ fn map_capability_error(error: CapabilityError) -> HttpError {
 
 fn map_limit_error(error: LimitError) -> HttpError {
     match error {
+        LimitError::OperationTimedOut => UPLOAD_TIMEOUT_ERROR,
         LimitError::Unauthorized => HttpError::unauthorized(),
         LimitError::UnknownSession => HttpError::not_found(),
         LimitError::InvalidTransition => HttpError {
@@ -1862,4 +1974,267 @@ fn add_common_headers(response: &mut Response<HttpBody>) {
     response
         .headers_mut()
         .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+}
+
+#[cfg(test)]
+mod late_completion_tests {
+    use super::*;
+    use crate::ledger::LedgerLimits;
+    use rusqlite::Connection;
+    use std::sync::Barrier;
+
+    fn test_state() -> (tempfile::TempDir, UploadLedger, ServerState) {
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("ledger.sqlite3");
+        let upload_root = temp.path().join("uploads");
+        std::fs::create_dir(&upload_root).unwrap();
+        let ledger = UploadLedger::open(
+            &database_path,
+            &upload_root,
+            LedgerLimits {
+                max_file_bytes: 4,
+                daily_quota_bytes: 20,
+                max_active_sessions_per_ip: 4,
+                max_global_reserved_bytes: 20,
+                disk_safety_margin_bytes: 0,
+            },
+            vec![[0xA1; 32]],
+        )
+        .unwrap();
+        let capabilities = CapabilityStore::open(&database_path).unwrap();
+        let state = ServerState::new(
+            ledger.clone(),
+            capabilities,
+            "https://flux.test",
+            vec![],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        (temp, ledger, state)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn committed_bootstrap_after_timeout_is_compensated_by_late_completion() {
+        let (temp, ledger, state) = test_state();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let operation_ledger = ledger.clone();
+        let late_ledger = ledger.clone();
+        let operation_entered = Arc::clone(&entered);
+        let operation_release = Arc::clone(&release);
+        let (compensated, compensation_result) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let worker = run_storage_with_late_completion(
+            &state,
+            deadline,
+            move || {
+                let result = operation_ledger.reserve_with_upload_capability(
+                    "192.0.2.10",
+                    Some(1),
+                    SystemTime::now() + Duration::from_secs(60),
+                );
+                operation_entered.wait();
+                operation_release.wait();
+                result
+            },
+            move |result| async move {
+                let succeeded = match result {
+                    Ok((reservation, _)) => {
+                        let session_id = reservation.session_id;
+                        let token = reservation.session_token;
+                        matches!(
+                            tokio::task::spawn_blocking(move || {
+                                late_ledger.compensate_late_reservation(session_id, &token)
+                            })
+                            .await,
+                            Ok(Ok(()))
+                        )
+                    }
+                    Err(_) => false,
+                };
+                let _ = compensated.send(succeeded);
+                succeeded
+            },
+        );
+        tokio::pin!(worker);
+        let entered_wait = tokio::task::spawn_blocking(move || entered.wait());
+        tokio::select! {
+            _ = &mut worker => panic!("storage timed out before entering gate"),
+            _ = entered_wait => {}
+        }
+        assert!(matches!(worker.await, Err(StorageTaskError::Timeout)));
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), compensation_result)
+                .await
+                .expect("late successful result must trigger compensation")
+                .unwrap()
+        );
+
+        assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+        let (state_name, relative_path, expires_at): (String, String, i64) =
+            Connection::open(ledger.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT uploads.state, uploads.upload_path, capabilities.expires_at \
+                     FROM uploads JOIN capabilities ON capabilities.token_hash = uploads.capability_hash",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(state_name, "expired");
+        assert_eq!(expires_at, 0);
+        assert!(!temp.path().join("uploads").join(relative_path).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bootstrap_compensation_required_result_is_retried_after_timeout() {
+        let (temp, ledger, state) = test_state();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let operation_ledger = ledger.clone();
+        let late_ledger = ledger.clone();
+        let operation_entered = Arc::clone(&entered);
+        let operation_release = Arc::clone(&release);
+        let (compensated, compensation_result) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let worker = run_storage_with_late_completion(
+            &state,
+            deadline,
+            move || -> Result<(UploadReservation, Capability), LimitError> {
+                let (reservation, _capability) = operation_ledger
+                    .reserve_with_upload_capability(
+                        "192.0.2.10",
+                        Some(1),
+                        SystemTime::now() + Duration::from_secs(60),
+                    )
+                    .unwrap();
+                operation_entered.wait();
+                operation_release.wait();
+                Err(LimitError::LateReservationCompensationRequired {
+                    session_id: reservation.session_id,
+                    capability: reservation.session_token,
+                })
+            },
+            move |result| async move {
+                let succeeded = compensate_late_bootstrap_result(late_ledger, result).await;
+                let _ = compensated.send(succeeded);
+                succeeded
+            },
+        );
+        tokio::pin!(worker);
+        let entered_wait = tokio::task::spawn_blocking(move || entered.wait());
+        tokio::select! {
+            _ = &mut worker => panic!("storage timed out before entering gate"),
+            _ = entered_wait => {}
+        }
+        assert!(matches!(worker.await, Err(StorageTaskError::Timeout)));
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), compensation_result)
+                .await
+                .expect("late compensation marker must trigger a retry")
+                .unwrap()
+        );
+
+        assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+        let (state_name, relative_path, expires_at): (String, String, i64) =
+            Connection::open(ledger.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT uploads.state, uploads.upload_path, capabilities.expires_at \
+                     FROM uploads JOIN capabilities ON capabilities.token_hash = uploads.capability_hash",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(state_name, "expired");
+        assert_eq!(expires_at, 0);
+        assert!(!temp.path().join("uploads").join(relative_path).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_finish_receiver_revokes_a_committed_settlement() {
+        let (_temp, ledger, state) = test_state();
+        let (reservation, _capability) = ledger
+            .reserve_with_upload_capability(
+                "192.0.2.10",
+                Some(1),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        let session_id = reservation.session_id;
+        let token = reservation.session_token;
+        let upload_path = reservation.upload_path;
+        let (claimed_sender, claimed) = oneshot::channel();
+        let context = UploadWorkerContext {
+            ledger: ledger.clone(),
+            writer: Arc::clone(&state.upload_chunk_writer),
+            active_uploads: Arc::clone(&state.active_uploads),
+            session_id,
+            token: token.clone(),
+            lease_duration: Duration::from_secs(30),
+            claimed_sender,
+        };
+        let (commands, receiver) = mpsc::channel(4);
+        let actor = thread::spawn(move || run_upload_worker(context, receiver));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (start_reply, start_result) = oneshot::channel();
+        commands
+            .send(UploadWorkerCommand::Start {
+                deadline,
+                response: start_reply,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(start_result.await.unwrap(), Ok(1)));
+        claimed.await.unwrap();
+
+        let (write_reply, write_result) = oneshot::channel();
+        commands
+            .send(UploadWorkerCommand::Write {
+                required_total: 1,
+                chunk: Bytes::from_static(b"x"),
+                deadline,
+                response: write_reply,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(write_result.await.unwrap(), Ok(1)));
+
+        let (finish_reply, finish_result) = oneshot::channel();
+        drop(finish_result);
+        commands
+            .send(UploadWorkerCommand::Finish {
+                actual_bytes: 1,
+                deadline,
+                response: finish_reply,
+            })
+            .await
+            .unwrap();
+        drop(commands);
+        tokio::task::spawn_blocking(move || actor.join().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger.state(session_id, &token).unwrap(),
+            crate::ledger::UploadState::Expired
+        );
+        assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+        assert!(!upload_path.exists());
+        let used: i64 = Connection::open(ledger.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(used_bytes), 0) FROM daily_usage",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(used, 0);
+    }
 }

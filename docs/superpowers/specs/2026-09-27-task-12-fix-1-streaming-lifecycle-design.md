@@ -1,6 +1,6 @@
 # Task 12 Fix Round 1: Streaming Upload Lifecycle and Resource Bounds
 
-**Date:** 2026-09-27  
+**Date:** 2026-09-27
 **Status:** Approved.
 
 ## Scope
