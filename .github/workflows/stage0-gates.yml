@@ -1,0 +1,494 @@
+name: stage0-gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run reproducible CI or request the full evidence gate
+        type: choice
+        options: [Automated, Complete]
+        default: Automated
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage0-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry\cache
+            ~\.cargo\registry\src
+            ~\.cargo\git\db
+          key: windows-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: windows-${{ runner.arch }}-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop-probe/pnpm-lock.yaml
+      - name: Cache pinned desktop dependencies
+        uses: actions/cache@v4
+        with:
+          path: apps/desktop-probe/node_modules
+          key: windows-desktop-${{ hashFiles('apps/desktop-probe/pnpm-lock.yaml') }}
+      - name: Install pinned desktop dependencies
+        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+      - name: Automated Stage 0 gates
+        shell: pwsh
+        run: >-
+          ./scripts/check-stage0.ps1 -Mode Automated
+          -Gate format -Gate clippy -Gate protocol -Gate contract-drift
+          -Gate capabilities -Gate ffmpeg-profile-tests -Gate desktop-probe-modes -Gate atomic-output
+          -Gate server-probe -Gate desktop-build
+      - name: Upload non-secret gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-logs-windows-${{ github.run_id }}
+          path: target/stage0/runs/**/*.log
+          if-no-files-found: warn
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: macos-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: macos-${{ runner.arch }}-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop-probe/pnpm-lock.yaml
+      - uses: actions/cache@v4
+        with:
+          path: apps/desktop-probe/node_modules
+          key: macos-desktop-${{ hashFiles('apps/desktop-probe/pnpm-lock.yaml') }}
+      - name: Install pinned desktop dependencies
+        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+      - name: Automated Stage 0 gates
+        shell: bash
+        run: >-
+          ./scripts/check-stage0.sh --mode automated
+          --gate format --gate clippy --gate protocol --gate contract-drift
+          --gate capabilities --gate ffmpeg-profile-tests --gate desktop-probe-modes --gate atomic-output
+          --gate desktop-build
+      - name: Upload non-secret gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-logs-macos-${{ github.run_id }}
+          path: target/stage0/runs/**/*.log
+          if-no-files-found: warn
+
+  ubuntu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: ubuntu-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ubuntu-${{ runner.arch }}-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - name: Install documented Tauri Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop-probe/pnpm-lock.yaml
+      - uses: actions/cache@v4
+        with:
+          path: apps/desktop-probe/node_modules
+          key: ubuntu-desktop-${{ hashFiles('apps/desktop-probe/pnpm-lock.yaml') }}
+      - name: Install pinned desktop dependencies
+        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+      - name: Automated Stage 0 gates
+        shell: bash
+        run: >-
+          ./scripts/check-stage0.sh --mode automated
+          --gate format --gate clippy --gate protocol --gate contract-drift
+          --gate capabilities --gate ffmpeg-profile-tests --gate desktop-probe-modes --gate atomic-output
+          --gate sandbox-unit --gate server-probe --gate desktop-build
+      - name: Upload non-secret gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-logs-ubuntu-${{ github.run_id }}
+          path: target/stage0/runs/**/*.log
+          if-no-files-found: warn
+
+  public-server-hosted-status:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Confirm an ordinary hosted runner remains BLOCKED
+        shell: bash
+        run: |
+          mkdir -p target/stage0
+          set +e
+          ./scripts/check-stage0.sh --mode automated --gate public-server-linux 2>&1 | tee target/stage0/hosted-public-gate.log
+          gate_status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$gate_status" -eq 0 ]] || ! grep -q 'public-server-linux=BLOCKED' target/stage0/hosted-public-gate.log; then
+            echo 'Hosted Linux must report BLOCKED, never PASS.' >&2
+            exit 1
+          fi
+      - name: Upload hosted BLOCKED report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-public-hosted-status-${{ github.run_id }}
+          path: |
+            target/stage0/hosted-public-gate.log
+            target/stage0/runs/**/*.log
+          if-no-files-found: warn
+
+  public-server-linux-native:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'Complete' && github.ref == 'refs/heads/main' }}
+    runs-on: [self-hosted, linux, x64, linux-cgroupv2-delegated]
+    env:
+      FLUXFORM_STAGE0_LINUX_CGROUPV2_DELEGATED: '1'
+      FLUXFORM_TEST_CGROUP_ROOT: ${{ vars.FLUXFORM_TEST_CGROUP_ROOT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: linux-native-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: linux-native-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - name: Run real delegated-cgroup and public-server suite
+        run: ./scripts/check-stage0.sh --mode automated --gate public-server-linux
+      - name: Upload non-secret gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-public-native-${{ github.run_id }}
+          path: target/stage0/runs/**/*.log
+          if-no-files-found: warn
+
+  native-profile-samples:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'Complete' && github.ref == 'refs/heads/main' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            runner: '["self-hosted","Windows","X64","windows-x64-native"]'
+            archive_var: STAGE0_FFMPEG_ARCHIVE_WINDOWS_X86_64
+            artifact_var: STAGE0_FFMPEG_ARTIFACT_ID_WINDOWS_X86_64
+            ffmpeg_var: STAGE0_FFMPEG_PATH_WINDOWS_X86_64
+            ffprobe_var: STAGE0_FFPROBE_PATH_WINDOWS_X86_64
+          - target: macos-x86_64
+            runner: '["self-hosted","macOS-x64-native"]'
+            archive_var: STAGE0_FFMPEG_ARCHIVE_MACOS_X86_64
+            artifact_var: STAGE0_FFMPEG_ARTIFACT_ID_MACOS_X86_64
+            ffmpeg_var: STAGE0_FFMPEG_PATH_MACOS_X86_64
+            ffprobe_var: STAGE0_FFPROBE_PATH_MACOS_X86_64
+          - target: macos-aarch64
+            runner: '["self-hosted","macOS-arm64-native"]'
+            archive_var: STAGE0_FFMPEG_ARCHIVE_MACOS_AARCH64
+            artifact_var: STAGE0_FFMPEG_ARTIFACT_ID_MACOS_AARCH64
+            ffmpeg_var: STAGE0_FFMPEG_PATH_MACOS_AARCH64
+            ffprobe_var: STAGE0_FFPROBE_PATH_MACOS_AARCH64
+          - target: linux-x86_64
+            runner: '["self-hosted","linux","x64","linux-cgroupv2-delegated"]'
+            archive_var: STAGE0_FFMPEG_ARCHIVE_LINUX_X86_64
+            artifact_var: STAGE0_FFMPEG_ARTIFACT_ID_LINUX_X86_64
+            ffmpeg_var: STAGE0_FFMPEG_PATH_LINUX_X86_64
+            ffprobe_var: STAGE0_FFPROBE_PATH_LINUX_X86_64
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    env:
+      STAGE0_FFMPEG_ARCHIVE: ${{ vars[matrix.archive_var] }}
+      STAGE0_FFMPEG_ARTIFACT_ID: ${{ vars[matrix.artifact_var] }}
+      STAGE0_FFMPEG: ${{ vars[matrix.ffmpeg_var] }}
+      STAGE0_FFPROBE: ${{ vars[matrix.ffprobe_var] }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: native-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: native-${{ matrix.target }}-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify immutable archive and distribution approval (PowerShell)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path target/stage0 | Out-Null
+          if ([string]::IsNullOrWhiteSpace($env:STAGE0_FFMPEG_ARCHIVE) -or -not (Test-Path -LiteralPath $env:STAGE0_FFMPEG_ARCHIVE -PathType Leaf)) { throw 'BLOCKED: no pre-provisioned archive; no download is attempted.' }
+          if ([string]::IsNullOrWhiteSpace($env:STAGE0_FFMPEG_ARTIFACT_ID)) { throw 'BLOCKED: no artifact ID is configured.' }
+          cargo run --locked --offline -p fluxform-ffmpeg-profile -- verify --profile config/ffmpeg-profile.toml --artifact-id $env:STAGE0_FFMPEG_ARTIFACT_ID --archive $env:STAGE0_FFMPEG_ARCHIVE --out target/stage0/ffmpeg-${{ matrix.target }}.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $report = Get-Content target/stage0/ffmpeg-${{ matrix.target }}.json -Raw | ConvertFrom-Json
+          if ($report.artifact_status -ne 'approved' -or $report.distribution_gate_status -ne 'approved') { throw 'BLOCKED: candidate-only artifact or blocked distribution approval.' }
+      - name: Verify immutable archive and distribution approval (Bash)
+        if: runner.os != 'Windows'
+        run: |
+          [[ -n "$STAGE0_FFMPEG_ARCHIVE" && -f "$STAGE0_FFMPEG_ARCHIVE" ]] || { echo 'BLOCKED: no pre-provisioned archive; no download is attempted.' >&2; exit 1; }
+          [[ -n "$STAGE0_FFMPEG_ARTIFACT_ID" ]] || { echo 'BLOCKED: no artifact ID is configured.' >&2; exit 1; }
+          mkdir -p target/stage0
+          cargo run --locked --offline -p fluxform-ffmpeg-profile -- verify --profile config/ffmpeg-profile.toml --artifact-id "$STAGE0_FFMPEG_ARTIFACT_ID" --archive "$STAGE0_FFMPEG_ARCHIVE" --out target/stage0/ffmpeg-${{ matrix.target }}.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('target/stage0/ffmpeg-${{ matrix.target }}.json').read_text())
+          if report.get('artifact_status') != 'approved' or report.get('distribution_gate_status') != 'approved':
+              raise SystemExit('BLOCKED: candidate-only artifact or blocked distribution approval.')
+          PY
+      - name: Run native manifest sample matrix (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:STAGE0_FFMPEG) -or [string]::IsNullOrWhiteSpace($env:STAGE0_FFPROBE)) { throw 'BLOCKED: native executable paths are not configured; no binaries are downloaded.' }
+          cargo run --locked --offline -p fluxform-capabilities --bin run_manifest_samples -- --manifest config/capabilities-v1.toml --samples testdata/media/v1/samples.toml --profile-report target/stage0/ffmpeg-${{ matrix.target }}.json --ffmpeg $env:STAGE0_FFMPEG --ffprobe $env:STAGE0_FFPROBE --out target/stage0/samples-${{ matrix.target }}.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run native manifest sample matrix (Bash)
+        if: runner.os != 'Windows'
+        run: |
+          [[ -n "$STAGE0_FFMPEG" && -n "$STAGE0_FFPROBE" ]] || { echo 'BLOCKED: native executable paths are not configured; no binaries are downloaded.' >&2; exit 1; }
+          cargo run --locked --offline -p fluxform-capabilities --bin run_manifest_samples -- --manifest config/capabilities-v1.toml --samples testdata/media/v1/samples.toml --profile-report target/stage0/ffmpeg-${{ matrix.target }}.json --ffmpeg "$STAGE0_FFMPEG" --ffprobe "$STAGE0_FFPROBE" --out target/stage0/samples-${{ matrix.target }}.json
+      - id: provenance
+        name: Bind reports to this native workflow run
+        if: success()
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+          RUNNER_ARCH_NAME: ${{ runner.arch }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_JOB_ID: ${{ github.job }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          target = os.environ['TARGET']
+          profile = Path(f'target/stage0/ffmpeg-{target}.json')
+          sample = Path(f'target/stage0/samples-{target}.json')
+          report = json.loads(sample.read_text(encoding='utf-8'))
+          digest = report['evidence_input_digest']
+          arch = {'x64': 'x86_64', 'arm64': 'aarch64'}.get(os.environ['RUNNER_ARCH_NAME'].lower(), os.environ['RUNNER_ARCH_NAME'].lower())
+          runner_os = os.environ['RUNNER_OS_NAME'].lower()
+          artifact_name = f'stage0-samples-{target}-{digest}'
+          def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+          provenance = {
+              'schema': 'fluxform.native-sample-artifact.v1',
+              'artifact_name': artifact_name,
+              'target_profile_id': report['target_profile_id'],
+              'target_triple': report['target_triple'],
+              'runner_os': runner_os,
+              'runner_arch': arch,
+              'git_commit': os.environ['COMMIT_SHA'],
+              'evidence_input_digest': digest,
+              'workflow_run_id': os.environ['WORKFLOW_RUN_ID'],
+              'workflow_job_id': os.environ['WORKFLOW_JOB_ID'],
+              'ffmpeg_profile_report_sha256': sha(profile),
+              'sample_report_sha256': sha(sample),
+          }
+          out = Path(f'target/stage0/native-artifact-{target}')
+          out.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile(profile, out / 'ffmpeg-profile-report.json')
+          shutil.copyfile(sample, out / 'sample-report.json')
+          (out / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'digest={digest}\n')
+          PY
+      - name: Upload exact native reports (never sample media)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-samples-${{ matrix.target }}-${{ steps.provenance.outputs.digest }}
+          path: target/stage0/native-artifact-${{ matrix.target }}/*
+          if-no-files-found: error
+      - name: Upload profile report for blocked review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-profile-review-${{ matrix.target }}-${{ github.run_id }}
+          path: target/stage0/ffmpeg-${{ matrix.target }}.json
+          if-no-files-found: ignore
+
+  aggregate-evidence:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'Complete' && github.ref == 'refs/heads/main' }}
+    needs: [native-profile-samples]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: ubuntu-aggregate-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ubuntu-aggregate-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - name: Download only native reports from this workflow run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stage0-samples-*
+          path: target/stage0/downloaded
+          merge-multiple: false
+      - name: Place four exact target reports under target/stage0/collected
+        shell: bash
+        run: |
+          python - <<'PY'
+          import shutil
+          from pathlib import Path
+          root = Path('target/stage0/downloaded')
+          expected = {'windows-x86_64', 'macos-x86_64', 'macos-aarch64', 'linux-x86_64'}
+          found = set()
+          for artifact in root.iterdir():
+              matches = [name for name in expected if artifact.name.startswith(f'stage0-samples-{name}-')]
+              if len(matches) != 1 or matches[0] in found:
+                  raise SystemExit(f'BLOCKED: unexpected or duplicate same-run artifact {artifact.name}')
+              target = matches[0]
+              found.add(target)
+              files = {entry.name for entry in artifact.iterdir()}
+              required = {'ffmpeg-profile-report.json', 'sample-report.json', 'provenance.json'}
+              if files != required:
+                  raise SystemExit(f'BLOCKED: {artifact.name} must contain exactly the three reports')
+              destination = Path('target/stage0/collected') / target
+              destination.mkdir(parents=True, exist_ok=False)
+              for name in required:
+                  shutil.copyfile(artifact / name, destination / name)
+              shutil.copyfile(destination / 'ffmpeg-profile-report.json', Path('target/stage0') / f'ffmpeg-{target}.json')
+          if found != expected:
+              raise SystemExit(f'BLOCKED: missing native report artifacts: {sorted(expected - found)}')
+          PY
+      - name: Recompute closure digest, collect reports, verify manifest and samples
+        shell: bash
+        run: ./scripts/check-stage0.sh --mode complete --gate aggregate-samples
+      - name: Upload aggregate report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-aggregate-${{ github.run_id }}
+          path: target/stage0/runs/**/aggregate-sample-report.json
+          if-no-files-found: warn
+
+  complete:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'Complete' }}
+    needs: [windows, macos, ubuntu, public-server-hosted-status, public-server-linux-native, native-profile-samples, aggregate-evidence]
+    runs-on: [self-hosted, linux, x64, linux-cgroupv2-delegated]
+    env:
+      FLUXFORM_STAGE0_LINUX_CGROUPV2_DELEGATED: '1'
+      FLUXFORM_TEST_CGROUP_ROOT: ${{ vars.FLUXFORM_TEST_CGROUP_ROOT }}
+    steps:
+      - name: Require every automated, native, and aggregate prerequisite
+        env:
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+          UBUNTU_RESULT: ${{ needs.ubuntu.result }}
+          HOSTED_PUBLIC_RESULT: ${{ needs.public-server-hosted-status.result }}
+          NATIVE_PUBLIC_RESULT: ${{ needs.public-server-linux-native.result }}
+          NATIVE_SAMPLES_RESULT: ${{ needs.native-profile-samples.result }}
+          AGGREGATE_RESULT: ${{ needs.aggregate-evidence.result }}
+        run: |
+          if [ "$WINDOWS_RESULT" != success ] || [ "$MACOS_RESULT" != success ] || [ "$UBUNTU_RESULT" != success ] || [ "$HOSTED_PUBLIC_RESULT" != success ] || [ "$NATIVE_PUBLIC_RESULT" != success ] || [ "$NATIVE_SAMPLES_RESULT" != success ] || [ "$AGGREGATE_RESULT" != success ]; then
+            echo "BLOCKED: Complete requires every automated gate, real native Linux gate, four native samples, and the same-run aggregate (windows=$WINDOWS_RESULT macos=$MACOS_RESULT ubuntu=$UBUNTU_RESULT hosted-linux=$HOSTED_PUBLIC_RESULT native-linux=$NATIVE_PUBLIC_RESULT samples=$NATIVE_SAMPLES_RESULT aggregate=$AGGREGATE_RESULT)." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: linux-complete-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: linux-complete-cargo-
+      - name: Prefetch locked Rust dependencies for offline gates
+        run: cargo fetch --locked
+      - name: Download this run's native sample reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stage0-samples-*
+          path: target/stage0/downloaded
+          merge-multiple: false
+      - name: Stage exact same-run reports for Complete revalidation
+        shell: bash
+        run: |
+          python - <<'PY'
+          import shutil
+          from pathlib import Path
+          root = Path('target/stage0/downloaded')
+          expected = {'windows-x86_64', 'macos-x86_64', 'macos-aarch64', 'linux-x86_64'}
+          found = set()
+          for artifact in root.iterdir():
+              matches = [name for name in expected if artifact.name.startswith(f'stage0-samples-{name}-')]
+              if len(matches) != 1 or matches[0] in found:
+                  raise SystemExit(f'BLOCKED: unexpected or duplicate same-run artifact {artifact.name}')
+              target = matches[0]
+              found.add(target)
+              required = {'ffmpeg-profile-report.json', 'sample-report.json', 'provenance.json'}
+              if {entry.name for entry in artifact.iterdir()} != required:
+                  raise SystemExit(f'BLOCKED: {artifact.name} must contain exactly the three reports')
+              destination = Path('target/stage0/collected') / target
+              destination.mkdir(parents=True, exist_ok=False)
+              for name in required:
+                  shutil.copyfile(artifact / name, destination / name)
+              shutil.copyfile(destination / 'ffmpeg-profile-report.json', Path('target/stage0') / f'ffmpeg-{target}.json')
+          if found != expected:
+              raise SystemExit(f'BLOCKED: missing native report artifacts: {sorted(expected - found)}')
+          PY
+      - name: Run Complete against the reviewed report and aggregated evidence
+        shell: bash
+        run: ./scripts/check-stage0.sh --mode complete
