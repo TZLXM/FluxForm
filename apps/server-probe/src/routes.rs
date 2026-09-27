@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::str::FromStr;
 #[cfg(test)]
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 #[cfg(test)]
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
@@ -42,6 +42,7 @@ use tower::service_fn;
 use uuid::Uuid;
 
 use crate::auth::{Capability, CapabilityError, CapabilityStore, Scope};
+use crate::events::{EventStore, EventStoreError, JobSnapshot, ReplayResult};
 use crate::ledger::{LimitError, SessionToken, UploadLedger, UploadReservation};
 
 const MAX_BOOTSTRAP_BODY_BYTES: usize = 16 * 1024;
@@ -60,6 +61,7 @@ const MAX_FORWARDED_HOPS: usize = 8;
 const MAX_FORWARDED_HEADER_BYTES: usize = 4 * 1024;
 const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
 const MAX_CIDR_TEXT_BYTES: usize = 64;
+const MAX_SSE_RESPONSE_BYTES: usize = 256 * 1024;
 const CSP: &str = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 const PUBLIC_ORIGIN_ERROR: HttpError = HttpError {
     status: StatusCode::FORBIDDEN,
@@ -166,7 +168,7 @@ pub struct ServerState {
     pending_delivery_acknowledgements: Arc<AtomicUsize>,
     active_uploads: Arc<Mutex<HashSet<i64>>>,
     worker_tracker: Arc<WorkerTracker>,
-    resources: Arc<Mutex<ResourceCatalog>>,
+    events: EventStore,
     #[cfg(test)]
     test_acknowledgement_gate: Option<(Arc<Notify>, Arc<Semaphore>)>,
     #[cfg(test)]
@@ -196,6 +198,11 @@ impl ServerState {
         if trusted_proxy_cidrs.len() > MAX_TRUSTED_PROXY_CIDRS {
             return Err(RouteConfigurationError::InvalidConfiguration);
         }
+        let events = EventStore::open(ledger.database_path())
+            .map_err(|_| RouteConfigurationError::StorageUnavailable)?;
+        if !events.shares_database_with(ledger.database_path()) {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
         let trusted_proxies = trusted_proxy_cidrs
             .iter()
             .map(|cidr| IpCidr::from_str(cidr))
@@ -219,7 +226,7 @@ impl ServerState {
             pending_delivery_acknowledgements: Arc::new(AtomicUsize::new(0)),
             active_uploads: Arc::new(Mutex::new(HashSet::new())),
             worker_tracker: Arc::new(WorkerTracker::default()),
-            resources: Arc::new(Mutex::new(ResourceCatalog::default())),
+            events,
             #[cfg(test)]
             test_acknowledgement_gate: None,
             #[cfg(test)]
@@ -297,26 +304,20 @@ impl ServerState {
         if !valid_resource_id(id) || initial_state.is_empty() || initial_state.len() > 64 {
             return Err(RouteConfigurationError::InvalidConfiguration);
         }
-        self.resources
-            .lock()
-            .map_err(|_| RouteConfigurationError::StorageUnavailable)?
-            .jobs
-            .insert(
-                id.to_owned(),
-                JobRecord {
-                    state: initial_state.to_owned(),
-                },
-            );
+        self.events
+            .register_state(id, initial_state, self.default_event_expiry()?)
+            .map_err(map_event_configuration_error)?;
         Ok(())
     }
 
     pub fn job_status(&self, id: &str) -> Option<String> {
-        self.resources
-            .lock()
+        self.events
+            .snapshot(id)
             .ok()?
-            .jobs
-            .get(id)
-            .map(|job| job.state.clone())
+            .data
+            .get("state")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     pub fn register_artifact(
@@ -332,19 +333,62 @@ impl ServerState {
         let content_type = HeaderValue::from_str(content_type)
             .map_err(|_| RouteConfigurationError::InvalidConfiguration)?;
         let filename = safe_download_filename(filename);
-        self.resources
-            .lock()
-            .map_err(|_| RouteConfigurationError::StorageUnavailable)?
-            .artifacts
-            .insert(
-                id.to_owned(),
-                ArtifactRecord {
-                    path: path.as_ref().to_path_buf(),
-                    filename,
-                    content_type,
-                },
-            );
+        self.events
+            .register_artifact(
+                id,
+                path.as_ref(),
+                &filename,
+                content_type.to_str().unwrap_or("application/octet-stream"),
+                self.default_event_expiry()?,
+            )
+            .map_err(map_event_configuration_error)?;
         Ok(())
+    }
+
+    pub fn register_job_artifact(
+        &self,
+        job_id: &str,
+        artifact_id: &str,
+        path: impl AsRef<Path>,
+        filename: &str,
+        content_type: &str,
+    ) -> Result<(), RouteConfigurationError> {
+        if !valid_resource_id(job_id)
+            || !valid_resource_id(artifact_id)
+            || filename.is_empty()
+            || filename.len() > 255
+        {
+            return Err(RouteConfigurationError::InvalidConfiguration);
+        }
+        let content_type = HeaderValue::from_str(content_type)
+            .map_err(|_| RouteConfigurationError::InvalidConfiguration)?;
+        let filename = safe_download_filename(filename);
+        let artifact_subject = format!("artifact:{artifact_id}");
+        let expires_at = self
+            .capabilities
+            .latest_expiry_for_subject(&artifact_subject)
+            .map_err(|_| RouteConfigurationError::StorageUnavailable)?
+            .unwrap_or(self.default_event_expiry()?);
+        self.events
+            .register_job_artifact(
+                job_id,
+                artifact_id,
+                path.as_ref(),
+                &filename,
+                content_type.to_str().unwrap_or("application/octet-stream"),
+                expires_at,
+            )
+            .map_err(map_event_configuration_error)?;
+        Ok(())
+    }
+
+    fn default_event_expiry(&self) -> Result<i64, RouteConfigurationError> {
+        let expires_at = SystemTime::now()
+            .checked_add(self.capability_ttl)
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .and_then(|value| i64::try_from(value.as_secs()).ok())
+            .ok_or(RouteConfigurationError::InvalidConfiguration)?;
+        Ok(expires_at)
     }
 }
 
@@ -955,23 +999,6 @@ pub enum RouteConfigurationError {
     StorageUnavailable,
 }
 
-#[derive(Default)]
-struct ResourceCatalog {
-    jobs: HashMap<String, JobRecord>,
-    artifacts: HashMap<String, ArtifactRecord>,
-}
-
-struct JobRecord {
-    state: String,
-}
-
-#[derive(Clone)]
-struct ArtifactRecord {
-    path: PathBuf,
-    filename: String,
-    content_type: HeaderValue,
-}
-
 /// Builds the same HTTP handler as [`serve`] for in-process route tests.
 pub fn router(
     state: ServerState,
@@ -1015,6 +1042,18 @@ where
             return Err(io::Error::other(
                 "upload session startup reconciliation failed",
             ));
+        }
+    }
+    let startup_events = state.events.clone();
+    let startup_event_deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    match run_storage(&state, startup_event_deadline, move || {
+        startup_events.reconcile_expired()
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => {
+            return Err(io::Error::other("job event startup reconciliation failed"));
         }
     }
     let mut maintenance = tokio::time::interval(SESSION_CLEANUP_INTERVAL);
@@ -1238,6 +1277,20 @@ where
                         break 'accept;
                     }
                 }
+                let events = state.events.clone();
+                let event_deadline =
+                    tokio::time::Instant::now() + state.storage_operation_timeout;
+                match run_storage(&state, event_deadline, move || {
+                    events.reconcile_expired()
+                }).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) | Err(_) => {
+                        serve_error = Some(io::Error::other(
+                            "job event periodic reconciliation failed",
+                        ));
+                        break 'accept;
+                    }
+                }
             }
             _ = &mut shutdown => break 'accept,
             _ = connections.join_next(), if !connections.is_empty() => {}
@@ -1382,11 +1435,11 @@ async fn dispatch(
         ("PUT", ["v1", "upload-sessions", session_id, "content"]) => {
             upload_content(request, state, session_id).await
         }
-        ("GET", ["v1", "jobs", job_id, "events"]) => job_events(request, state, job_id),
-        ("GET", ["v1", "jobs", job_id]) => job_status(request, state, job_id),
-        ("DELETE", ["v1", "jobs", job_id]) => cancel_job(request, state, job_id),
+        ("GET", ["v1", "jobs", job_id, "events"]) => job_events(request, state, job_id).await,
+        ("GET", ["v1", "jobs", job_id]) => job_status(request, state, job_id).await,
+        ("DELETE", ["v1", "jobs", job_id]) => cancel_job(request, state, job_id).await,
         ("GET", ["v1", "artifacts", artifact_id, "download"]) => {
-            download_artifact(request, state, artifact_id)
+            download_artifact(request, state, artifact_id).await
         }
         _ => Err(HttpError::not_found()),
     }
@@ -1572,99 +1625,149 @@ where
     }
 }
 
-fn job_status(
+async fn reconcile_event_expiry(state: &ServerState) -> Result<(), HttpError> {
+    let events = state.events.clone();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    match run_storage(state, deadline, move || events.reconcile_expired()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(HttpError::storage_unavailable()),
+    }
+}
+
+async fn job_status(
     request: Request<HttpBody>,
     state: &ServerState,
     job_id: &str,
 ) -> Result<Response<HttpBody>, HttpError> {
     validate_resource_id(job_id)?;
+    reconcile_event_expiry(state).await?;
     let subject = format!("job:{job_id}");
     authorize(request.headers(), state, &subject, Scope::Status)?;
-    let status = state
-        .resources
-        .lock()
+    let events = state.events.clone();
+    let owned_job_id = job_id.to_owned();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    let snapshot = run_storage(state, deadline, move || events.snapshot(&owned_job_id))
+        .await
         .map_err(|_| HttpError::storage_unavailable())?
-        .jobs
-        .get(job_id)
-        .map(|job| job.state.clone())
-        .ok_or_else(HttpError::not_found)?;
+        .map_err(map_event_store_error)?;
     Ok(json_response(
         StatusCode::OK,
-        json!({"job_id": job_id, "state": status}),
+        snapshot_response(job_id, snapshot),
     ))
 }
 
-fn job_events(
+async fn job_events(
     request: Request<HttpBody>,
     state: &ServerState,
     job_id: &str,
 ) -> Result<Response<HttpBody>, HttpError> {
     validate_resource_id(job_id)?;
+    reconcile_event_expiry(state).await?;
     let subject = format!("job:{job_id}");
     authorize(request.headers(), state, &subject, Scope::Events)?;
-    let status = state
-        .resources
-        .lock()
-        .map_err(|_| HttpError::storage_unavailable())?
-        .jobs
-        .get(job_id)
-        .map(|job| job.state.clone())
-        .ok_or_else(HttpError::not_found)?;
-    let event = format!(
-        "id: 1\nevent: job.state_changed\ndata: {}\n\n",
-        json!({"job_id": job_id, "state": status})
-    );
-    let mut response = Response::new(full_body(Bytes::from(event)));
+    let last_event_id = parse_last_event_id(request.headers())?;
+    let events = state.events.clone();
+    let owned_job_id = job_id.to_owned();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    let replay = run_storage(state, deadline, move || {
+        events.replay_after(&owned_job_id, last_event_id)
+    })
+    .await
+    .map_err(|_| HttpError::storage_unavailable())?
+    .map_err(map_event_store_error)?;
+
+    let (body, must_close) = match replay {
+        ReplayResult::Events { events, .. } => {
+            let mut body = String::new();
+            for event in events {
+                let data = value_with_revision(event.data, event.revision);
+                body.push_str(&sse_frame(event.revision, &event.event_type, &data)?);
+                if body.len() > MAX_SSE_RESPONSE_BYTES {
+                    return Err(HttpError::storage_unavailable());
+                }
+            }
+            (body, false)
+        }
+        ReplayResult::ResyncRequired(snapshot) => {
+            let data = json!({
+                "revision": snapshot.revision,
+                "snapshot": snapshot_response(job_id, snapshot),
+            });
+            (
+                sse_frame(
+                    data["revision"].as_u64().unwrap_or_default(),
+                    "resync_required",
+                    &data,
+                )?,
+                true,
+            )
+        }
+    };
+    let mut response = Response::new(full_body(Bytes::from(body)));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream; charset=utf-8"),
     );
+    if must_close {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
     Ok(response)
 }
 
-fn cancel_job(
+async fn cancel_job(
     request: Request<HttpBody>,
     state: &ServerState,
     job_id: &str,
 ) -> Result<Response<HttpBody>, HttpError> {
     validate_resource_id(job_id)?;
+    reconcile_event_expiry(state).await?;
     let subject = format!("job:{job_id}");
     authorize(request.headers(), state, &subject, Scope::Cancel)?;
-    let mut resources = state
-        .resources
-        .lock()
-        .map_err(|_| HttpError::storage_unavailable())?;
-    let job = resources
-        .jobs
-        .get_mut(job_id)
-        .ok_or_else(HttpError::not_found)?;
-    job.state = "cancelled".to_owned();
+    let events = state.events.clone();
+    let owned_job_id = job_id.to_owned();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    run_storage(state, deadline, move || {
+        let snapshot = events.snapshot(&owned_job_id)?;
+        if snapshot.data.get("state").and_then(Value::as_str) == Some("cancelled") {
+            return Ok(());
+        }
+        let data = json!({"job_id": owned_job_id, "state": "cancelled"});
+        events.append(&owned_job_id, "job.state_changed", &data, &data)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| HttpError::storage_unavailable())?
+    .map_err(map_event_store_error)?;
     Ok(empty_response(StatusCode::ACCEPTED))
 }
 
-fn download_artifact(
+async fn download_artifact(
     request: Request<HttpBody>,
     state: &ServerState,
     artifact_id: &str,
 ) -> Result<Response<HttpBody>, HttpError> {
     validate_resource_id(artifact_id)?;
+    reconcile_event_expiry(state).await?;
     let subject = format!("artifact:{artifact_id}");
     authorize(request.headers(), state, &subject, Scope::Download)?;
-    let artifact = state
-        .resources
-        .lock()
+    let events = state.events.clone();
+    let owned_artifact_id = artifact_id.to_owned();
+    let deadline = tokio::time::Instant::now() + state.storage_operation_timeout;
+    let artifact = run_storage(state, deadline, move || events.artifact(&owned_artifact_id))
+        .await
         .map_err(|_| HttpError::storage_unavailable())?
-        .artifacts
-        .get(artifact_id)
-        .cloned()
-        .ok_or_else(HttpError::not_found)?;
+        .map_err(map_event_store_error)?;
     let bytes = std::fs::read(&artifact.path).map_err(|_| HttpError::storage_unavailable())?;
     let mut response = Response::new(full_body(Bytes::from(bytes)));
     *response.status_mut() = StatusCode::OK;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, artifact.content_type);
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.content_type)
+            .map_err(|_| HttpError::storage_unavailable())?,
+    );
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{}\"", artifact.filename))
@@ -2118,6 +2221,95 @@ fn map_limit_error(error: LimitError) -> HttpError {
             HttpError::bad_request("invalid_request", "The upload request is invalid.")
         }
         _ => HttpError::storage_unavailable(),
+    }
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<u64, HttpError> {
+    let mut values = headers.get_all("last-event-id").iter();
+    let Some(value) = values.next() else {
+        return Ok(0);
+    };
+    if values.next().is_some() {
+        return Err(HttpError::bad_request(
+            "invalid_last_event_id",
+            "The event revision is invalid.",
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        HttpError::bad_request("invalid_last_event_id", "The event revision is invalid.")
+    })?;
+    if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(HttpError::bad_request(
+            "invalid_last_event_id",
+            "The event revision is invalid.",
+        ));
+    }
+    let revision = value.parse::<u64>().map_err(|_| {
+        HttpError::bad_request("invalid_last_event_id", "The event revision is invalid.")
+    })?;
+    if revision.to_string() != value {
+        return Err(HttpError::bad_request(
+            "invalid_last_event_id",
+            "The event revision is invalid.",
+        ));
+    }
+    Ok(revision)
+}
+
+fn snapshot_response(job_id: &str, snapshot: JobSnapshot) -> Value {
+    let mut snapshot = value_with_revision(snapshot.data, snapshot.revision);
+    if let Value::Object(ref mut object) = snapshot {
+        object
+            .entry("job_id".to_owned())
+            .or_insert_with(|| Value::String(job_id.to_owned()));
+    }
+    snapshot
+}
+
+fn value_with_revision(mut value: Value, revision: u64) -> Value {
+    if let Value::Object(ref mut object) = value {
+        object.insert("revision".to_owned(), Value::from(revision));
+        value
+    } else {
+        json!({"revision": revision, "data": value})
+    }
+}
+
+fn sse_frame(revision: u64, event_type: &str, data: &Value) -> Result<String, HttpError> {
+    let data = serde_json::to_string(data).map_err(|_| HttpError::storage_unavailable())?;
+    let frame = format!("id: {revision}\nevent: {event_type}\ndata: {data}\n\n");
+    if frame.len() > MAX_SSE_RESPONSE_BYTES {
+        return Err(HttpError::storage_unavailable());
+    }
+    Ok(frame)
+}
+
+fn map_event_store_error(error: EventStoreError) -> HttpError {
+    match error {
+        EventStoreError::JobNotFound | EventStoreError::Expired => HttpError::not_found(),
+        EventStoreError::FutureRevision => HttpError::bad_request(
+            "last_event_id_in_future",
+            "The event revision is newer than the current job revision.",
+        ),
+        EventStoreError::Storage(_)
+        | EventStoreError::Capacity
+        | EventStoreError::RevisionExhausted
+        | EventStoreError::InvalidRecord
+        | EventStoreError::Corrupt => HttpError::storage_unavailable(),
+    }
+}
+
+fn map_event_configuration_error(error: EventStoreError) -> RouteConfigurationError {
+    match error {
+        EventStoreError::InvalidRecord | EventStoreError::JobNotFound => {
+            RouteConfigurationError::InvalidConfiguration
+        }
+        EventStoreError::Storage(_)
+        | EventStoreError::FutureRevision
+        | EventStoreError::Expired
+        | EventStoreError::Capacity
+        | EventStoreError::RevisionExhausted
+        | EventStoreError::Corrupt => RouteConfigurationError::StorageUnavailable,
     }
 }
 

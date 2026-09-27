@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod events;
 mod ledger;
 pub mod routes;
 
