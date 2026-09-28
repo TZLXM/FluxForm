@@ -1190,6 +1190,21 @@ fn complete_workflow_keeps_reviewed_raw_evidence_on_the_protected_runner() {
 
 #[cfg(any(windows, unix))]
 #[test]
+fn bash_snapshot_failure_regression_preserves_primary_diagnostic() {
+    let root = workspace_root();
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let output = Command::new(python)
+        .arg(root.join("scripts/test_check_stage0_snapshot_failure.py"))
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "{text}");
+}
+
+#[cfg(any(windows, unix))]
+#[test]
 fn desktop_build_uses_a_target_snapshot_and_preserves_source_status() {
     let directory = TempDir::new().unwrap();
     let (bin, log) = pnpm_shim(directory.path());

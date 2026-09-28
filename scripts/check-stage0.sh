@@ -116,6 +116,17 @@ run_logged() {
   run_logged_in_directory "$name" '' "$executable" "$@"
 }
 
+first_logged_diagnostic() {
+  local log_path="$1" line
+  [[ -f "$log_path" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == +* || "$line" == exit_code=* ]] && continue
+    printf '%s\n' "${line:0:512}"
+    return 0
+  done <"$log_path"
+  return 1
+}
+
 run_cargo() {
   local name="$1"; shift
   if ! command -v cargo >/dev/null 2>&1; then
@@ -417,9 +428,17 @@ run_gate() {
       local python_command
       python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to make an isolated desktop source snapshot.'; return 1; }
       local source_status_before source_status_after snapshot snapshot_failed=0 install_failed=0 build_failed=0 cleanup_failed=0 status_failed=0
+      local snapshot_gate_status='' snapshot_gate_reason='' snapshot_diagnostic=''
+      local cleanup_gate_status='' cleanup_gate_reason='' cleanup_diagnostic='' safe_name="${name//[^A-Za-z0-9_.-]/_}"
+      local snapshot_log="$run_root/$safe_name-snapshot.log" cleanup_log="$run_root/$safe_name-snapshot-cleanup.log"
       source_status_before="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { blocked 'git status could not verify source-tree cleanliness around the desktop build.'; return 1; }
       snapshot="$run_root/desktop-source"
-      if ! run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot"; then snapshot_failed=1; fi
+      if ! run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot"; then
+        snapshot_failed=1
+        snapshot_gate_status="$gate_status"
+        snapshot_gate_reason="$gate_reason"
+        if ! snapshot_diagnostic="$(first_logged_diagnostic "$snapshot_log")"; then snapshot_diagnostic=''; fi
+      fi
       if ((snapshot_failed == 0)); then
         if ! run_logged "$name-pnpm-install" pnpm --store-dir "$evidence_root/pnpm-store" --dir "$snapshot/apps/desktop-probe" install --offline --frozen-lockfile; then install_failed=1; fi
         if ((install_failed == 0)); then
@@ -427,16 +446,31 @@ run_gate() {
         fi
       fi
       if [[ -e "$snapshot" || -L "$snapshot" ]]; then
-        if ! run_logged "$name-snapshot-cleanup" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" --cleanup; then cleanup_failed=1; fi
+        if ! run_logged "$name-snapshot-cleanup" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" --cleanup; then
+          cleanup_failed=1
+          cleanup_gate_status="$gate_status"
+          cleanup_gate_reason="$gate_reason"
+          if ! cleanup_diagnostic="$(first_logged_diagnostic "$cleanup_log")"; then cleanup_diagnostic=''; fi
+        fi
       fi
       source_status_after="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || status_failed=1
-      if ((cleanup_failed)); then
-        if ((snapshot_failed)); then gate_reason+="; additionally could not safely clean this invocation-owned desktop snapshot"; else failed 'could not safely clean this invocation-owned desktop snapshot.'; fi
+      if ((snapshot_failed)); then
+        gate_status="$snapshot_gate_status"
+        gate_reason="$snapshot_gate_reason"
+        if [[ -n "$snapshot_diagnostic" ]]; then gate_reason+="; snapshot diagnostic: $snapshot_diagnostic"; fi
+        if ((cleanup_failed)); then
+          gate_reason+="; cleanup also failed: $cleanup_gate_reason"
+          if [[ -n "$cleanup_diagnostic" ]]; then gate_reason+="; cleanup diagnostic: $cleanup_diagnostic"; fi
+        fi
+      elif ((cleanup_failed)); then
+        gate_status="$cleanup_gate_status"
+        gate_reason="$cleanup_gate_reason"
+        if [[ -n "$cleanup_diagnostic" ]]; then gate_reason+="; cleanup diagnostic: $cleanup_diagnostic"; fi
       fi
       if ((status_failed)); then
-        if ((snapshot_failed)); then gate_reason+="; additionally git status could not verify source-tree cleanliness after the desktop build"; else failed 'git status could not verify source-tree cleanliness after the desktop build.'; fi
+        if ((snapshot_failed || cleanup_failed)); then gate_reason+="; post-status check failed: git status could not verify source-tree cleanliness after the desktop build"; else failed 'git status could not verify source-tree cleanliness after the desktop build.'; fi
       elif [[ "$source_status_after" != "$source_status_before" ]]; then
-        if ((snapshot_failed)); then gate_reason+="; additionally desktop build changed source Git status"; else failed 'desktop build changed source Git status; build outputs must stay in target/stage0.'; fi
+        if ((snapshot_failed || cleanup_failed)); then gate_reason+="; post-status check failed: desktop build changed source Git status"; else failed 'desktop build changed source Git status; build outputs must stay in target/stage0.'; fi
       fi
       if ((snapshot_failed || cleanup_failed || status_failed)) || [[ "$source_status_after" != "$source_status_before" ]]; then return 1; fi
       if ((install_failed)); then blocked 'offline frozen pnpm install failed; no download was attempted.'; return 1; fi
