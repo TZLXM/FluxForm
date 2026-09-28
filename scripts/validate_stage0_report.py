@@ -781,7 +781,9 @@ def validate_semantics(repo_root: Path, row: int, result: object, artifact_ident
             raise EvidenceBlocked("native aggregate actual raw-byte SHA-256 is missing")
         if aggregate_report_path is None:
             raise EvidenceBlocked("current collector output is required to prove the reviewed aggregate raw-byte identity")
-        _validate_aggregate_execution_receipt(repo_root, aggregate_report_path, attestation, aggregate, aggregate_raw_digest)
+        receipt_file_digests = _validate_aggregate_execution_receipt(
+            repo_root, aggregate_report_path, attestation, aggregate, aggregate_raw_digest
+        )
         for target_id, (triple, runner_os, runner_arch) in SAMPLE_TARGETS.items():
             profile = exact_keys(role_documents.get(f"profile-report-{target_id}"), PROBE_REPORT_FIELDS, f"{target_id} ProbeReport")
             sample = exact_keys(role_documents.get(f"sample-report-{target_id}"), SAMPLE_REPORT_FIELDS, f"{target_id} sample report")
@@ -794,10 +796,19 @@ def validate_semantics(repo_root: Path, row: int, result: object, artifact_ident
             _validate_row7_result_matrix(repo_root, sample, edge_values, samples)
             if provenance["schema"] != "fluxform.native-sample-artifact.v1" or provenance["workflow_run_id"] != attestation["workflow_run_id"] or provenance["git_commit"] != attestation["commit_sha"] or sample["git_commit"] != attestation["commit_sha"]:
                 raise EvidenceBlocked(f"{target_id} native provenance is not bound to this workflow run and commit")
+            if (
+                provenance["artifact_name"] != f"stage0-samples-{target_id}-{aggregate['evidence_input_digest']}"
+                or (provenance["target_profile_id"], provenance["target_triple"], provenance["runner_os"], provenance["runner_arch"])
+                != (target_id, triple, runner_os, runner_arch)
+            ):
+                raise EvidenceBlocked(f"{target_id} native provenance artifact and target identity do not match its native platform")
             if not provenance["workflow_job_id"] or not all(re.fullmatch(r"[0-9a-f]{64}", str(provenance[field])) for field in ("ffmpeg_profile_report_sha256", "sample_report_sha256")):
                 raise EvidenceBlocked(f"{target_id} native provenance has a missing job identity or report hash")
             if role_digests.get(f"profile-report-{target_id}") != provenance["ffmpeg_profile_report_sha256"] or role_digests.get(f"sample-report-{target_id}") != provenance["sample_report_sha256"]:
                 raise EvidenceBlocked(f"{target_id} provenance hashes do not match the actual reviewed raw bytes")
+            collected_provenance_path = f"target/stage0/collected/{target_id}/provenance.json"
+            if role_digests.get(f"provenance-{target_id}") != receipt_file_digests.get(collected_provenance_path):
+                raise EvidenceBlocked(f"{target_id} reviewed provenance bytes do not match the same-run receipt file closure")
             if (sample["target_triple"], sample["target_profile_id"], sample["runner_os"], sample["runner_arch"]) != (triple, target_id, runner_os, runner_arch):
                 raise EvidenceBlocked(f"{target_id} sample result target identity does not match its native platform")
             if sample["evidence_input_digest"] != aggregate["evidence_input_digest"] or provenance["evidence_input_digest"] != aggregate["evidence_input_digest"]:
@@ -917,7 +928,7 @@ def _validate_aggregate_execution_receipt(
     attestation: dict,
     aggregate: dict,
     aggregate_digest: str,
-) -> None:
+) -> dict[str, str]:
     root = repo_root.resolve(strict=True)
     aggregate_path = Path(os.path.abspath(aggregate_report_path))
     try:
@@ -1043,6 +1054,7 @@ def _validate_aggregate_execution_receipt(
         raise EvidenceBlocked("same-run aggregate receipt does not bind the exact current collector/manifest/catalog/profile/log file closure")
     if receipt["closure_digest"] != _serialized_sha256(expected_records):
         raise EvidenceBlocked("same-run aggregate receipt closure digest is stale")
+    return {item["path"]: item["sha256"] for item in normalized_files}
 
 
 def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, str, str, PurePosixPath]], attestation: dict, aggregate_report_path: Path | None) -> None:

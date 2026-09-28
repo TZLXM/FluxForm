@@ -661,6 +661,43 @@ class Stage0EvidenceParserTests(unittest.TestCase):
             }):
                 validator.validate_bundle(fixture["root"], [fixture["reference"]], fixture["attestation"], fixture["aggregate_path"])
 
+    def test_row7_rejects_replaced_provenance_after_descriptor_updates(self) -> None:
+        target_id = "windows-x86_64"
+        replacements = {
+            "artifact_name": "stage0-samples-linux-x86_64-" + "d" * 64,
+            "target_profile_id": "macos-x86_64",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "runner_os": "linux",
+            "runner_arch": "aarch64",
+            # This otherwise-valid job ID mutation specifically exercises receipt-byte binding.
+            "workflow_job_id": "another-nonempty-job",
+        }
+        for field, value in replacements.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                fixture = _row7_fixture(Path(directory))
+                provenance = dict(fixture["documents"][f"provenance-{target_id}"])
+                provenance[field] = value
+                raw_entry = next(
+                    item for item in fixture["raw_entries"]
+                    if item["role"] == f"provenance-{target_id}"
+                )
+                raw_path = fixture["root"] / raw_entry["path"]
+                raw_bytes = _canonical_json(provenance)
+                raw_path.write_bytes(raw_bytes)
+                raw_entry["sha256"] = _sha256(raw_bytes)
+                fixture["manifest_path"].write_bytes(_canonical_json(fixture["manifest"]))
+                manifest_sha = _sha256(fixture["manifest_path"].read_bytes())
+                fixture["reference"] = (*fixture["reference"][:3], manifest_sha, *fixture["reference"][4:])
+                _refresh_attestation(fixture["root"], fixture["attestation"], fixture["manifest_path"])
+                with mock.patch.object(validator, "_validate_probe_report"), mock.patch.dict(os.environ, {
+                    "GITHUB_SHA": fixture["commit"], "GITHUB_RUN_ID": fixture["run_id"],
+                    "GITHUB_ACTOR": "reviewer", "STAGE0_REVIEWED_EVIDENCE_ENV": "stage0-manual-review",
+                }):
+                    with self.assertRaises(validator.EvidenceBlocked):
+                        validator.validate_bundle(
+                            fixture["root"], [fixture["reference"]], fixture["attestation"], fixture["aggregate_path"]
+                        )
+
     def test_row7_rejects_replaced_raw_bytes_even_when_descriptor_hash_is_updated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = _row7_fixture(Path(directory))
