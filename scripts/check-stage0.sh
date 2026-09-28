@@ -420,7 +420,7 @@ run_gate() {
       source_status_before="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { blocked 'git status could not verify source-tree cleanliness around the desktop build.'; return 1; }
       snapshot="$run_root/desktop-source"
       run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" || return 1
-      if ! run_logged "$name-pnpm-install" pnpm --dir "$snapshot/apps/desktop-probe" install --offline --frozen-lockfile; then install_failed=1; fi
+      if ! run_logged "$name-pnpm-install" pnpm --store-dir "$evidence_root/pnpm-store" --dir "$snapshot/apps/desktop-probe" install --offline --frozen-lockfile; then install_failed=1; fi
       if ((install_failed == 0)); then
         if ! run_logged "$name" pnpm --dir "$snapshot/apps/desktop-probe" run tauri:build --no-bundle; then build_failed=1; fi
       fi

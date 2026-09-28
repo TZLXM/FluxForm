@@ -56,7 +56,7 @@ jobs:
           path: apps/desktop-probe/node_modules
           key: windows-desktop-${{ hashFiles('apps/desktop-probe/pnpm-lock.yaml') }}
       - name: Install pinned desktop dependencies
-        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+        run: pnpm --store-dir "${{ github.workspace }}/target/stage0/pnpm-store" --dir apps/desktop-probe install --frozen-lockfile
       - name: Automated Stage 0 gates
         shell: pwsh
         run: >-
@@ -103,7 +103,7 @@ jobs:
           path: apps/desktop-probe/node_modules
           key: macos-desktop-${{ hashFiles('apps/desktop-probe/pnpm-lock.yaml') }}
       - name: Install pinned desktop dependencies
-        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+        run: pnpm --store-dir "${{ github.workspace }}/target/stage0/pnpm-store" --dir apps/desktop-probe install --frozen-lockfile
       - name: Automated Stage 0 gates
         shell: bash
         run: >-
@@ -154,7 +154,7 @@ jobs:
           path: apps/desktop-probe/node_modules
           key: ubuntu-desktop-${{ hashFiles('apps/desktop-probe/pnpm-lock.yaml') }}
       - name: Install pinned desktop dependencies
-        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+        run: pnpm --store-dir "${{ github.workspace }}/target/stage0/pnpm-store" --dir apps/desktop-probe install --frozen-lockfile
       - name: Automated Stage 0 gates
         shell: bash
         run: >-
@@ -464,7 +464,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/desktop-probe/pnpm-lock.yaml
       - name: Prepare pinned desktop dependencies before offline gate execution
-        run: pnpm --dir apps/desktop-probe install --frozen-lockfile
+        run: pnpm --store-dir "${{ github.workspace }}/target/stage0/pnpm-store" --dir apps/desktop-probe install --frozen-lockfile
       - name: Download this run's native sample reports
         uses: actions/download-artifact@v4
         with:

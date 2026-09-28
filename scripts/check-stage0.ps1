@@ -397,7 +397,7 @@ function Invoke-Stage0Gate {
             try {
                 Invoke-LoggedCommand -Name "$Name-snapshot" -Executable $python.Source -Arguments @((Join-Path $scriptRoot 'prepare_stage0_desktop_source.py'), '--repo-root', $repoRoot, '--destination', $sourceSnapshot)
                 try {
-                    Invoke-LoggedCommand -Name "$Name-pnpm-install" -Executable 'pnpm' -Arguments @('--dir', (Join-Path $sourceSnapshot 'apps/desktop-probe'), 'install', '--offline', '--frozen-lockfile')
+                    Invoke-LoggedCommand -Name "$Name-pnpm-install" -Executable 'pnpm' -Arguments @('--store-dir', (Join-Path $evidenceRoot 'pnpm-store'), '--dir', (Join-Path $sourceSnapshot 'apps/desktop-probe'), 'install', '--offline', '--frozen-lockfile')
                 } catch {
                     throw "BLOCKED: offline frozen pnpm install failed; no download was attempted. $($_.Exception.Message)"
                 }
