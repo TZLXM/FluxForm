@@ -58,6 +58,7 @@ run_root="$evidence_root/runs/$run_id"
 mkdir -p -- "$run_root"
 report_path="${report_path:-$repo_root/docs/architecture/stage-0-gate-report.md}"
 export CARGO_NET_OFFLINE=true
+export CARGO_TARGET_DIR="$evidence_root/cargo-target"
 
 automated_defaults=(format clippy protocol contract-drift capabilities ffmpeg-profile-tests atomic-output sandbox-unit server-probe desktop-probe-modes desktop-build ffmpeg-profile)
 complete_defaults=(ffmpeg-artifacts aggregate-samples report public-server-linux)
@@ -84,8 +85,8 @@ log_command() {
   "$@" >/dev/null 2>&1 && return 0
 }
 
-run_logged() {
-  local name="$1"; local executable="$2"; shift 2
+run_logged_in_directory() {
+  local name="$1"; local working_directory="$2"; local executable="$3"; shift 3
   local safe_name="${name//[^A-Za-z0-9_.-]/_}"
   local log_path="$run_root/$safe_name.log"
   {
@@ -93,8 +94,14 @@ run_logged() {
     printf ' %q' "$@"
     printf '\n'
   } | tee "$log_path"
-  "$executable" "$@" 2>&1 | tee -a "$log_path"
-  local exit_code=${PIPESTATUS[0]}
+  local exit_code
+  if [[ -n "$working_directory" ]]; then
+    (cd -- "$working_directory" && "$executable" "$@") 2>&1 | tee -a "$log_path"
+    exit_code=${PIPESTATUS[0]}
+  else
+    "$executable" "$@" 2>&1 | tee -a "$log_path"
+    exit_code=${PIPESTATUS[0]}
+  fi
   printf '\nexit_code=%s\n' "$exit_code" >>"$log_path"
   printf 'log: %s\n' "$log_path"
   if ((exit_code != 0)); then
@@ -102,6 +109,11 @@ run_logged() {
     gate_reason="command exited $exit_code: $executable $*"
     return 1
   fi
+}
+
+run_logged() {
+  local name="$1"; local executable="$2"; shift 2
+  run_logged_in_directory "$name" '' "$executable" "$@"
 }
 
 run_cargo() {
@@ -112,6 +124,65 @@ run_cargo() {
     return 1
   fi
   run_logged "$name" cargo --locked --offline "$@"
+}
+
+run_cargo_in_directory() {
+  local name="$1"; local working_directory="$2"; shift 2
+  if ! command -v cargo >/dev/null 2>&1; then
+    gate_status='BLOCKED'
+    gate_reason='cargo is not installed or is not on PATH.'
+    return 1
+  fi
+  run_logged_in_directory "$name" "$working_directory" cargo --locked --offline "$@"
+}
+
+run_isolated_desktop_cargo_commands() {
+  local name="$1"; local command_group="$2"
+  local source_status_before source_status_after snapshot python_command
+  local operation_failed=0 cleanup_failed=0
+  source_status_before="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { blocked 'git status could not verify source-tree cleanliness around desktop Cargo gates.'; return 1; }
+  snapshot="$run_root/desktop-source"
+  python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to make an isolated desktop source snapshot.'; operation_failed=1; }
+
+  if ((operation_failed == 0)); then
+    run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" || operation_failed=1
+  fi
+  if ((operation_failed == 0)); then
+    case "$command_group" in
+      clippy)
+        run_cargo_in_directory "$name-transparent-orb" "$snapshot" clippy -p fluxform-desktop-probe --all-targets -- -D warnings || operation_failed=1
+        if ((operation_failed == 0)); then run_cargo_in_directory "$name-rectangular-hit-region" "$snapshot" clippy -p fluxform-desktop-probe --no-default-features --features probe-transparent-window-with-rectangular-hit-region --all-targets -- -D warnings || operation_failed=1; fi
+        if ((operation_failed == 0)); then run_cargo_in_directory "$name-opaque-fallback" "$snapshot" clippy -p fluxform-desktop-probe --no-default-features --features probe-opaque-frameless-fallback --all-targets -- -D warnings || operation_failed=1; fi
+        ;;
+      tests)
+        run_cargo_in_directory "$name-transparent-orb" "$snapshot" test -p fluxform-desktop-probe --all-targets || operation_failed=1
+        if ((operation_failed == 0)); then run_cargo_in_directory "$name-rectangular-hit-region" "$snapshot" test -p fluxform-desktop-probe --no-default-features --features probe-transparent-window-with-rectangular-hit-region --all-targets || operation_failed=1; fi
+        if ((operation_failed == 0)); then run_cargo_in_directory "$name-opaque-fallback" "$snapshot" test -p fluxform-desktop-probe --no-default-features --features probe-opaque-frameless-fallback --all-targets || operation_failed=1; fi
+        ;;
+      *)
+        failed "unknown isolated desktop Cargo command group: $command_group"
+        operation_failed=1
+        ;;
+    esac
+  fi
+
+  if [[ -d "$snapshot" ]]; then
+    if [[ -n "$python_command" ]]; then
+      run_logged "$name-snapshot-cleanup" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" --cleanup || cleanup_failed=1
+    else
+      failed 'cannot safely clean the isolated desktop source snapshot without Python 3.'
+      cleanup_failed=1
+    fi
+  fi
+
+  source_status_after="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { failed 'git status could not verify source-tree cleanliness after desktop Cargo gates.'; return 1; }
+  if [[ "$source_status_after" != "$source_status_before" ]]; then
+    failed 'desktop Cargo gates changed source Git status; build outputs must stay in target/stage0.'
+    return 1
+  fi
+  if ((cleanup_failed)); then failed 'could not safely clean this invocation-owned desktop source snapshot.'; return 1; fi
+  if ((operation_failed)); then return 1; fi
+  return 0
 }
 
 blocked() { gate_status='BLOCKED'; gate_reason="$1"; return 1; }
@@ -320,9 +391,7 @@ run_gate() {
     format) run_cargo "$name" fmt --all -- --check || return 1 ;;
     clippy)
       run_cargo "$name" clippy --workspace --exclude fluxform-desktop-probe --all-targets --all-features -- -D warnings || return 1
-      run_cargo "$name-desktop-transparent-orb" clippy -p fluxform-desktop-probe --all-targets -- -D warnings || return 1
-      run_cargo "$name-desktop-rectangular-hit-region" clippy -p fluxform-desktop-probe --no-default-features --features probe-transparent-window-with-rectangular-hit-region --all-targets -- -D warnings || return 1
-      run_cargo "$name-desktop-opaque-fallback" clippy -p fluxform-desktop-probe --no-default-features --features probe-opaque-frameless-fallback --all-targets -- -D warnings || return 1
+      run_isolated_desktop_cargo_commands "$name-desktop" clippy || return 1
       ;;
     protocol) run_cargo "$name" test -p fluxform-protocol --all-targets --all-features || return 1 ;;
     contract-drift) run_cargo "$name" test -p fluxform-protocol --test contracts committed_contracts_match_the_rust_source || return 1 ;;
@@ -338,9 +407,7 @@ run_gate() {
       run_cargo "$name" test -p fluxform-server-probe --all-targets --all-features || return 1
       ;;
     desktop-probe-modes)
-      run_cargo "$name-transparent-orb" test -p fluxform-desktop-probe --all-targets || return 1
-      run_cargo "$name-rectangular-hit-region" test -p fluxform-desktop-probe --no-default-features --features probe-transparent-window-with-rectangular-hit-region --all-targets || return 1
-      run_cargo "$name-opaque-fallback" test -p fluxform-desktop-probe --no-default-features --features probe-opaque-frameless-fallback --all-targets || return 1
+      run_isolated_desktop_cargo_commands "$name" tests || return 1
       ;;
     desktop-build)
       if ! command -v pnpm >/dev/null 2>&1; then echo 'SKIPPED: pnpm is unavailable; no package was installed.'; gate_status='SKIPPED'; return 0; fi

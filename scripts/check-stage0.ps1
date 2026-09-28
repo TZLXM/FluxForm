@@ -83,8 +83,10 @@ $knownGates = @($automatedDefaults + $completeDefaults | Select-Object -Unique)
 $results = [ordered]@{}
 $stopAfterFailure = $false
 $previousOffline = $env:CARGO_NET_OFFLINE
+$previousCargoTargetDirectory = $env:CARGO_TARGET_DIR
 $previousPythonNoBytecode = $env:PYTHONDONTWRITEBYTECODE
 $env:CARGO_NET_OFFLINE = 'true'
+$env:CARGO_TARGET_DIR = Join-Path $evidenceRoot 'cargo-target'
 $env:PYTHONDONTWRITEBYTECODE = '1'
 
 function Write-Stage0Log {
@@ -96,17 +98,26 @@ function Write-Stage0Log {
 }
 
 function Invoke-LoggedCommand {
-    param([string] $Name, [string] $Executable, [string[]] $Arguments)
+    param([string] $Name, [string] $Executable, [string[]] $Arguments, [string] $WorkingDirectory)
     $rendered = @("$Executable $($Arguments -join ' ')")
     Write-Host "+ $($rendered[0])"
     $previousErrorActionPreference = $ErrorActionPreference
+    $locationPushed = $false
     try {
+        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            Push-Location -LiteralPath $WorkingDirectory
+            $locationPushed = $true
+        }
         # Cargo reports normal progress on stderr. Capture it without promoting it to a terminating PowerShell error.
         $ErrorActionPreference = 'Continue'
         $lines = @(& $Executable @Arguments 2>&1 | ForEach-Object { [string] $_ })
         $exitCode = $LASTEXITCODE
     } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+        try {
+            if ($locationPushed) { Pop-Location }
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
     }
     Write-Stage0Log -Name $Name -Lines @($rendered + $lines + "exit_code=$exitCode")
     foreach ($line in $lines) { Write-Host $line }
@@ -116,11 +127,11 @@ function Invoke-LoggedCommand {
 }
 
 function Invoke-Cargo {
-    param([string] $Name, [string[]] $Arguments)
+    param([string] $Name, [string[]] $Arguments, [string] $WorkingDirectory)
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         throw 'BLOCKED: cargo is not installed or is not on PATH.'
     }
-    Invoke-LoggedCommand -Name $Name -Executable 'cargo' -Arguments (@('--locked', '--offline') + $Arguments)
+    Invoke-LoggedCommand -Name $Name -Executable 'cargo' -Arguments (@('--locked', '--offline') + $Arguments) -WorkingDirectory $WorkingDirectory
 }
 
 function Get-ReportRows {
@@ -260,6 +271,33 @@ function Get-SourceGitStatus {
     return [string]::Join("`n", $lines)
 }
 
+function Invoke-IsolatedDesktopCargoCommands {
+    param([string] $Name, [object[]] $Commands)
+    $sourceStatusBefore = Get-SourceGitStatus
+    $sourceSnapshot = Join-Path $runRoot 'desktop-source'
+    $python = $null
+    try {
+        $python = Get-WorkingPython3Command
+        if (-not $python) { throw 'BLOCKED: Python 3 is required to make an isolated desktop source snapshot.' }
+        Invoke-LoggedCommand -Name "$Name-snapshot" -Executable $python.Source -Arguments @((Join-Path $scriptRoot 'prepare_stage0_desktop_source.py'), '--repo-root', $repoRoot, '--destination', $sourceSnapshot)
+        foreach ($command in $Commands) {
+            Invoke-Cargo -Name $command.Name -Arguments $command.Arguments -WorkingDirectory $sourceSnapshot
+        }
+    } finally {
+        try {
+            if (Test-Path -LiteralPath $sourceSnapshot -PathType Container) {
+                if (-not $python) { throw 'BLOCKED: Python 3 is required to clean the isolated desktop source snapshot.' }
+                Invoke-LoggedCommand -Name "$Name-snapshot-cleanup" -Executable $python.Source -Arguments @((Join-Path $scriptRoot 'prepare_stage0_desktop_source.py'), '--repo-root', $repoRoot, '--destination', $sourceSnapshot, '--cleanup')
+            }
+        } finally {
+            $sourceStatusAfter = Get-SourceGitStatus
+            if ($sourceStatusAfter -cne $sourceStatusBefore) {
+                throw 'FAIL: desktop Cargo gates changed source Git status; build outputs must stay in target/stage0.'
+            }
+        }
+    }
+}
+
 function Copy-ProfileEvidence {
     param([string] $SourceRoot, [string] $DestinationRoot)
     $targets = @(
@@ -300,9 +338,11 @@ function Invoke-Stage0Gate {
         }
         'clippy' {
             Invoke-Cargo $Name @('clippy', '--workspace', '--exclude', 'fluxform-desktop-probe', '--all-targets', '--all-features', '--', '-D', 'warnings')
-            Invoke-Cargo "$Name-desktop-transparent-orb" @('clippy', '-p', 'fluxform-desktop-probe', '--all-targets', '--', '-D', 'warnings')
-            Invoke-Cargo "$Name-desktop-rectangular-hit-region" @('clippy', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-transparent-window-with-rectangular-hit-region', '--all-targets', '--', '-D', 'warnings')
-            Invoke-Cargo "$Name-desktop-opaque-fallback" @('clippy', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-opaque-frameless-fallback', '--all-targets', '--', '-D', 'warnings')
+            Invoke-IsolatedDesktopCargoCommands -Name "$Name-desktop" -Commands @(
+                @{ Name = "$Name-desktop-transparent-orb"; Arguments = @('clippy', '-p', 'fluxform-desktop-probe', '--all-targets', '--', '-D', 'warnings') },
+                @{ Name = "$Name-desktop-rectangular-hit-region"; Arguments = @('clippy', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-transparent-window-with-rectangular-hit-region', '--all-targets', '--', '-D', 'warnings') },
+                @{ Name = "$Name-desktop-opaque-fallback"; Arguments = @('clippy', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-opaque-frameless-fallback', '--all-targets', '--', '-D', 'warnings') }
+            )
             return 'PASS'
         }
         'protocol' {
@@ -336,9 +376,11 @@ function Invoke-Stage0Gate {
             return 'PASS'
         }
         'desktop-probe-modes' {
-            Invoke-Cargo "$Name-transparent-orb" @('test', '-p', 'fluxform-desktop-probe', '--all-targets')
-            Invoke-Cargo "$Name-rectangular-hit-region" @('test', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-transparent-window-with-rectangular-hit-region', '--all-targets')
-            Invoke-Cargo "$Name-opaque-fallback" @('test', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-opaque-frameless-fallback', '--all-targets')
+            Invoke-IsolatedDesktopCargoCommands -Name $Name -Commands @(
+                @{ Name = "$Name-transparent-orb"; Arguments = @('test', '-p', 'fluxform-desktop-probe', '--all-targets') },
+                @{ Name = "$Name-rectangular-hit-region"; Arguments = @('test', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-transparent-window-with-rectangular-hit-region', '--all-targets') },
+                @{ Name = "$Name-opaque-fallback"; Arguments = @('test', '-p', 'fluxform-desktop-probe', '--no-default-features', '--features', 'probe-opaque-frameless-fallback', '--all-targets') }
+            )
             return 'PASS'
         }
         'desktop-build' {
@@ -505,6 +547,7 @@ try {
     }
 } finally {
     if ($null -eq $previousOffline) { Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue } else { $env:CARGO_NET_OFFLINE = $previousOffline }
+    if ($null -eq $previousCargoTargetDirectory) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue } else { $env:CARGO_TARGET_DIR = $previousCargoTargetDirectory }
     if ($null -eq $previousPythonNoBytecode) { Remove-Item Env:PYTHONDONTWRITEBYTECODE -ErrorAction SilentlyContinue } else { $env:PYTHONDONTWRITEBYTECODE = $previousPythonNoBytecode }
 }
 
