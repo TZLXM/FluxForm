@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -169,6 +170,32 @@ WINDOW_RESULT_FIELDS = {
     "last_window_close_works", "dpi_change_works", "multi_monitor_move_works", "idle_cpu_percent",
     "idle_gpu_percent", "notes", "passed", "webview_helper_process_count",
 }
+WINDOW_PROBE_MODES = {
+    "transparent-orb",
+    "transparent-window-with-rectangular-hit-region",
+    "opaque-frameless-fallback",
+}
+WINDOW_DISPLAY_SERVERS = {"windows", "macos", "x11", "wayland"}
+WINDOW_HIT_REGION_STATUSES = {
+    "pending", "circular-applied", "rectangular-fallback-unsupported",
+    "rectangular-fallback-apply-failed", "failed-closed", "rectangular", "opaque", "unknown",
+}
+WINDOW_BOOLEAN_FIELDS = {
+    "provenance_verified", "native_hit_region_supported", "network_disconnected",
+    "first_launch_succeeded", "transparent_pixels_visible", "transparent_pixels_click_through",
+    "frameless_drag_works", "file_drop_works", "outside_orb_drop_reached_background_target",
+    "outside_orb_drop_reached_fluxform", "focus_recovery_works", "keyboard_input_works",
+    "repeated_launch_created_second_window", "single_window_close_works", "last_window_close_works",
+    "dpi_change_works", "multi_monitor_move_works", "passed",
+}
+WINDOW_STRING_FIELDS = {
+    "probe_mode", "os", "os_version", "display_server", "installed_artifact_sha256",
+    "installed_executable_sha256", "install_identity", "provenance_error",
+    "installed_launch_path", "input_hit_region_status", "notes",
+}
+WINDOW_U32_FIELDS = {"repeated_launch_backend_process_count", "webview_helper_process_count"}
+WINDOW_F32_FIELDS = {"idle_cpu_percent", "idle_gpu_percent"}
+WINDOW_F32_MAX = 3.4028234663852886e38
 
 ROW_PATTERN = re.compile(
     r"^\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*\*\*(PASS|FAIL|BLOCKED)\*\*\s*\|\s*([^|]+?)\s*\|\s*(.*?)\s*\|$"
@@ -369,7 +396,303 @@ def _validate_probe_report(repo_root: Path, row: int, report: object) -> None:
         raise EvidenceBlocked(f"evidence row {row} ProbeReport has no immutable approval record/date")
 
 
-def validate_semantics(repo_root: Path, row: int, result: object, artifact_identities: object, role_documents: dict[str, dict] | None = None, attestation: dict | None = None) -> None:
+def _validate_window_probe_result(result: object) -> dict:
+    value = exact_keys(result, WINDOW_RESULT_FIELDS, "Windows WindowProbeResult")
+    if any(type(value[field]) is not str for field in WINDOW_STRING_FIELDS):
+        raise EvidenceBlocked("Windows WindowProbeResult contains a non-string field")
+    if any(type(value[field]) is not bool for field in WINDOW_BOOLEAN_FIELDS):
+        raise EvidenceBlocked("Windows WindowProbeResult contains a non-boolean field")
+    if any(type(value[field]) is not int or not 0 <= value[field] <= 0xFFFFFFFF for field in WINDOW_U32_FIELDS):
+        raise EvidenceBlocked("Windows WindowProbeResult contains a value outside its u32 process-count fields")
+    for field in WINDOW_F32_FIELDS:
+        metric = value[field]
+        if isinstance(metric, bool) or not isinstance(metric, (int, float)):
+            raise EvidenceBlocked(f"Windows WindowProbeResult {field} is not an f32-compatible number")
+        try:
+            metric_value = float(metric)
+        except (OverflowError, ValueError) as error:
+            raise EvidenceBlocked(f"Windows WindowProbeResult {field} is outside the f32 range") from error
+        if not math.isfinite(metric_value) or metric_value < 0 or metric_value > WINDOW_F32_MAX:
+            raise EvidenceBlocked("Windows WindowProbeResult idle metrics must be finite, non-negative f32 values")
+
+    if value["probe_mode"] not in WINDOW_PROBE_MODES:
+        raise EvidenceBlocked("Windows WindowProbeResult has an unknown probe mode")
+    if value["display_server"] not in WINDOW_DISPLAY_SERVERS:
+        raise EvidenceBlocked("Windows WindowProbeResult has an unknown display server")
+    if not value["os"].strip() or not value["os_version"].strip():
+        raise EvidenceBlocked("Windows WindowProbeResult OS and OS version are required")
+    if not value["installed_launch_path"].strip():
+        raise EvidenceBlocked("Windows WindowProbeResult installed launch path is required")
+    is_sha256 = lambda item: re.fullmatch(r"[0-9a-fA-F]{64}", item, flags=re.ASCII) is not None
+    if not is_sha256(value["installed_executable_sha256"]):
+        raise EvidenceBlocked("Windows WindowProbeResult installed executable identity must be a SHA-256 hex digest")
+    if value["installed_artifact_sha256"] and not is_sha256(value["installed_artifact_sha256"]):
+        raise EvidenceBlocked("Windows WindowProbeResult installer package identity must be empty or a SHA-256 hex digest")
+    if value["provenance_verified"] and (
+        not is_sha256(value["installed_artifact_sha256"])
+        or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value["install_identity"], flags=re.ASCII)
+    ):
+        raise EvidenceBlocked("Windows WindowProbeResult verified provenance requires a package hash and valid install identity")
+    if value["input_hit_region_status"] not in WINDOW_HIT_REGION_STATUSES:
+        raise EvidenceBlocked("Windows WindowProbeResult has an unknown native input hit-region status")
+
+    if not value["passed"]:
+        return value
+    if not value["provenance_verified"]:
+        raise EvidenceBlocked("Windows WindowProbeResult passing evidence requires verified installed-package provenance")
+    expected_status = {
+        "transparent-orb": "circular-applied",
+        "transparent-window-with-rectangular-hit-region": "rectangular",
+        "opaque-frameless-fallback": "opaque",
+    }[value["probe_mode"]]
+    if not value["native_hit_region_supported"] or value["input_hit_region_status"] != expected_status:
+        raise EvidenceBlocked("Windows WindowProbeResult passing evidence requires the selected native input hit region")
+    if value["repeated_launch_backend_process_count"] != 1:
+        raise EvidenceBlocked("Windows WindowProbeResult repeated launch must use exactly one backend process")
+    common_behavior_fields = {
+        "network_disconnected", "first_launch_succeeded", "frameless_drag_works", "file_drop_works",
+        "focus_recovery_works", "keyboard_input_works", "repeated_launch_created_second_window",
+        "single_window_close_works", "last_window_close_works", "dpi_change_works", "multi_monitor_move_works",
+    }
+    if any(value[field] is not True for field in common_behavior_fields):
+        raise EvidenceBlocked("Windows WindowProbeResult passing evidence is missing a required manual behavior")
+    mode_behavior_passes = {
+        "transparent-orb": (
+            value["transparent_pixels_visible"]
+            and value["transparent_pixels_click_through"]
+            and value["outside_orb_drop_reached_background_target"]
+            and not value["outside_orb_drop_reached_fluxform"]
+        ),
+        "transparent-window-with-rectangular-hit-region": (
+            value["transparent_pixels_visible"]
+            and not value["transparent_pixels_click_through"]
+            and not value["outside_orb_drop_reached_background_target"]
+            and value["outside_orb_drop_reached_fluxform"]
+        ),
+        "opaque-frameless-fallback": (
+            not value["transparent_pixels_visible"]
+            and not value["transparent_pixels_click_through"]
+            and not value["outside_orb_drop_reached_background_target"]
+            and value["outside_orb_drop_reached_fluxform"]
+        ),
+    }[value["probe_mode"]]
+    if not mode_behavior_passes:
+        raise EvidenceBlocked("Windows WindowProbeResult passing evidence does not satisfy its selected mode")
+    return value
+
+
+def _serialized_sha256(value: object) -> str:
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def _row7_sources(repo_root: Path) -> tuple[dict, dict, dict[str, dict], dict[str, dict], dict[str, str]]:
+    manifest_relative = safe_relative_path("config/capabilities-v1.toml")
+    catalog_relative = safe_relative_path("testdata/media/v1/samples.toml")
+    manifest_path = safe_file(repo_root, manifest_relative, "tracked capability manifest")
+    catalog_path = safe_file(repo_root, catalog_relative, "tracked sample catalog")
+    manifest_bytes, manifest_digest, _ = _read_pinned_bytes(manifest_path, "tracked capability manifest", repo_root)
+    catalog_bytes, catalog_digest, _ = _read_pinned_bytes(catalog_path, "tracked sample catalog", repo_root)
+    try:
+        manifest = tomllib.loads(manifest_bytes.decode("utf-8", errors="strict"))
+        catalog = tomllib.loads(catalog_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise EvidenceBlocked(f"tracked row 7 manifest or sample catalog is invalid: {error}") from error
+    if set(manifest) != {"manifest_version", "edges"} or manifest["manifest_version"] != "v1" or not isinstance(manifest["edges"], list):
+        raise EvidenceBlocked("tracked row 7 capability manifest has an unknown v1 shape")
+    if set(catalog) != {"catalog_version", "samples"} or catalog["catalog_version"] != "v1" or not isinstance(catalog["samples"], list):
+        raise EvidenceBlocked("tracked row 7 sample catalog has an unknown v1 shape")
+
+    edge_fields = {
+        "id", "category", "input_extensions", "input_demuxers", "input_codecs", "input_topology",
+        "output_format", "output_muxer", "video_codec", "audio_codec", "stream_map", "alpha_policy",
+        "orientation_policy", "metadata_policy", "profile_ids", "valid_samples", "invalid_samples", "options",
+    }
+    required_edge_fields = edge_fields - {"video_codec", "audio_codec"}
+    edge_values: dict[str, dict] = {}
+    matrix: dict[tuple[str, str], tuple[dict, dict]] = {}
+    for edge in manifest["edges"]:
+        if not isinstance(edge, dict) or set(edge) - edge_fields or required_edge_fields - set(edge):
+            raise EvidenceBlocked("tracked row 7 edge does not match the Rust ConversionEdgeV1 schema")
+        normalized = {field: edge.get(field) for field in (
+            "id", "category", "input_extensions", "input_demuxers", "input_codecs", "input_topology",
+            "output_format", "output_muxer", "video_codec", "audio_codec", "stream_map", "alpha_policy",
+            "orientation_policy", "metadata_policy", "profile_ids", "valid_samples", "invalid_samples",
+        )}
+        options = edge["options"]
+        if not isinstance(options, dict):
+            raise EvidenceBlocked("tracked row 7 edge options must be a typed object")
+        normalized["options"] = {}
+        for name in sorted(options):
+            bounds = options[name]
+            if not isinstance(bounds, dict) or set(bounds) != {"minimum", "maximum", "default"} or any(type(bounds[field]) is not int for field in ("minimum", "maximum", "default")):
+                raise EvidenceBlocked("tracked row 7 edge parameter bounds do not match Rust ParameterBounds")
+            normalized["options"][name] = {field: bounds[field] for field in ("minimum", "maximum", "default")}
+        if not isinstance(edge["id"], str) or not edge["id"] or edge["id"] in edge_values:
+            raise EvidenceBlocked("tracked row 7 manifest repeats or omits an edge identity")
+        edge_values[edge["id"]] = {**edge, "_rust_value": normalized, "_digest": _serialized_sha256(normalized)}
+
+    sample_fields = {
+        "id", "path", "sha256", "provenance", "license", "category", "container", "codecs",
+        "stream_topology", "width", "height", "duration_ms", "alpha", "orientation", "metadata",
+        "expected_outcome", "expected_error_code",
+    }
+    samples: dict[str, dict] = {}
+    for sample in catalog["samples"]:
+        if not isinstance(sample, dict) or set(sample) != sample_fields:
+            raise EvidenceBlocked("tracked row 7 sample does not match the Rust SampleRecordV1 schema")
+        if not isinstance(sample["id"], str) or not sample["id"] or sample["id"] in samples:
+            raise EvidenceBlocked("tracked row 7 sample catalog repeats or omits a sample identity")
+        if type(sample["width"]) is not int or not 0 <= sample["width"] <= 0xFFFFFFFF or type(sample["height"]) is not int or not 0 <= sample["height"] <= 0xFFFFFFFF or type(sample["duration_ms"]) is not int or not 0 <= sample["duration_ms"] <= 0xFFFFFFFFFFFFFFFF:
+            raise EvidenceBlocked("tracked row 7 sample dimensions or duration are outside Rust integer bounds")
+        if not isinstance(sample["codecs"], list) or not all(type(item) is str for item in sample["codecs"]):
+            raise EvidenceBlocked("tracked row 7 sample codecs are malformed")
+        if not isinstance(sample["path"], str) or not re.fullmatch(r"files/[^/\\]+", sample["path"]):
+            raise EvidenceBlocked("tracked row 7 sample path is not a direct files/ child")
+        if not isinstance(sample["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", sample["sha256"]):
+            raise EvidenceBlocked("tracked row 7 sample SHA-256 is malformed")
+        sample_path = safe_file(repo_root, safe_relative_path(f"testdata/media/v1/{sample['path']}"), "tracked media sample")
+        sample_bytes, sample_digest, _ = _read_pinned_bytes(sample_path, "tracked media sample", repo_root)
+        if sample_digest != sample["sha256"]:
+            raise EvidenceBlocked(f"tracked row 7 sample bytes do not match catalog identity: {sample['id']}")
+        samples[sample["id"]] = sample
+
+    expected_references: set[tuple[str, str]] = set()
+    sample_references: set[str] = set()
+    for edge_id, edge in edge_values.items():
+        for sample_id in edge["valid_samples"]:
+            sample = samples.get(sample_id)
+            if sample is None or sample["expected_outcome"] != "success" or sample["category"] != edge["category"]:
+                raise EvidenceBlocked("tracked row 7 valid sample does not match its manifest edge")
+            expected_references.add((edge_id, sample_id))
+            sample_references.add(sample_id)
+        for sample_id in edge["invalid_samples"]:
+            sample = samples.get(sample_id)
+            if sample is None or sample["expected_outcome"] != "error" or sample["category"] != edge["category"]:
+                raise EvidenceBlocked("tracked row 7 invalid sample does not match its manifest edge")
+            expected_references.add((edge_id, sample_id))
+            sample_references.add(sample_id)
+    if sample_references != set(samples):
+        raise EvidenceBlocked("tracked row 7 sample catalog is not the exact manifest sample closure")
+
+    corpus_directory = safe_file(repo_root, safe_relative_path("testdata/media/v1/samples.toml"), "tracked sample catalog").parent / "files"
+    try:
+        corpus_names = {entry.name for entry in corpus_directory.iterdir()}
+    except OSError as error:
+        raise EvidenceBlocked(f"tracked row 7 media corpus cannot be enumerated: {error}") from error
+    expected_corpus_names = {Path(sample["path"]).name for sample in samples.values()}
+    if corpus_names != expected_corpus_names:
+        raise EvidenceBlocked("tracked row 7 media corpus is not the exact catalog file set")
+    return manifest, catalog, edge_values, samples, {
+        "manifest_digest": manifest_digest,
+        "catalog_digest": catalog_digest,
+        "expected_cases": _serialized_sha256(sorted(expected_references)),
+    }
+
+
+def _row7_expected_output(edge: dict, sample: dict) -> dict:
+    options = edge["options"]
+    option = lambda name, fallback: options.get(name, {}).get("default", fallback)
+    edge_duration = min(0xFFFFFFFFFFFFFFFF, option("max_duration_seconds", 3600) * 1000)
+    sample_duration = edge_duration if sample["duration_ms"] == 0 else min(0xFFFFFFFFFFFFFFFF, sample["duration_ms"] + 100)
+    codec_names = {
+        "libx264": "h264", "h264": "h264", "libx265": "hevc", "hevc": "hevc",
+        "libmp3lame": "mp3", "libwebp": "webp", "libwebp_anim": "webp",
+    }
+    codecs = [codec_names.get(edge[field].lower(), edge[field]) for field in ("video_codec", "audio_codec") if edge.get(field) is not None]
+    return {
+        "container": edge["output_format"],
+        "codecs": codecs,
+        "stream_topology": {"audio": "single_audio_stream", "image": "single_video_frame", "video": "single_video_stream"}[edge["category"]],
+        "width": sample["width"],
+        "height": sample["height"],
+        "max_width": option("max_width", 4096) & 0xFFFFFFFF,
+        "max_height": option("max_height", 4096) & 0xFFFFFFFF,
+        "expected_duration_ms": sample["duration_ms"],
+        "duration_tolerance_ms": 100,
+        "max_duration_ms": min(edge_duration, sample_duration),
+        "alpha_policy": edge["alpha_policy"],
+        "orientation_policy": edge["orientation_policy"],
+        "metadata_policy": edge["metadata_policy"],
+    }
+
+
+def _validate_observed_media(value: object, label: str) -> dict:
+    observed = exact_keys(value, OBSERVED_MEDIA_FIELDS, label)
+    if any(type(observed[field]) is not str for field in ("format_name", "stream_topology")):
+        raise EvidenceBlocked(f"{label} has a malformed text field")
+    if not isinstance(observed["codecs"], list) or not all(type(item) is str for item in observed["codecs"]):
+        raise EvidenceBlocked(f"{label} codecs are malformed")
+    if not isinstance(observed["metadata_keys"], list) or not all(type(item) is str for item in observed["metadata_keys"]):
+        raise EvidenceBlocked(f"{label} metadata keys are malformed")
+    for field in ("width", "height"):
+        if type(observed[field]) is not int or not 0 <= observed[field] <= 0xFFFFFFFF:
+            raise EvidenceBlocked(f"{label} {field} is outside its Rust u32 range")
+    for field in ("duration_ms", "frame_count"):
+        if type(observed[field]) is not int or not 0 <= observed[field] <= 0xFFFFFFFFFFFFFFFF:
+            raise EvidenceBlocked(f"{label} {field} is outside its Rust u64 range")
+    if type(observed["alpha_present"]) is not bool or type(observed["orientation_present"]) is not bool:
+        raise EvidenceBlocked(f"{label} has a malformed boolean fact")
+    return observed
+
+
+def _validate_row7_result_matrix(repo_root: Path, sample: dict, edge_values: dict[str, dict], samples: dict[str, dict]) -> None:
+    if not isinstance(sample["results"], list):
+        raise EvidenceBlocked("row 7 sample report results must be a list")
+    expected_cases = {
+        (edge_id, sample_id)
+        for edge_id, edge in edge_values.items()
+        for sample_id in edge["valid_samples"] + edge["invalid_samples"]
+    }
+    actual_cases: set[tuple[str, str]] = set()
+    for raw_result in sample["results"]:
+        result = exact_keys(raw_result, SAMPLE_RESULT_FIELDS, "row 7 sample result")
+        case = (result["edge_id"], result["sample_id"])
+        if case in actual_cases or case not in expected_cases:
+            raise EvidenceBlocked("row 7 sample report has a repeated or unknown manifest/sample case")
+        actual_cases.add(case)
+        edge = edge_values[case[0]]
+        source_sample = samples[case[1]]
+        expected_outcome = source_sample["expected_outcome"]
+        if (
+            result["edge_spec_digest"] != edge["_digest"]
+            or result["sample_sha256"] != source_sample["sha256"]
+            or result["expected_outcome"] != expected_outcome
+            or result["expected_error_code"] != source_sample["expected_error_code"]
+        ):
+            raise EvidenceBlocked("row 7 sample result identity differs from the tracked manifest/catalog")
+        expectations = _row7_expected_output(edge, source_sample)
+        if result["output_expectations"] != expectations or result["output_expectations_digest"] != _serialized_sha256(expectations):
+            raise EvidenceBlocked("row 7 output expectations do not match the tracked edge and sample")
+        if result["status"] != "passed" or type(result["ffmpeg_invoked"]) is not bool:
+            raise EvidenceBlocked("row 7 collector result did not pass its native execution")
+        if not isinstance(result["actual_error_code"], str) or not isinstance(result["diagnostic"], str):
+            raise EvidenceBlocked("row 7 collector result has malformed diagnostic fields")
+        if not isinstance(result["ffprobe_arguments"], list) or not all(type(item) is str for item in result["ffprobe_arguments"]) or not isinstance(result["ffmpeg_arguments"], list) or not all(type(item) is str for item in result["ffmpeg_arguments"]):
+            raise EvidenceBlocked("row 7 collector result has malformed command arguments")
+        observed_input = _validate_observed_media(result["observed_input"], "row 7 observed input")
+        if (
+            observed_input["width"] != source_sample["width"]
+            or observed_input["height"] != source_sample["height"]
+            or observed_input["stream_topology"] != source_sample["stream_topology"]
+            or {item.lower() for item in observed_input["codecs"]} != {item.lower() for item in source_sample["codecs"]}
+            or abs(observed_input["duration_ms"] - source_sample["duration_ms"]) > 20
+            or (source_sample["alpha"] != "not_applicable" and observed_input["alpha_present"] != (source_sample["alpha"] == "present"))
+            or (source_sample["orientation"] != "not_applicable" and observed_input["orientation_present"] != (source_sample["orientation"] == "present"))
+            or (bool(observed_input["metadata_keys"]) != (source_sample["metadata"] == "present"))
+        ):
+            raise EvidenceBlocked("row 7 observed input does not match the tracked sample identity")
+        if expected_outcome == "success":
+            if result["actual_error_code"] != "" or result["ffmpeg_invoked"] is not True:
+                raise EvidenceBlocked("row 7 successful sample did not invoke FFmpeg cleanly")
+            _validate_observed_media(result["observed_output"], "row 7 observed output")
+        elif result["actual_error_code"] != source_sample["expected_error_code"] or result["ffmpeg_invoked"] is not False or result["observed_output"] is not None:
+            raise EvidenceBlocked("row 7 rejected sample does not match its stable expected error")
+    if actual_cases != expected_cases:
+        raise EvidenceBlocked("row 7 sample result set is not the exact tracked manifest/catalog cross-product")
+
+
+def validate_semantics(repo_root: Path, row: int, result: object, artifact_identities: object, role_documents: dict[str, dict] | None = None, attestation: dict | None = None, role_digests: dict[str, str] | None = None, aggregate_report_path: Path | None = None) -> None:
     kind = KINDS[row - 1]
     if row not in ROW_RESULT_SCHEMAS:
         raise EvidenceBlocked(f"evidence row {row} ({kind}) has no authoritative machine-readable source schema; it remains BLOCKED")
@@ -442,8 +765,9 @@ def validate_semantics(repo_root: Path, row: int, result: object, artifact_ident
         return
 
     if row == 7:
-        if role_documents is None or attestation is None:
-            raise EvidenceBlocked("native sample aggregate requires its complete raw result closure and same-run attestation")
+        if role_documents is None or attestation is None or role_digests is None:
+            raise EvidenceBlocked("native sample aggregate requires its actual raw-byte digests and same-run attestation")
+        _manifest, _catalog, edge_values, samples, source_digests = _row7_sources(repo_root)
         aggregate = exact_keys(role_documents.get("aggregate-report"), {"schema", "status", "evidence_input_digest", "targets"}, "native sample aggregate")
         if aggregate["schema"] != "fluxform.sample-aggregate.v1" or aggregate["status"] != "passed" or not re.fullmatch(r"[0-9a-f]{64}", str(aggregate["evidence_input_digest"])):
             raise EvidenceBlocked("native collector aggregate is blocked, stale, or has an unknown schema")
@@ -452,6 +776,12 @@ def validate_semantics(repo_root: Path, row: int, result: object, artifact_ident
             raise EvidenceBlocked("native collector aggregate does not contain exactly the four native targets")
         if attestation.get("commit_sha") != os.environ.get("GITHUB_SHA"):
             raise EvidenceBlocked("native aggregate provenance does not match the reviewed workflow commit")
+        aggregate_raw_digest = role_digests.get("aggregate-report")
+        if not isinstance(aggregate_raw_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", aggregate_raw_digest):
+            raise EvidenceBlocked("native aggregate actual raw-byte SHA-256 is missing")
+        if aggregate_report_path is None:
+            raise EvidenceBlocked("current collector output is required to prove the reviewed aggregate raw-byte identity")
+        _validate_aggregate_execution_receipt(repo_root, aggregate_report_path, attestation, aggregate, aggregate_raw_digest)
         for target_id, (triple, runner_os, runner_arch) in SAMPLE_TARGETS.items():
             profile = exact_keys(role_documents.get(f"profile-report-{target_id}"), PROBE_REPORT_FIELDS, f"{target_id} ProbeReport")
             sample = exact_keys(role_documents.get(f"sample-report-{target_id}"), SAMPLE_REPORT_FIELDS, f"{target_id} sample report")
@@ -461,30 +791,19 @@ def validate_semantics(repo_root: Path, row: int, result: object, artifact_ident
                 raise EvidenceBlocked(f"{target_id} sample result has no passing current result set")
             if len(sample["results"]) != 9:
                 raise EvidenceBlocked(f"{target_id} sample result does not contain the complete nine-case matrix")
-            case_ids = set()
-            for sample_result in sample["results"]:
-                sample_result = exact_keys(sample_result, SAMPLE_RESULT_FIELDS, f"{target_id} sample case")
-                if sample_result["status"] != "passed" or type(sample_result["ffmpeg_invoked"]) is not bool:
-                    raise EvidenceBlocked(f"{target_id} sample result contains a non-passing edge/rejection result")
-                case_id = (sample_result["edge_id"], sample_result["sample_id"], sample_result["expected_outcome"])
-                if case_id in case_ids:
-                    raise EvidenceBlocked(f"{target_id} sample result repeats an edge/sample case")
-                case_ids.add(case_id)
-                exact_keys(sample_result["output_expectations"], OUTPUT_EXPECTATION_FIELDS, f"{target_id} output expectations")
-                for observed_name in ("observed_input", "observed_output"):
-                    observed = sample_result[observed_name]
-                    if observed is not None:
-                        observed = exact_keys(observed, OBSERVED_MEDIA_FIELDS, f"{target_id} {observed_name}")
-                        if type(observed["alpha_present"]) is not bool or type(observed["orientation_present"]) is not bool:
-                            raise EvidenceBlocked(f"{target_id} observed media has malformed boolean facts")
-            if provenance["schema"] != "fluxform.native-sample-artifact.v1" or provenance["workflow_run_id"] != attestation["workflow_run_id"] or provenance["git_commit"] != attestation["commit_sha"]:
+            _validate_row7_result_matrix(repo_root, sample, edge_values, samples)
+            if provenance["schema"] != "fluxform.native-sample-artifact.v1" or provenance["workflow_run_id"] != attestation["workflow_run_id"] or provenance["git_commit"] != attestation["commit_sha"] or sample["git_commit"] != attestation["commit_sha"]:
                 raise EvidenceBlocked(f"{target_id} native provenance is not bound to this workflow run and commit")
             if not provenance["workflow_job_id"] or not all(re.fullmatch(r"[0-9a-f]{64}", str(provenance[field])) for field in ("ffmpeg_profile_report_sha256", "sample_report_sha256")):
                 raise EvidenceBlocked(f"{target_id} native provenance has a missing job identity or report hash")
+            if role_digests.get(f"profile-report-{target_id}") != provenance["ffmpeg_profile_report_sha256"] or role_digests.get(f"sample-report-{target_id}") != provenance["sample_report_sha256"]:
+                raise EvidenceBlocked(f"{target_id} provenance hashes do not match the actual reviewed raw bytes")
             if (sample["target_triple"], sample["target_profile_id"], sample["runner_os"], sample["runner_arch"]) != (triple, target_id, runner_os, runner_arch):
                 raise EvidenceBlocked(f"{target_id} sample result target identity does not match its native platform")
             if sample["evidence_input_digest"] != aggregate["evidence_input_digest"] or provenance["evidence_input_digest"] != aggregate["evidence_input_digest"]:
                 raise EvidenceBlocked(f"{target_id} result is stale relative to the collector evidence-input closure")
+            if sample["manifest_digest"] != source_digests["manifest_digest"] or sample["sample_catalog_digest"] != source_digests["catalog_digest"]:
+                raise EvidenceBlocked(f"{target_id} sample report does not bind the current tracked manifest and catalog bytes")
             if sample["profile_digest"] != profile["profile_digest"] or sample["artifact_id"] != profile["artifact_id"] or sample["ffmpeg_sha256"] != profile["ffmpeg_sha256"] or sample["ffprobe_sha256"] != profile["ffprobe_sha256"]:
                 raise EvidenceBlocked(f"{target_id} sample/profile artifact identity mismatch")
             target_summary = next(item for item in targets if item["target_profile_id"] == target_id)
@@ -501,45 +820,20 @@ def validate_semantics(repo_root: Path, row: int, result: object, artifact_ident
                 "native_runner_arch": runner_arch,
             }:
                 raise EvidenceBlocked(f"{target_id} aggregate summary does not bind the exact raw profile/sample reports")
+        target_by_id = {item["target_profile_id"]: item for item in targets}
+        if len(target_by_id) != len(SAMPLE_TARGETS) or any(type(target_by_id[target]["sample_result_count"]) is not int or target_by_id[target]["sample_result_count"] != 9 for target in SAMPLE_TARGETS):
+            raise EvidenceBlocked("native collector aggregate has duplicate or incomplete target result identities")
         return
 
     if row == 16:
-        result = exact_keys(result, WINDOW_RESULT_FIELDS, "Windows WindowProbeResult")
-        boolean_fields = {
-            "provenance_verified", "network_disconnected", "first_launch_succeeded", "transparent_pixels_visible",
-            "transparent_pixels_click_through", "frameless_drag_works", "file_drop_works",
-            "outside_orb_drop_reached_background_target", "outside_orb_drop_reached_fluxform", "focus_recovery_works",
-            "keyboard_input_works", "repeated_launch_created_second_window", "single_window_close_works",
-            "last_window_close_works", "dpi_change_works", "multi_monitor_move_works", "passed",
-        }
-        if any(type(result[field]) is not bool for field in boolean_fields):
-            raise EvidenceBlocked("Windows WindowProbeResult contains non-boolean behavioral facts")
-        if type(result["repeated_launch_backend_process_count"]) is not int or type(result["webview_helper_process_count"]) is not int:
-            raise EvidenceBlocked("Windows WindowProbeResult process counts are not integers")
-        if not isinstance(result["os"], str) or not isinstance(result["probe_mode"], str):
-            raise EvidenceBlocked("Windows WindowProbeResult OS or probe mode is malformed")
-        if result["os"].lower() != "windows" or result["passed"] is not True or result["provenance_verified"] is not True:
+        result = _validate_window_probe_result(result)
+        if result["os"].lower() != "windows" or result["display_server"] != "windows" or result["passed"] is not True:
             raise EvidenceBlocked("Windows WindowProbeResult is not a passing verified installed-app result")
-        if result["network_disconnected"] is not True or result["first_launch_succeeded"] is not True:
-            raise EvidenceBlocked("Windows WindowProbeResult lacks disconnected install/first-launch evidence")
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", result["installed_artifact_sha256"]):
-            raise EvidenceBlocked("Windows WindowProbeResult has no installer package identity")
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", result["installed_executable_sha256"]):
-            raise EvidenceBlocked("Windows WindowProbeResult has no installed executable identity")
-        if result["repeated_launch_backend_process_count"] != 1 or result["repeated_launch_created_second_window"] is not True or result["single_window_close_works"] is not True or result["last_window_close_works"] is not True or result["dpi_change_works"] is not True or result["multi_monitor_move_works"] is not True:
-            raise EvidenceBlocked("Windows WindowProbeResult lacks required launch/close/DPI/monitor behavior")
-        if result["probe_mode"] == "transparent-orb":
-            mode_passed = result["transparent_pixels_visible"] and result["transparent_pixels_click_through"] and result["outside_orb_drop_reached_background_target"] and not result["outside_orb_drop_reached_fluxform"]
-        elif result["probe_mode"] == "transparent-window-with-rectangular-hit-region":
-            mode_passed = result["transparent_pixels_visible"] and not result["transparent_pixels_click_through"] and not result["outside_orb_drop_reached_background_target"] and result["outside_orb_drop_reached_fluxform"]
-        elif result["probe_mode"] == "opaque-frameless-fallback":
-            mode_passed = not result["transparent_pixels_visible"] and not result["transparent_pixels_click_through"] and not result["outside_orb_drop_reached_background_target"] and result["outside_orb_drop_reached_fluxform"]
-        else:
-            mode_passed = False
-        if not mode_passed:
-            raise EvidenceBlocked("Windows WindowProbeResult does not satisfy its declared input/display mode")
-        expected = {"installer-package": result["installed_artifact_sha256"], "installed-executable": result["installed_executable_sha256"]}
-        if not isinstance(artifact_identities, dict) or {key: value.get("sha256") for key, value in artifact_identities.items() if isinstance(value, dict)} != expected:
+        expected = {
+            "installer-package": {"sha256": result["installed_artifact_sha256"]},
+            "installed-executable": {"sha256": result["installed_executable_sha256"]},
+        }
+        if artifact_identities != expected:
             raise EvidenceBlocked("Windows WindowProbeResult package/executable identities do not match its manifest")
         return
 
@@ -610,9 +904,151 @@ def validate_attestation(repo_root: Path, path: Path | None, expected_bundle: st
     return attestation
 
 
+def _pinned_repository_digest(repo_root: Path, relative_text: str, label: str) -> str:
+    relative = safe_relative_path(relative_text)
+    path = safe_file(repo_root, relative, label)
+    _data, digest, _identity = _read_pinned_bytes(path, label, repo_root)
+    return digest
+
+
+def _validate_aggregate_execution_receipt(
+    repo_root: Path,
+    aggregate_report_path: Path,
+    attestation: dict,
+    aggregate: dict,
+    aggregate_digest: str,
+) -> None:
+    root = repo_root.resolve(strict=True)
+    aggregate_path = Path(os.path.abspath(aggregate_report_path))
+    try:
+        aggregate_relative = aggregate_path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise EvidenceBlocked("current collector aggregate is outside the repository root") from error
+    run_relative = safe_relative_path(aggregate_relative)
+    if len(run_relative.parts) != 5 or run_relative.parts[:3] != ("target", "stage0", "runs") or run_relative.name != "aggregate-sample-report.json":
+        raise EvidenceBlocked("current collector aggregate is not inside one target/stage0/runs invocation")
+    run_id = run_relative.parts[3]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        raise EvidenceBlocked("current collector aggregate run identity is malformed")
+
+    _manifest, _catalog, _edges, samples, source_digests = _row7_sources(repo_root)
+    current, current_digest, _current_identity = read_pinned_json(aggregate_path, "current collector aggregate output", repo_root)
+    if current != aggregate:
+        raise EvidenceBlocked("current collector aggregate document differs from the reviewed row 7 report")
+    if current_digest != aggregate_digest:
+        raise EvidenceBlocked("reviewed aggregate raw bytes do not match the same-run collector output")
+
+    receipt_relative = f"target/stage0/runs/{run_id}/aggregate-validation.json"
+    receipt_path = safe_file(repo_root, safe_relative_path(receipt_relative), "same-run aggregate execution receipt")
+    receipt, _receipt_digest, _receipt_identity = read_pinned_json(receipt_path, "same-run aggregate execution receipt", repo_root)
+    receipt = exact_keys(receipt, {
+        "schema", "status", "commit_sha", "evidence_input_digest", "aggregate_report", "commands", "files", "closure_digest",
+    }, "same-run aggregate execution receipt")
+    if receipt["schema"] != "fluxform.stage0.aggregate-execution-receipt.v1" or receipt["status"] != "PASS":
+        raise EvidenceBlocked("same-run aggregate execution receipt is not a successful v1 receipt")
+    expected_commit = os.environ.get("GITHUB_SHA", "")
+    if not expected_commit or receipt["commit_sha"] != expected_commit or receipt["commit_sha"] != attestation["commit_sha"]:
+        raise EvidenceBlocked("same-run aggregate receipt, attestation, and current workflow commit differ")
+    if receipt["evidence_input_digest"] != aggregate["evidence_input_digest"]:
+        raise EvidenceBlocked("same-run aggregate receipt is stale relative to the collector evidence-input digest")
+    aggregate_identity = exact_keys(receipt["aggregate_report"], {"path", "sha256"}, "same-run aggregate output identity")
+    if aggregate_identity != {"path": aggregate_relative, "sha256": current_digest}:
+        raise EvidenceBlocked("same-run aggregate receipt does not bind the current collector output bytes")
+
+    command_specs = {
+        "collector": (
+            "aggregate-samples.log",
+            "cargo --locked --offline run -p fluxform-capabilities --bin collect_sample_reports",
+        ),
+        "verify_manifest": (
+            "aggregate-samples-manifest.log",
+            "cargo --locked --offline run -p fluxform-capabilities --bin verify_manifest",
+        ),
+        "cross_platform_samples": (
+            "aggregate-samples-cross-platform.log",
+            "cargo --locked --offline test -p fluxform-capabilities --test cross_platform_samples",
+        ),
+    }
+    commands = exact_keys(receipt["commands"], set(command_specs), "same-run aggregate command receipts")
+    required_log_fragments = {
+        "collector": ("--input target/stage0/collected", "--manifest config/capabilities-v1.toml", "--samples testdata/media/v1/samples.toml", "--expected-input-digest", "--out"),
+        "verify_manifest": ("verify-manifest --manifest config/capabilities-v1.toml", "--reports", "collected-profiles"),
+        "cross_platform_samples": ("--test cross_platform_samples",),
+    }
+    expected_command_values = {
+        "collector": "collect_sample_reports",
+        "verify_manifest": "verify_manifest verify-manifest",
+        "cross_platform_samples": "cross_platform_samples",
+    }
+    expected_files: dict[str, str] = {
+        "config/capabilities-v1.toml": source_digests["manifest_digest"],
+        "testdata/media/v1/samples.toml": source_digests["catalog_digest"],
+        aggregate_relative: current_digest,
+    }
+    for sample in samples.values():
+        sample_relative = f"testdata/media/v1/{sample['path']}"
+        expected_files[sample_relative] = _pinned_repository_digest(repo_root, sample_relative, "tracked sample corpus file")
+    for target_id in SAMPLE_TARGETS:
+        for filename in ("ffmpeg-profile-report.json", "sample-report.json", "provenance.json"):
+            relative = f"target/stage0/collected/{target_id}/{filename}"
+            expected_files[relative] = _pinned_repository_digest(repo_root, relative, "same-run collected native artifact")
+        collected_profile_relative = f"target/stage0/collected/{target_id}/ffmpeg-profile-report.json"
+        copied_profile_relative = f"target/stage0/runs/{run_id}/collected-profiles/{target_id}.json"
+        collected_profile_digest = expected_files[collected_profile_relative]
+        copied_profile_digest = _pinned_repository_digest(repo_root, copied_profile_relative, "same-run collected profile copy")
+        if copied_profile_digest != collected_profile_digest:
+            raise EvidenceBlocked(f"{target_id} verify_manifest profile copy differs from the collector input")
+        expected_files[copied_profile_relative] = copied_profile_digest
+    for command_id, (filename, prefix) in command_specs.items():
+        log_relative = f"target/stage0/runs/{run_id}/{filename}"
+        log_digest = _pinned_repository_digest(repo_root, log_relative, f"same-run {command_id} log")
+        expected_files[log_relative] = log_digest
+        command = exact_keys(commands[command_id], {"command", "path", "sha256", "exit_code"}, f"same-run {command_id} command receipt")
+        if type(command["exit_code"]) is not int or command["exit_code"] != 0:
+            raise EvidenceBlocked(f"same-run {command_id} exit code is not an integer zero")
+        if command != {
+            "command": expected_command_values[command_id],
+            "path": log_relative,
+            "sha256": log_digest,
+            "exit_code": 0,
+        }:
+            raise EvidenceBlocked(f"same-run {command_id} command receipt is stale or did not exit successfully")
+        log_path = safe_file(repo_root, safe_relative_path(log_relative), f"same-run {command_id} log")
+        log_bytes, _digest, _identity = _read_pinned_bytes(log_path, f"same-run {command_id} log", repo_root)
+        try:
+            lines = log_bytes.decode("utf-8", errors="strict").splitlines()
+        except UnicodeError as error:
+            raise EvidenceBlocked(f"same-run {command_id} log is not UTF-8") from error
+        invocation = lines[0].removeprefix("+ ") if lines else ""
+        if not invocation.startswith(prefix) or not lines or lines[-1] != "exit_code=0":
+            raise EvidenceBlocked(f"same-run {command_id} log does not prove its exact successful tool invocation")
+        if any(fragment not in invocation for fragment in required_log_fragments[command_id]):
+            raise EvidenceBlocked(f"same-run {command_id} log omits required collector/verification arguments")
+        if command_id == "collector" and (aggregate["evidence_input_digest"] not in invocation or "aggregate-sample-report.json" not in invocation or run_id not in invocation):
+            raise EvidenceBlocked("same-run collector log targets another input digest or run output")
+        if command_id == "verify_manifest" and run_id not in invocation:
+            raise EvidenceBlocked("same-run verify_manifest log targets another invocation")
+
+    file_records = receipt["files"]
+    if not isinstance(file_records, list):
+        raise EvidenceBlocked("same-run aggregate receipt file closure is malformed")
+    normalized_files = []
+    for item in file_records:
+        item = exact_keys(item, {"path", "sha256"}, "same-run aggregate receipt file")
+        relative = safe_relative_path(item["path"])
+        normalized_files.append({"path": relative.as_posix(), "sha256": item["sha256"]})
+    normalized_files.sort(key=lambda item: item["path"])
+    expected_records = [{"path": path, "sha256": digest} for path, digest in sorted(expected_files.items())]
+    if normalized_files != expected_records:
+        raise EvidenceBlocked("same-run aggregate receipt does not bind the exact current collector/manifest/catalog/profile/log file closure")
+    if receipt["closure_digest"] != _serialized_sha256(expected_records):
+        raise EvidenceBlocked("same-run aggregate receipt closure digest is stale")
+
+
 def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, str, str, PurePosixPath]], attestation: dict, aggregate_report_path: Path | None) -> None:
     loaded = []
     result_paths: set[str] = set()
+    result_path_keys: set[str] = set()
     result_digests: set[str] = set()
     manifest_paths: set[str] = set()
     all_bundles = {reference[4] for reference in references}
@@ -651,6 +1087,7 @@ def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, 
         if not isinstance(descriptors, list) or len(descriptors) != len(expected_roles):
             raise EvidenceBlocked(f"evidence row {number} raw-result file set is incomplete")
         role_documents = {}
+        role_digests = {}
         for descriptor in descriptors:
             descriptor = exact_keys(descriptor, {"role", "path", "sha256", "type", "schema", "row_id"}, f"evidence row {number} raw-result descriptor")
             role = descriptor["role"]
@@ -668,9 +1105,10 @@ def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, 
             digest = descriptor["sha256"]
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise EvidenceBlocked(f"evidence row {number} raw result has a malformed SHA-256")
-            if key_path in result_paths or digest in result_digests:
+            if key_path in result_path_keys or digest in result_digests:
                 raise EvidenceBlocked("a raw result file is reused across report rows")
-            result_paths.add(key_path)
+            result_path_keys.add(key_path)
+            result_paths.add(raw_relative.as_posix())
             result_digests.add(digest)
             raw_path = safe_file(repo_root, raw_relative, f"evidence row {number} raw result")
             document, actual_digest, _file_identity = read_pinned_json(raw_path, f"evidence row {number} raw result", repo_root)
@@ -686,6 +1124,7 @@ def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, 
                 if not isinstance(document, dict) or document.get("schema") != descriptor["schema"]:
                     raise EvidenceBlocked(f"evidence row {number} raw result does not match its declared schema")
             role_documents[role] = document
+            role_digests[role] = actual_digest
         if set(role_documents) != set(expected_roles):
             raise EvidenceBlocked(f"evidence row {number} does not contain every required raw-result role")
         artifacts = manifest["artifact_identities"]
@@ -693,7 +1132,7 @@ def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, 
             raise EvidenceBlocked(f"evidence row {number} artifact identities must be a typed object")
         primary_role = "primary" if number == 1 else "probe-report" if number in PROFILE_TARGETS else "approval-record" if number == 6 else "aggregate-report" if number == 7 else "window-result"
         primary = role_documents[primary_role]
-        validate_semantics(repo_root, number, primary, artifacts, role_documents, attestation)
+        validate_semantics(repo_root, number, primary, artifacts, role_documents, attestation, role_digests, aggregate_report_path)
         loaded.append(number)
 
     attested_paths = {item["path"] for item in attestation["files"]}
@@ -702,16 +1141,16 @@ def validate_bundle(repo_root: Path, references: list[tuple[int, str, str, str, 
     if 7 in loaded:
         if aggregate_report_path is None:
             raise EvidenceBlocked("current collector output is required to prove the sample evidence-input closure")
-        current_path = aggregate_report_path.resolve(strict=True)
-        current, _digest, _identity = read_pinned_json(current_path, "current collector aggregate output", repo_root)
+        current_path = Path(os.path.abspath(aggregate_report_path))
+        current, current_digest, _identity = read_pinned_json(current_path, "current collector aggregate output", repo_root)
         aggregate_descriptor = next(reference for reference in references if reference[0] == 7)
         manifest_path = safe_file(repo_root, aggregate_descriptor[6], "row 7 manifest")
         manifest, _manifest_sha, _ = read_pinned_json(manifest_path, "row 7 manifest", repo_root)
         report_info = next(item for item in manifest["raw_results"] if item["role"] == "aggregate-report")
         raw_path = safe_file(repo_root, safe_relative_path(report_info["path"]), "row 7 aggregate raw result")
-        recorded, _recorded_sha, _ = read_pinned_json(raw_path, "row 7 aggregate raw result", repo_root)
-        if current != recorded:
-            raise EvidenceBlocked("row 7 aggregate raw result is stale relative to the collector run in this Complete invocation")
+        recorded, recorded_digest, _ = read_pinned_json(raw_path, "row 7 aggregate raw result", repo_root)
+        if current != recorded or current_digest != recorded_digest:
+            raise EvidenceBlocked("row 7 reviewed aggregate raw bytes are stale relative to the collector run in this Complete invocation")
 
 
 def validate(repo_root: Path, report_path: Path, attestation_path: Path | None = None, aggregate_report_path: Path | None = None) -> None:

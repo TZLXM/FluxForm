@@ -455,6 +455,22 @@ function Invoke-Stage0Gate {
             }
             Invoke-Cargo "$Name-manifest" @('run', '-p', 'fluxform-capabilities', '--bin', 'verify_manifest', '--', 'verify-manifest', '--manifest', 'config/capabilities-v1.toml', '--reports', $profiles)
             Invoke-Cargo "$Name-cross-platform" @('test', '-p', 'fluxform-capabilities', '--test', 'cross_platform_samples')
+            $python = Get-WorkingPython3Command
+            if (-not $python) { throw 'BLOCKED: Python 3 is required to record the aggregate execution receipt.' }
+            if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { throw 'BLOCKED: GITHUB_SHA is required to bind the aggregate execution receipt to this workflow commit.' }
+            $receiptWriter = Join-Path $scriptRoot 'write_stage0_aggregate_receipt.py'
+            $receiptArguments = @('--repo-root', $repoRoot, '--aggregate-report', $out, '--commit-sha', $env:GITHUB_SHA)
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $receiptLines = @(& $python.Source $receiptWriter @receiptArguments 2>&1 | ForEach-Object { [string] $_ })
+                $receiptExitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            foreach ($line in $receiptLines) { Write-Host $line }
+            if ($receiptExitCode -eq 10) { throw 'BLOCKED: same-run aggregate execution receipt could not be recorded.' }
+            if ($receiptExitCode -ne 0) { throw 'FAIL: same-run aggregate execution receipt could not be recorded.' }
             return 'PASS'
         }
         default { throw "unknown gate selector: $Name" }

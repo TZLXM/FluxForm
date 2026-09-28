@@ -193,33 +193,85 @@ def details_from_fd(fd: int, metadata: os.stat_result) -> tuple[int, ...]:
 
 
 def read_pinned_bytes(path: Path, label: str, repository_root: Path) -> tuple[bytes, str, tuple[int, ...]]:
-    absolute = _contained_real_path(path, repository_root)
     if os.name == "nt":
+        absolute = _contained_real_path(path, repository_root)
         data, identity, _final_path = _read_windows(absolute, repository_root)
         return data, hashlib.sha256(data).hexdigest(), identity
     if os.name not in ("posix",):
         raise ValueError("this platform has no supported pinned evidence reader")
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise ValueError("this Unix platform does not provide O_NOFOLLOW")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(absolute, flags)
+    required_dirfd = os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+    required_follow_symlinks = os.stat in os.supports_follow_symlinks
+    if not required_dirfd or not required_follow_symlinks or not all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY")):
+        raise ValueError("this Unix platform cannot safely pin evidence with dirfd and O_NOFOLLOW")
+
+    root = repository_root.resolve(strict=True)
+    absolute = Path(os.path.abspath(path))
     try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} is not a regular file")
-        chunks = []
-        while chunk := os.read(fd, 1024 * 1024):
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        after = os.fstat(fd)
-        path_after = absolute.lstat()
-        if _identity(before) != _identity(after) or _identity(before) != _identity(path_after):
-            raise ValueError(f"{label} identity or size changed while reading")
-        if len(data) != before.st_size:
-            raise ValueError(f"{label} size changed while reading")
+        relative = absolute.relative_to(root)
+    except ValueError as error:
+        raise ValueError("evidence file is outside the repository root") from error
+    components = relative.parts
+    if not components or any(part in ("", ".", "..") for part in components):
+        raise ValueError("evidence path is not a regular file beneath the repository root")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    parent_fds: list[int] = []
+    parent_names: list[str] = []
+    try:
+        root_fd = os.open(root, directory_flags)
+        parent_fds.append(root_fd)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise ValueError("repository root is not a directory")
+
+        for component in components[:-1]:
+            parent_fd = parent_fds[-1]
+            entry_before = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(entry_before.st_mode) or not stat.S_ISDIR(entry_before.st_mode):
+                raise ValueError("evidence path contains a symlink or non-directory parent")
+            child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            child_metadata = os.fstat(child_fd)
+            if not stat.S_ISDIR(child_metadata.st_mode) or (entry_before.st_dev, entry_before.st_ino) != (child_metadata.st_dev, child_metadata.st_ino):
+                os.close(child_fd)
+                raise ValueError("evidence parent directory changed while opening")
+            parent_fds.append(child_fd)
+            parent_names.append(component)
+
+        parent_fd = parent_fds[-1]
+        leaf = components[-1]
+        leaf_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(leaf_before.st_mode) or not stat.S_ISREG(leaf_before.st_mode):
+            raise ValueError(f"{label} is not a regular non-symlink file")
+        fd = os.open(leaf, file_flags, dir_fd=parent_fd)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or (leaf_before.st_dev, leaf_before.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError(f"{label} identity changed while opening")
+            chunks = []
+            while chunk := os.read(fd, 1024 * 1024):
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(fd)
+            leaf_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if _identity(before) != _identity(after) or _identity(before) != _identity(leaf_after):
+                raise ValueError(f"{label} identity or size changed while reading")
+            if len(data) != before.st_size:
+                raise ValueError(f"{label} size changed while reading")
+        finally:
+            os.close(fd)
+
+        for index, component in enumerate(parent_names):
+            containing_fd = parent_fds[index]
+            opened_fd = parent_fds[index + 1]
+            named = os.stat(component, dir_fd=containing_fd, follow_symlinks=False)
+            opened = os.fstat(opened_fd)
+            if stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(named.st_mode) or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("evidence parent directory changed while reading")
+
         return data, hashlib.sha256(data).hexdigest(), _identity(before)
     finally:
-        os.close(fd)
+        for descriptor in reversed(parent_fds):
+            os.close(descriptor)
 
 
 def read_pinned_json_bytes(path: Path, label: str, repository_root: Path) -> tuple[Any, bytes, str, tuple[int, ...]]:

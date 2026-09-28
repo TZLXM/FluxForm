@@ -88,12 +88,13 @@ run_logged() {
   local name="$1"; local executable="$2"; shift 2
   local safe_name="${name//[^A-Za-z0-9_.-]/_}"
   local log_path="$run_root/$safe_name.log"
-  printf '+ %s' "$executable"
-  printf ' %q' "$@"
-  printf '\n'
-  "$executable" "$@" >"$log_path" 2>&1
-  local exit_code=$?
-  cat -- "$log_path"
+  {
+    printf '+ %s' "$executable"
+    printf ' %q' "$@"
+    printf '\n'
+  } | tee "$log_path"
+  "$executable" "$@" 2>&1 | tee -a "$log_path"
+  local exit_code=${PIPESTATUS[0]}
   printf '\nexit_code=%s\n' "$exit_code" >>"$log_path"
   printf 'log: %s\n' "$log_path"
   if ((exit_code != 0)); then
@@ -472,6 +473,16 @@ PY
       done
       run_cargo "$name-manifest" run -p fluxform-capabilities --bin verify_manifest -- verify-manifest --manifest config/capabilities-v1.toml --reports "$profiles" || return 1
       run_cargo "$name-cross-platform" test -p fluxform-capabilities --test cross_platform_samples || return 1
+      local receipt_python
+      receipt_python="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to record the aggregate execution receipt.'; return 1; }
+      if "$receipt_python" "$script_dir/write_stage0_aggregate_receipt.py" \
+        --repo-root "$repo_root" --aggregate-report "$aggregate" --commit-sha "${GITHUB_SHA:-}"; then
+        :
+      else
+        local receipt_exit_code=$?
+        if ((receipt_exit_code == 10)); then blocked 'same-run aggregate execution receipt could not be recorded.'; else failed 'same-run aggregate execution receipt could not be recorded.'; fi
+        return 1
+      fi
       ;;
     *) failed "unknown gate selector: $name"; return 1 ;;
   esac

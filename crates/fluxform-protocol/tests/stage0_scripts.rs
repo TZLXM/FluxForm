@@ -656,6 +656,16 @@ fn output_text(output: &Output) -> String {
     )
 }
 
+#[cfg(unix)]
+fn first_command_log_path(output: &str) -> PathBuf {
+    PathBuf::from(
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("log: "))
+            .expect("run_logged should print the command log path"),
+    )
+}
+
 fn git_status_text() -> String {
     let output = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
@@ -687,6 +697,19 @@ fn selected_gate_failure_stops_and_summarizes_unrun_gates() {
             .unwrap_or_default()
             .contains("contract-drift")
     );
+    #[cfg(unix)]
+    {
+        let command_log = fs::read_to_string(first_command_log_path(&text)).unwrap();
+        assert!(command_log.starts_with("+ cargo "), "{command_log}");
+        assert!(
+            command_log.contains("shim stderr diagnostic"),
+            "{command_log}"
+        );
+        assert!(
+            command_log.trim_end().ends_with("exit_code=23"),
+            "tee must not mask the executable's failure status: {command_log}"
+        );
+    }
 }
 
 #[cfg(any(windows, unix))]
@@ -717,6 +740,19 @@ fn successful_protocol_gate_runs_contract_drift_verification() {
         ),
         "expected the real contract drift test to run; commands: {commands}"
     );
+    #[cfg(unix)]
+    {
+        let command_log = fs::read_to_string(first_command_log_path(&text)).unwrap();
+        assert!(command_log.starts_with("+ cargo "), "{command_log}");
+        assert!(
+            command_log.contains("shim stderr diagnostic"),
+            "{command_log}"
+        );
+        assert!(
+            command_log.trim_end().ends_with("exit_code=0"),
+            "successful command log should preserve the executable status: {command_log}"
+        );
+    }
 }
 
 #[cfg(any(windows, unix))]
