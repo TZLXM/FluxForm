@@ -416,17 +416,29 @@ run_gate() {
       if [[ "$pnpm_version" != '11.19.0' ]]; then echo "SKIPPED: expected pinned pnpm 11.19.0, found $pnpm_version; no package was installed."; gate_status='SKIPPED'; return 0; fi
       local python_command
       python_command="$(find_python3)" || { blocked 'a runnable Python 3 interpreter is required to make an isolated desktop source snapshot.'; return 1; }
-      local source_status_before source_status_after snapshot install_failed=0 build_failed=0
+      local source_status_before source_status_after snapshot snapshot_failed=0 install_failed=0 build_failed=0 cleanup_failed=0 status_failed=0
       source_status_before="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { blocked 'git status could not verify source-tree cleanliness around the desktop build.'; return 1; }
       snapshot="$run_root/desktop-source"
-      run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" || return 1
-      if ! run_logged "$name-pnpm-install" pnpm --store-dir "$evidence_root/pnpm-store" --dir "$snapshot/apps/desktop-probe" install --offline --frozen-lockfile; then install_failed=1; fi
-      if ((install_failed == 0)); then
-        if ! run_logged "$name" pnpm --dir "$snapshot/apps/desktop-probe" run tauri:build --no-bundle; then build_failed=1; fi
+      if ! run_logged "$name-snapshot" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot"; then snapshot_failed=1; fi
+      if ((snapshot_failed == 0)); then
+        if ! run_logged "$name-pnpm-install" pnpm --store-dir "$evidence_root/pnpm-store" --dir "$snapshot/apps/desktop-probe" install --offline --frozen-lockfile; then install_failed=1; fi
+        if ((install_failed == 0)); then
+          if ! run_logged "$name" pnpm --dir "$snapshot/apps/desktop-probe" run tauri:build --no-bundle; then build_failed=1; fi
+        fi
       fi
-      if ! run_logged "$name-snapshot-cleanup" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" --cleanup; then failed 'could not safely clean this invocation-owned desktop snapshot.'; return 1; fi
-      source_status_after="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || { failed 'git status could not verify source-tree cleanliness after the desktop build.'; return 1; }
-      if [[ "$source_status_after" != "$source_status_before" ]]; then failed 'desktop build changed source Git status; build outputs must stay in target/stage0.'; return 1; fi
+      if [[ -e "$snapshot" || -L "$snapshot" ]]; then
+        if ! run_logged "$name-snapshot-cleanup" "$python_command" "$script_dir/prepare_stage0_desktop_source.py" --repo-root "$repo_root" --destination "$snapshot" --cleanup; then cleanup_failed=1; fi
+      fi
+      source_status_after="$(git -C "$repo_root" status --porcelain --untracked-files=all)" || status_failed=1
+      if ((cleanup_failed)); then
+        if ((snapshot_failed)); then gate_reason+="; additionally could not safely clean this invocation-owned desktop snapshot"; else failed 'could not safely clean this invocation-owned desktop snapshot.'; fi
+      fi
+      if ((status_failed)); then
+        if ((snapshot_failed)); then gate_reason+="; additionally git status could not verify source-tree cleanliness after the desktop build"; else failed 'git status could not verify source-tree cleanliness after the desktop build.'; fi
+      elif [[ "$source_status_after" != "$source_status_before" ]]; then
+        if ((snapshot_failed)); then gate_reason+="; additionally desktop build changed source Git status"; else failed 'desktop build changed source Git status; build outputs must stay in target/stage0.'; fi
+      fi
+      if ((snapshot_failed || cleanup_failed || status_failed)) || [[ "$source_status_after" != "$source_status_before" ]]; then return 1; fi
       if ((install_failed)); then blocked 'offline frozen pnpm install failed; no download was attempted.'; return 1; fi
       if ((build_failed)); then return 1; fi
       ;;

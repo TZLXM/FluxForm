@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-IGNORED_NAMES = {".git", "target", "node_modules", "bin", "obj", "publish", "tools-cache"}
+RESERVED_ROOT_NAMES = {".git", "target"}
 OWNERSHIP_MARKER = ".stage0-owned-desktop-snapshot"
 WINDOWS_RESERVED_NAMES = {
     "aux",
@@ -339,10 +339,6 @@ def _copy_tracked_file(repo_root: Path, destination: Path, entry: TrackedFile) -
                 os.utime(target, ns=timestamps)
 
 
-def _is_ignored(entry: TrackedFile) -> bool:
-    return any(part in IGNORED_NAMES for part in entry.parts)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", required=True, type=Path)
@@ -407,6 +403,9 @@ def main() -> int:
     try:
         entries = read_tracked_files(repo_root)
         for entry in entries:
+            root_name = entry.parts[0].casefold() if os.name == "nt" else entry.parts[0]
+            if root_name in RESERVED_ROOT_NAMES:
+                raise SnapshotError(f"Refusing tracked reserved repository-root path: {entry.path!r}")
             inspect_source_path(repo_root, entry)
 
         destination.mkdir()
@@ -414,8 +413,7 @@ def main() -> int:
         with marker.open("x", encoding="utf-8", newline="") as marker_file:
             marker_file.write(destination.parent.name)
         for entry in entries:
-            if not _is_ignored(entry):
-                _copy_tracked_file(repo_root, destination, entry)
+            _copy_tracked_file(repo_root, destination, entry)
     except (OSError, SnapshotError) as error:
         print(f"FAIL: cannot create isolated desktop source snapshot: {error}", file=sys.stderr)
         return 2

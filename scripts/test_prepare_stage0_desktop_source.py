@@ -52,6 +52,22 @@ class DesktopSourceSnapshotTests(unittest.TestCase):
             timeout=30,
         )
 
+    def test_tracked_src_bin_file_is_copied(self) -> None:
+        executable = self.repo / "src" / "bin" / "fixture-tool.rs"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("fn main() {}\n", encoding="utf-8")
+        self.git("add", "src/bin/fixture-tool.rs")
+
+        result = self.run_snapshot()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        copied_executable = self.destination / "src" / "bin" / "fixture-tool.rs"
+        self.assertTrue(copied_executable.is_file(), "tracked src/bin file was omitted from the snapshot")
+        self.assertEqual(
+            copied_executable.read_text(encoding="utf-8"),
+            "fn main() {}\n",
+        )
+
     def test_untracked_large_directory_is_not_copied(self) -> None:
         untracked = self.repo / "target-task-untracked-sentinel"
         untracked.mkdir()
