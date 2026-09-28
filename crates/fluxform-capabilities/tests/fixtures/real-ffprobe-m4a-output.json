@@ -1,0 +1,25 @@
+{
+  "streams": [
+    {
+      "codec_name": "aac",
+      "codec_type": "audio",
+      "duration": "0.255011",
+      "nb_read_frames": "11",
+      "tags": {
+        "language": "und",
+        "handler_name": "SoundHandler",
+        "vendor_id": "[0][0][0][0]"
+      }
+    }
+  ],
+  "format": {
+    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+    "duration": "0.256000",
+    "tags": {
+      "major_brand": "isom",
+      "minor_version": "512",
+      "compatible_brands": "isomiso2mp41",
+      "encoder": "Lavf59.27.100"
+    }
+  }
+}

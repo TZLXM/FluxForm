@@ -1,0 +1,392 @@
+{
+  "$defs": {
+    "AlphaHandlingV1": {
+      "enum": [
+        "preserve",
+        "composite_white"
+      ],
+      "type": "string"
+    },
+    "AudioOptionsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "bitrate_kbps": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "channels": {
+          "default": null,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "encoder": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sample_rate_hz": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AudioRetentionV1": {
+      "enum": [
+        "preserve",
+        "remove"
+      ],
+      "type": "string"
+    },
+    "CategoryV1": {
+      "enum": [
+        "video",
+        "audio",
+        "image"
+      ],
+      "type": "string"
+    },
+    "ClientContextV1": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ConversionOptionsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioOptionsV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "image": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageOptionsV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "video": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VideoOptionsV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "ImageOptionsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "alpha_handling": {
+          "$ref": "#/$defs/AlphaHandlingV1",
+          "default": "preserve"
+        },
+        "apply_orientation": {
+          "default": true,
+          "type": "boolean"
+        },
+        "height": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quality": {
+          "default": null,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "resize_mode": {
+          "$ref": "#/$defs/ResizeModeV1",
+          "default": "contain"
+        },
+        "width": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OutputTargetV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "managed_artifact",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "directory_token": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "local_directory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "directory_token"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "local_path",
+              "type": "string"
+            },
+            "path_token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path_token"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "managed_job_directory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OverwritePolicyV1": {
+      "enum": [
+        "reject",
+        "rename",
+        "replace"
+      ],
+      "type": "string"
+    },
+    "ProtocolVersionV1": {
+      "enum": [
+        "v1"
+      ],
+      "type": "string"
+    },
+    "RationalV1": {
+      "additionalProperties": false,
+      "properties": {
+        "denominator": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "numerator": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "numerator",
+        "denominator"
+      ],
+      "type": "object"
+    },
+    "ResizeModeV1": {
+      "enum": [
+        "contain",
+        "cover",
+        "stretch"
+      ],
+      "type": "string"
+    },
+    "VideoOptionsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "aspect_ratio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RationalV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "audio": {
+          "$ref": "#/$defs/AudioRetentionV1",
+          "default": "preserve"
+        },
+        "encoder": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "frame_rate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RationalV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "height": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "preset": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality": {
+          "default": null,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "resize_mode": {
+          "$ref": "#/$defs/ResizeModeV1",
+          "default": "contain"
+        },
+        "width": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "category": {
+      "$ref": "#/$defs/CategoryV1"
+    },
+    "client_context": {
+      "$ref": "#/$defs/ClientContextV1"
+    },
+    "input_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "options": {
+      "$ref": "#/$defs/ConversionOptionsV1"
+    },
+    "output_format": {
+      "type": "string"
+    },
+    "output_target": {
+      "$ref": "#/$defs/OutputTargetV1"
+    },
+    "overwrite_policy": {
+      "$ref": "#/$defs/OverwritePolicyV1"
+    },
+    "protocol_version": {
+      "$ref": "#/$defs/ProtocolVersionV1"
+    }
+  },
+  "required": [
+    "protocol_version",
+    "input_ids",
+    "category",
+    "output_format",
+    "output_target",
+    "overwrite_policy",
+    "options",
+    "client_context"
+  ],
+  "title": "ConversionRequestV1",
+  "type": "object"
+}

@@ -1,0 +1,28 @@
+{
+  "category": "image",
+  "client_context": {
+    "request_id": "request_image_01"
+  },
+  "input_ids": [
+    "input_image_01",
+    "input_image_02"
+  ],
+  "options": {
+    "audio": null,
+    "image": {
+      "alpha_handling": "preserve",
+      "apply_orientation": true,
+      "height": 1080,
+      "quality": 90,
+      "resize_mode": "contain",
+      "width": 1920
+    },
+    "video": null
+  },
+  "output_format": "png",
+  "output_target": {
+    "kind": "managed_artifact"
+  },
+  "overwrite_policy": "reject",
+  "protocol_version": "v1"
+}

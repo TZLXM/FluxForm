@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "background-target",
+  "description": "Background drop observation and click instrumentation only",
+  "windows": ["background-target"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-record-background-interaction"
+  ]
+}

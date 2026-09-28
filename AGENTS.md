@@ -67,6 +67,40 @@ FluxForm 是 Windows 平台格式转换工具，使用 C# / .NET 9 开发，包�
 - `Directory.Build.props` 启用 NuGet lock file；新增或升级 NuGet 包后必须运行 `dotnet restore .\FluxForm.sln --use-lock-file` 并提交对应 `packages.lock.json`。发布脚本使用独立的临时 lock path，避免 RID 发布修改项目根目录的锁文件。
 - `.editorconfig` 与 `.gitattributes` 统一 UTF-8、缩进和 CRLF 行尾策略，避免中文文档和 XAML/PowerShell 文件产生无关 diff。
 
+## Rust Stage 0 feasibility gates
+
+Stage 0 Rust workspace 使用 `rust-toolchain.toml` 固定的 Rust 1.94.1。修改 Rust 代码后，优先运行可离线复现的检查：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --offline --workspace --exclude fluxform-desktop-probe --all-targets --all-features -- -D warnings
+cargo clippy --locked --offline -p fluxform-desktop-probe --all-targets -- -D warnings
+cargo clippy --locked --offline -p fluxform-desktop-probe --no-default-features --features probe-transparent-window-with-rectangular-hit-region --all-targets -- -D warnings
+cargo clippy --locked --offline -p fluxform-desktop-probe --no-default-features --features probe-opaque-frameless-fallback --all-targets -- -D warnings
+cargo test --locked --offline -p fluxform-protocol --all-targets --all-features
+cargo test --locked --offline -p fluxform-capabilities --lib --test manifest --test runner
+cargo test --locked --offline -p fluxform-ffmpeg-profile --all-targets --all-features
+cargo test --locked --offline -p fluxform-atomic-output --all-targets --all-features
+cargo test --locked --offline -p fluxform-desktop-probe --all-targets
+cargo test --locked --offline -p fluxform-desktop-probe --no-default-features --features probe-transparent-window-with-rectangular-hit-region --all-targets
+cargo test --locked --offline -p fluxform-desktop-probe --no-default-features --features probe-opaque-frameless-fallback --all-targets
+cargo test --locked --offline -p fluxform-server-probe --all-targets --all-features
+```
+
+`./scripts/check-stage0.ps1 -Mode Automated` 与 `./scripts/check-stage0.sh --mode automated` 执行本机可复现门禁；Cargo locked/offline，gate 不下载 Rust crate、pnpm package 或 FFmpeg。桌面 Tauri gate 会在唯一的 `target/stage0/runs/.../desktop-source` 快照内执行 `pnpm install --offline --frozen-lockfile` 和 `tauri:build --no-bundle`，不在 source tree 生成 permissions 或其他 build output，并比较 gate 前后 Git status。CI 的 cache preparation 可明确执行 `cargo fetch --locked` 和 `pnpm install --frozen-lockfile`；这是 gate 之外可审计的准备步骤。重复 `-Gate` / `--gate` 可聚焦选择多个门禁，例如 `-Gate protocol -Gate contract-drift`；首个失败后停止执行，但 summary 仍须列出所有 selected gate 并标明后续 `NOT_RUN`。完整门禁使用 `-Mode Complete` / `--mode complete`，依序先执行全部 Automated gates，再执行 FFmpeg-artifact、aggregate-sample、report 和 public-Linux gates；只有所有 required gates 都 `PASS` 才可输出 `stage0_complete=true`。Complete 校验 23 行报告和四平台 profile/sample provenance。
+
+报告中每个 `PASS` row 都必须以独立 reviewed evidence manifest 绑定准确的 row id/label/status、platform/date、reviewer identity/reviewed state、不可复用 raw-result 文件的 path/SHA-256/schema/type 及该 row 专属 evidence kind/required fields。JSON 只能经 duplicate-key rejecting parser 与 pinned single-handle reader 读取；Unix reader 用 `O_NOFOLLOW` 和 fstat identity，Windows reader 用 share-read-only handle、final-path/reparse 与 volume/file identity。证据文件必须在 repository 的 `target/stage0/reviewed-evidence/<bundle-id>/` 内，不能经 symlink/reparse 逃逸，也不可跨 row 复用。当前明确支持的机器语义仅为协议合同（row 1）、FFmpeg ProbeReport（rows 2–5）、tracked 产品批准/矩阵（row 6）、native aggregate 闭包（row 7）及 Windows WindowProbeResult（row 16）；其余 rows 8–15、17–23 因源工具尚无被审阅的权威 JSON schema 而 fail-closed 为 `BLOCKED`，不得以测试夹具或通用 PASS 字段放行。rows 2–5 仍要求当前不可用的批准 profile 与 license gate；row 6 fixture 不能替代人工产品审批。人工窗口或离线安装 row 不能以 Cargo.lock/build artifact 代替。Reviewer identity 是受审阅的 attestation 字段，不是密码学身份认证。
+
+Complete 只在受保护的 `stage0-manual-review` GitHub environment 和同时带有 `linux-cgroupv2-delegated`、`stage0-reviewed-evidence` 标签的 self-hosted Linux runner 上读取 Actions 变量 `STAGE0_REVIEWED_EVIDENCE_INPUT_DIR` / `STAGE0_REVIEWED_EVIDENCE_BUNDLE_ID` 指定的只读预置 JSON bundle。Complete job 在本机 `target/stage0` 暂存并按当前 `GITHUB_RUN_ID`、`GITHUB_SHA`、`GITHUB_ACTOR`、environment 与 closure digest 生成/验证临时 attestation；reviewed manifests/raw results 不上传为 GitHub artifact。缺少 runner、受保护 environment、输入变量、只读输入或任何 row 闭包时，Complete 应非零并保持 `stage0_complete=false`。配置该 runner/environment/input 前一直 BLOCKED 是预期行为。CI 可传输本次运行的 profile/sample/provenance 与 aggregate 检查输出，但不得传输 sample contents 或 tokens。当前 2 PASS/21 BLOCKED 历史矩阵保持原样，不能因新增 gate 或局部 PASS 升级。Windows workflow 的 native provenance 必须调用跨 shell Python 文件，不能在默认 PowerShell 中放 Bash heredoc。
+
+desktop probe 的三个 behavior mode features 互斥，因此不能对它直接运行 `--all-features`：该 crate 会有意以编译错误拒绝组合。Workspace clippy 对其余 crate 使用 `--all-features`，desktop probe 的默认 transparent-orb、rectangular-hit-region 与 opaque-fallback 配置分别执行 clippy/test；不得在同一命令中合并互斥 feature。
+
+FFmpeg profile 门禁不再接受直接执行路径来生成证据。历史兼容参数 `-Ffmpeg`/`-Ffprobe`（Bash 为 `--ffmpeg`/`--ffprobe`）一旦提供即 fail-closed 且不会执行路径；需要通过 `-FfmpegArchive PATH -ArtifactId ID -Profile PATH`（Bash 对应 `--ffmpeg-archive`、`--artifact-id`、`--profile`）调用 Task3 hardened immutable-archive verifier。任何候选 artifact、缺少 owner/legal 批准或不匹配的 profile 都不是 PASS。
+
+Linux public-server gate 必须在原生 x86_64、已注册的 `linux-cgroupv2-delegated` self-hosted runner 上运行，并实测 cgroup v2 与 public-startup suite；普通托管 Linux runner 只报告 `BLOCKED`。volatile gate/report 输出只写入 `target/stage0`。不要提交、替换或借门禁流程修改 `tools-cache/`、`publish/` 或现有 .NET 项目。
+
+后续 Rust Stage 只有在 [Stage 0 Gate Report](docs/architecture/stage-0-gate-report.md) 全部为 PASS，或用户批准了记录清楚的 spec fallback 修订后，才可开始。此门槛与下方现有 .NET 开发、构建、发布及验收流程并行保留，不取代它们。
+
 ## 功能开发流程
 
 新增功能时，先判断功能类型，再按对应模块的标准步骤实现。每个步骤都有明确的文件位置和验收标准。

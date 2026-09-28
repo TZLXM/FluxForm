@@ -849,7 +849,7 @@ git commit -m "feat(server): prove Linux network isolation"
 
 - [ ] **Step 1: Add failing aggregate-limit tests**
 
-Under a delegated test subtree, prove that `pids.max` limits the combined worker and descendants, `memory.max` limits aggregate resident memory across multiple children, `memory.swap.max = 0` prevents swap escape, and `cpu.max` throttles total CPU bandwidth. Create a child whose first instruction after the release barrier immediately forks, calls `setsid`, and forks again; assert the original and every descendant were born in the job cgroup. After timeout, assert `cgroup.events` reports no populated descendants and the escaped process is gone.
+Under a delegated test subtree, prove that `pids.max` limits the combined worker and descendants, `memory.max` limits aggregate resident memory across multiple children, `memory.swap.max = 0` prevents swap escape, and `cpu.max` throttles total CPU bandwidth. Create a child whose first instruction after the release barrier immediately forks, calls `setsid`, and forks again; assert the original and every descendant were born in the job cgroup. The fixed `resource-tree` proof reports exactly its supervisor, session child, and grandchild; all three must remain live, non-zombie, and in the exact job cgroup until `cgroup.kill` is issued. A child that exits before kill cannot count as placement evidence. After timeout, assert `cgroup.events` reports no populated descendants and the escaped process is gone.
 
 - [ ] **Step 2: Run and verify failure**
 

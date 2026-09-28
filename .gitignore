@@ -1,8 +1,12 @@
 # Build outputs
+/target/
 bin/
+!crates/fluxform-capabilities/src/bin/
+!crates/fluxform-capabilities/src/bin/**
 obj/
 publish/
 out/
+apps/desktop-probe/node_modules/
 
 # Visual Studio / VS Code
 .vs/

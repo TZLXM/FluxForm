@@ -1,0 +1,102 @@
+manifest_version = "v1"
+
+# The matrix is product-scope approved only. It is not evidence of artifact,
+# redistribution, or native-platform approval.
+[[edges]]
+id = "video.mov-to-mp4"
+category = "video"
+input_extensions = ["mov"]
+input_demuxers = ["mov"]
+input_codecs = ["h264"]
+input_topology = "single_video_stream"
+output_format = "mp4"
+output_muxer = "mp4"
+video_codec = "libx264"
+stream_map = ["0:v:0"]
+alpha_policy = "discard"
+orientation_policy = "apply_to_pixels"
+metadata_policy = "strip"
+profile_ids = ["windows-x86_64", "macos-aarch64", "macos-x86_64", "linux-x86_64"]
+valid_samples = ["video-mov-h264-silent-240p-v1"]
+invalid_samples = ["video-mov-hevc-silent-unsupported-v1"]
+
+[edges.options.crf]
+minimum = 0
+maximum = 51
+default = 23
+
+[edges.options.max_width]
+minimum = 16
+maximum = 4096
+default = 1920
+
+[edges.options.max_height]
+minimum = 16
+maximum = 2160
+default = 1080
+
+[edges.options.max_duration_seconds]
+minimum = 1
+maximum = 3600
+default = 600
+
+[[edges]]
+id = "audio.m4a-to-m4a"
+category = "audio"
+input_extensions = ["m4a"]
+input_demuxers = ["mov"]
+input_codecs = ["aac"]
+input_topology = "single_audio_stream"
+output_format = "m4a"
+output_muxer = "mp4"
+audio_codec = "aac"
+stream_map = ["0:a:0"]
+alpha_policy = "discard"
+orientation_policy = "ignore"
+metadata_policy = "strip"
+profile_ids = ["windows-x86_64", "macos-aarch64", "macos-x86_64", "linux-x86_64"]
+valid_samples = ["audio-m4a-aac-lc-mono-v1"]
+invalid_samples = ["audio-m4a-alac-unsupported-v1"]
+
+[edges.options.bitrate_kbps]
+minimum = 32
+maximum = 320
+default = 64
+
+[edges.options.max_duration_seconds]
+minimum = 1
+maximum = 3600
+default = 600
+
+[[edges]]
+id = "image.jpeg-to-png"
+category = "image"
+input_extensions = ["jpg", "jpeg"]
+input_demuxers = ["jpeg_pipe"]
+input_codecs = ["mjpeg"]
+input_topology = "single_video_frame"
+output_format = "png"
+output_muxer = "image2"
+video_codec = "png"
+stream_map = ["0:v:0"]
+alpha_policy = "preserve_if_present"
+orientation_policy = "apply_to_pixels"
+metadata_policy = "safe_image_metadata"
+profile_ids = ["windows-x86_64", "macos-aarch64", "macos-x86_64", "linux-x86_64"]
+valid_samples = ["image-jpeg-baseline-rgb-v1"]
+invalid_samples = ["image-jpeg-truncated-v1", "image-gif-animated-v1", "image-webp-animated-v1", "image-tiff-multipage-v1"]
+
+[edges.options.compression_level]
+minimum = 0
+maximum = 9
+default = 6
+
+[edges.options.max_width]
+minimum = 1
+maximum = 4096
+default = 4096
+
+[edges.options.max_height]
+minimum = 1
+maximum = 4096
+default = 4096

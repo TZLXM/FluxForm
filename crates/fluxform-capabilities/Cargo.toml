@@ -1,0 +1,27 @@
+[package]
+name = "fluxform-capabilities"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+
+[[bin]]
+name = "verify_manifest"
+path = "src/bin/verify_manifest.rs"
+
+[[bin]]
+name = "run_manifest_samples"
+path = "src/bin/run_manifest_samples.rs"
+
+[[bin]]
+name = "collect_sample_reports"
+path = "src/bin/collect_sample_reports.rs"
+
+[dependencies]
+fluxform-ffmpeg-profile = { path = "../fluxform-ffmpeg-profile" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
